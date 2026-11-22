@@ -138,6 +138,8 @@ python tools/stop_servers.py --force  # kill whatever owns the port
 python tools/init_db.py
 ```
 
+The worldserver also creates and migrates the character, creature and spell tables when it starts, so a checkout made before a schema addition still works without re-running `init_db.py`.
+
 ### Importing the CMaNGOS 3.3.5a world database
 
 The world dump can be downloaded from the [cmangos/wotlk-db](https://github.com/cmangos/wotlk-db) repository (`Full_DB/WoTLKDB_*.sql`).
