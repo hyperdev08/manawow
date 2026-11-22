@@ -67,20 +67,98 @@ SPELL_EFFECT_HEALTH_LEECH = 9
 SPELL_EFFECT_HEAL = 10
 SPELL_EFFECT_WEAPON_DAMAGE_NOSCHOOL = 17
 SPELL_EFFECT_SUMMON = 28
+SPELL_EFFECT_WEAPON_PERCENT_DAMAGE = 31
 SPELL_EFFECT_WEAPON_DAMAGE = 58
 SPELL_EFFECT_SUMMON_PET = 56
 SPELL_EFFECT_TRIGGER_SPELL = 64
 SPELL_EFFECT_SUMMON_OBJECT_WILD = 76
 SPELL_EFFECT_ATTACK = 78
 SPELL_EFFECT_ADD_COMBO_POINTS = 80
+SPELL_EFFECT_PERSISTENT_AREA_AURA = 27
 SPELL_EFFECT_SUMMON_OBJECT_SLOT1 = 104
 SPELL_EFFECT_HEAL_MAX_HEALTH = 120
 SPELL_EFFECT_NORMALIZED_WEAPON_DMG = 121
 
 # Aura types (Spell.dbc EffectApplyAuraName).
 SPELL_AURA_PERIODIC_DAMAGE = 3
+SPELL_AURA_DUMMY = 4
 SPELL_AURA_PERIODIC_HEAL = 8
+SPELL_AURA_MOD_STUN = 12
+SPELL_AURA_MOD_RESISTANCE = 22
+SPELL_AURA_PERIODIC_TRIGGER_SPELL = 23
+SPELL_AURA_PERIODIC_ENERGIZE = 24
+SPELL_AURA_MOD_PACIFY = 25
+SPELL_AURA_MOD_ROOT = 26
+SPELL_AURA_MOD_SILENCE = 27
+SPELL_AURA_MOD_STAT = 29
+SPELL_AURA_MOD_INCREASE_SPEED = 31
+SPELL_AURA_MOD_DECREASE_SPEED = 33
+SPELL_AURA_MOD_INCREASE_HEALTH = 34
+SPELL_AURA_MOD_INCREASE_ENERGY = 35
 SPELL_AURA_PERIODIC_LEECH = 53
+SPELL_AURA_MOD_ATTACK_POWER = 99
+SPELL_AURA_MOD_RANGED_ATTACK_POWER = 124
+SPELL_AURA_MOD_MELEE_HASTE = 138
+# 3.3.5 Death and Decay uses this periodic dummy aura for its ground ticks.
+SPELL_AURA_PERIODIC_DUMMY = 226
+
+# ``SPELL_AURA_MOD_STAT`` misc value -> primary attribute.
+STAT_AURA_NAMES = ("str", "agi", "sta", "inte", "spi")
+# ``SPELL_AURA_MOD_RESISTANCE`` misc value is a school mask (bit 0 = physical).
+RESISTANCE_AURA_SCHOOLS = (
+    (2, "holy"), (4, "fire"), (8, "nature"), (16, "frost"),
+    (32, "shadow"), (64, "arcane"),
+)
+
+# ``EffectImplicitTarget`` values used by area selection (3.3.5a).
+TARGET_UNIT_CASTER = 1
+TARGET_UNIT_TARGET_ENEMY = 6
+TARGET_UNIT_SRC_AREA_ENEMY = 15
+TARGET_UNIT_DEST_AREA_ENEMY = 16
+TARGET_DEST_CASTER = 18
+TARGET_UNIT_CASTER_AREA_PARTY = 20
+TARGET_UNIT_TARGET_ALLY = 21
+TARGET_SRC_CASTER = 22
+TARGET_UNIT_CONE_ENEMY_24 = 24
+TARGET_UNIT_TARGET_ANY = 25
+TARGET_DEST_DYNOBJ_ENEMY = 28
+TARGET_UNIT_SRC_AREA_ALLY = 30
+TARGET_UNIT_DEST_AREA_ALLY = 31
+TARGET_UNIT_SRC_AREA_PARTY = 33
+TARGET_UNIT_DEST_AREA_PARTY = 34
+TARGET_DEST_DEST = 87
+TARGET_UNIT_CONE_ENEMY_54 = 54
+TARGET_UNIT_CONE_ENEMY_104 = 104
+
+AREA_ENEMY_TARGETS = frozenset((TARGET_UNIT_SRC_AREA_ENEMY,
+                                TARGET_UNIT_DEST_AREA_ENEMY))
+AREA_ALLY_TARGETS = frozenset((TARGET_UNIT_CASTER_AREA_PARTY,
+                               TARGET_UNIT_SRC_AREA_ALLY,
+                               TARGET_UNIT_DEST_AREA_ALLY,
+                               TARGET_UNIT_SRC_AREA_PARTY,
+                               TARGET_UNIT_DEST_AREA_PARTY))
+CONE_TARGETS = frozenset((TARGET_UNIT_CONE_ENEMY_24,
+                          TARGET_UNIT_CONE_ENEMY_54,
+                          TARGET_UNIT_CONE_ENEMY_104))
+
+# ``SpellRadius.dbc`` build 12340.  The server only needs the maximum radius
+# for area selection; every 3.3.5 row has RadiusPerLevel = 0.
+SPELL_RADII = {
+    7: 2.0, 8: 5.0, 9: 20.0, 10: 30.0, 11: 45.0, 12: 100.0, 13: 10.0,
+    14: 8.0, 15: 3.0, 16: 1.0, 17: 13.0, 18: 15.0, 19: 18.0, 20: 25.0,
+    21: 35.0, 22: 200.0, 23: 40.0, 24: 65.0, 25: 70.0, 26: 4.0, 27: 50.0,
+    28: 50000.0, 29: 6.0, 30: 500.0, 31: 80.0, 32: 12.0, 33: 99.0,
+    35: 55.0, 36: 0.0, 37: 7.0, 38: 21.0, 39: 34.0, 40: 9.0, 41: 150.0,
+    42: 11.0, 43: 16.0, 44: 0.5, 45: 10.0, 46: 5.0, 47: 15.0, 48: 60.0,
+    49: 90.0, 50: 15.0, 51: 60.0, 52: 5.0, 53: 60.0, 54: 50000.0,
+    55: 130.0, 56: 38.0, 57: 45.0, 58: 50000.0, 59: 32.0, 60: 44.0,
+    61: 14.0, 62: 47.0, 63: 23.0, 64: 3.5, 65: 80.0,
+}
+
+
+def spell_radius(radius_index: int) -> float:
+    """Yards for a ``SpellRadius.dbc`` index (0 when unknown)."""
+    return float(SPELL_RADII.get(int(radius_index or 0), 0.0))
 
 # Aliases kept for callers written against the old names.
 SPELL_EFFECT_DMG = SPELL_EFFECT_SCHOOL_DAMAGE
@@ -247,6 +325,10 @@ class SpellTemplate:
         # ``DurationIndex`` points into ``SpellDuration.dbc``.  Summoning reads
         # it to decide whether a summon is permanent (index 21 = -1) or expires.
         self.duration_index = int(_row_get(row, "duration_index", 0))
+        # ``SpellTargetRestrictions.MaxTargets``; 0 means "no cap".
+        self.max_targets = int(_row_get(row, "max_affected_targets", 0))
+        # ``Spell.dbc`` StackAmount; 0/1 means the aura does not stack.
+        self.stack_amount = int(_row_get(row, "stack_amount", 0))
         self.category = int(_row_get(row, "category", 0))
         self.speed = float(_row_get(row, "speed", 0.0))
         self.power_type = int(_row_get(row, "power_type", 0))
@@ -339,6 +421,49 @@ class SpellTemplate:
         if 0 <= index < len(self.effects):
             return self.effects[index]
         return None
+
+    def effect_radius(self, effect_index: int) -> float:
+        """Area radius in yards for one effect (``SpellRadius.dbc``)."""
+        effect = self.get_effect(effect_index)
+        if effect is None:
+            return 0.0
+        return spell_radius(effect.get("radius") or 0)
+
+    def effect_area_kind(self, effect_index: int) -> Optional[str]:
+        """Classify an effect's implicit targets.
+
+        Returns ``"enemy"`` for area enemy effects, ``"ally"`` for party/ally
+        areas, ``"cone"`` for cone effects and ``None`` for single-target
+        effects.  The 3.3.5 DBC puts the selector in ``EffectImplicitTargetB``
+        for most spells (e.g. Arcane Explosion is ``22, 15``) and occasionally
+        in A; the ground anchors (``TARGET_SRC_CASTER``/``DEST_CASTER``) are not
+        selectors themselves.
+        """
+        effect = self.get_effect(effect_index)
+        if effect is None:
+            return None
+        a = int(effect.get("target_a") or 0)
+        b = int(effect.get("target_b") or 0)
+        if a in CONE_TARGETS or b in CONE_TARGETS:
+            return "cone"
+        if b in AREA_ENEMY_TARGETS or a in AREA_ENEMY_TARGETS:
+            return "enemy"
+        if b in AREA_ALLY_TARGETS or a in AREA_ALLY_TARGETS:
+            return "ally"
+        return None
+
+    def is_ground_area(self, effect_index: int) -> bool:
+        """True for a persistent ground effect (Blizzard, Consecration, ...)."""
+        effect = self.get_effect(effect_index)
+        if effect is None:
+            return False
+        if int(effect.get("effect") or 0) != SPELL_EFFECT_PERSISTENT_AREA_AURA:
+            return False
+        a = int(effect.get("target_a") or 0)
+        b = int(effect.get("target_b") or 0)
+        return (a in (TARGET_DEST_CASTER, TARGET_DEST_DYNOBJ_ENEMY)
+                or b in AREA_ENEMY_TARGETS or b in AREA_ALLY_TARGETS
+                or self.effect_area_kind(effect_index) is not None)
 
     def get_range(self) -> float:
         """Return the spell's maximum range in yards (SpellRange.dbc).
@@ -480,6 +605,9 @@ class SpellCast:
         self.x = x
         self.y = y
         self.z = z
+        # True when the client sent a destination location (ground-targeted
+        # spells such as Blizzard, Flamestrike or Death and Decay).
+        self.has_dest = False
         self.state = CAST_STATE_NONE
         self.started_at = time.monotonic()
         self.cast_time_ms = 0
@@ -517,16 +645,131 @@ def get_spell_template(path: str, spell_id: int) -> Optional[SpellTemplate]:
     return SpellTemplate(row)
 
 
-# ``SpellDuration.dbc`` values that matter for summoning.  The DBC itself is
-# not part of the world dump; ``spell_duration`` is filled from
-# ``--spell-duration-dbc`` when the client files are available.  Until then the
-# common summon durations are encoded here so a timed guardian still expires.
-SUMMON_DURATION_FALLBACK_MS = {
-    0: -1,          # no duration field: permanent/script-controlled
-    18: 18000,      # 18 s (Mirror Image)
-    21: -1,         # until cancelled (warlock pets, most guardians)
-    22: 30000,      # 30 s (Force of Nature, elementals)
+# ``SpellDuration.dbc`` values used when the table has not been imported from
+# the client files.  Only the entries the server can reach are listed; the full
+# table is filled by ``--spell-duration-dbc``.
+SPELL_DURATION_FALLBACK_MS = {
+    0: 0,
+    1: 10000,
+    3: 60000,
+    4: 120000,
+    5: 300000,
+    6: 600000,
+    8: 15000,
+    9: 30000,
+    18: 20000,
+    21: -1,
+    22: 45000,
+    23: 90000,
+    24: 160000,
+    25: 180000,
+    26: 240000,
+    27: 3000,
+    28: 5000,
+    29: 12000,
+    30: 1800000,
+    31: 8000,
+    32: 6000,
+    35: 4000,
+    36: 1000,
+    38: 11000,
+    39: 2000,
+    40: 1200000,
+    41: 360000,
+    42: 3600000,
+    62: 75000,
+    63: 25000,
+    64: 40000,
+    65: 1500,
+    66: 2500,
+    85: 18000,
+    86: 21000,
+    105: 9000,
+    106: 24000,
+    125: 35000,
+    165: 7000,
+    185: 6000,
+    186: 2000,
+    187: 5000,
+    205: 27000,
+    225: 604800000,
+    245: 50000,
+    265: 55000,
+    285: 6000,
+    305: 14000,
+    325: 36000,
+    326: 44000,
+    327: 500,
+    328: 250,
+    347: 900000,
+    367: 7200000,
+    387: 16000,
+    407: 100,
+    427: 600000,
+    447: 6000,
+    467: 22000,
+    468: 26000,
+    487: 1700,
+    507: 1100,
+    508: 1100,
+    527: 14400000,
+    547: 5400000,
+    548: 10800000,
+    549: 3800,
+    550: 2147483647,
+    551: 3500,
+    552: 210000,
+    553: 16000,
+    554: 155000,
+    555: 4500,
+    556: 28000,
+    557: 165000,
+    558: 114000,
+    559: 53000,
+    560: 299000,
+    561: 3300000,
+    562: 150000,
+    563: 20500,
+    564: 13000,
+    565: 70000,
+    566: 0,
+    567: 135000,
+    568: 1250,
+    569: 280000,
+    570: 32000,
+    571: 5500,
+    572: 100000,
+    573: 11999900,
+    574: 200,
+    575: 17000,
+    576: 43200000,
+    577: 160000,
+    578: 14250,
+    579: 170000,
+    580: 64800000,
+    581: 34000,
+    582: 3200,
+    583: 600,
+    584: 800,
+    585: 0,
+    586: 25000,
+    587: 31000,
+    588: 30000,
+    589: 6500,
+    590: 330000,
+    591: 80000,
+    592: 400,
+    593: 300,
+    594: 660000,
+    596: 900,
+    597: 4700,
+    598: 3600,
+    600: 42000,
+    602: 480000,
 }
+
+# Old name kept for the summoning module.
+SUMMON_DURATION_FALLBACK_MS = SPELL_DURATION_FALLBACK_MS
 
 
 def get_spell_duration(path: str, duration_index: int) -> Optional[Tuple[int, int, int]]:
@@ -554,23 +797,33 @@ def get_spell_duration(path: str, duration_index: int) -> Optional[Tuple[int, in
             int(row["max_duration"] or 0))
 
 
-def summon_duration_ms(path: str, duration_index: int, level: int = 1) -> int:
-    """How long a summoned creature lives, in milliseconds (``-1`` permanent).
+def spell_duration_ms(path: str, duration_index: int, level: int = 1) -> int:
+    """Duration for a ``SpellDuration.dbc`` index, in milliseconds.
 
-    Mirrors ``Spell::CalculateDuration``: the base duration plus the
-    per-level part, capped by ``MaxDuration``.  A negative base duration means
-    "until cancelled", which is what warlock pets use.
+    Mirrors ``Spell::CalculateDuration``: the base duration plus the per-level
+    part, capped by ``MaxDuration``.  ``-1`` means "until cancelled" and ``0``
+    means "no duration".
     """
     index = int(duration_index or 0)
     data = get_spell_duration(path, index)
     if data is None:
-        return int(SUMMON_DURATION_FALLBACK_MS.get(index, -1))
+        return int(SPELL_DURATION_FALLBACK_MS.get(index, 0))
     duration, per_level, max_duration = data
     if duration < 0:
         return -1
     total = duration + per_level * max(0, int(level) - 1)
     if max_duration > 0:
         total = min(total, max_duration)
+    return total if total > 0 else 0
+
+
+def summon_duration_ms(path: str, duration_index: int, level: int = 1) -> int:
+    """How long a summoned creature lives, in milliseconds (``-1`` permanent).
+
+    Summons treat "no duration" as "until dismissed" (most warlock pets use
+    index 21, which is explicitly -1).
+    """
+    total = spell_duration_ms(path, duration_index, level)
     return total if total > 0 else -1
 
 
@@ -782,15 +1035,26 @@ def pack_guid(guid: int) -> bytes:
     return bytes([mask]) + bytes(data)
 
 
-def _target_data(target_guid: int) -> bytes:
-    """``SpellTargetData`` for a single unit target (or a self cast).
+def _target_data(target_guid: int, cast: Optional["SpellCast"] = None) -> bytes:
+    """``SpellTargetData`` for a unit target and/or destination.
 
-    ``SpellCastTargets::write`` starts with the ``uint32`` target mask and only
-    appends the packed unit guid when ``TARGET_FLAG_UNIT`` (0x2) is set.
+    ``SpellCastTargets::Write`` starts with the ``uint32`` target mask, appends
+    the packed unit guid for ``TARGET_FLAG_UNIT`` (0x2), and for a destination
+    (0x40) appends an empty packed transport guid followed by three floats.
     """
+    flags = 0
     if target_guid:
-        return struct.pack("<I", 0x02) + pack_guid(target_guid)
-    return struct.pack("<I", 0)
+        flags |= 0x02
+    has_dest = bool(cast is not None and cast.has_dest)
+    if has_dest:
+        flags |= 0x40
+    out = bytearray(struct.pack("<I", flags))
+    if flags & 0x02:
+        out += pack_guid(target_guid)
+    if has_dest:
+        out += b"\x00"                      # empty transport guid
+        out += struct.pack("<fff", float(cast.x), float(cast.y), float(cast.z))
+    return bytes(out)
 
 
 def _go_target_list(target_guid: int, caster_guid: int) -> bytes:
@@ -826,7 +1090,7 @@ def build_spell_start(cast: SpellCast, caster_guid: int, target_guid: int = 0,
     out += struct.pack("<I", int(cast.spell_id))
     out += struct.pack("<I", CAST_FLAG_SPELL_START if flags is None else flags)
     out += struct.pack("<I", int(cast.cast_time_ms))
-    out += _target_data(target_guid)
+    out += _target_data(target_guid, cast)
     return bytes(out)
 
 
@@ -867,7 +1131,7 @@ def build_spell_go(cast: SpellCast, caster_guid: int, target_guid: int = 0,
     out += struct.pack("<I", flags)
     out += struct.pack("<I", int(timestamp_ms) & 0xFFFFFFFF)
     out += _go_target_list(target_guid, caster_guid)
-    out += _target_data(target_guid)
+    out += _target_data(target_guid, cast)
     if flags & CAST_FLAG_PREDICTED_POWER:
         out += struct.pack("<I", int(predicted_power or 0) & 0xFFFFFFFF)
     if flags & CAST_FLAG_PREDICTED_RUNES:

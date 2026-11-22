@@ -110,12 +110,12 @@ class WorldEntryMixin:
         known_spell_ids = [int(row["spell"]) for row in known_spells]
         # The cast handler refuses anything the character has not learned.
         self.known_spell_ids = set(known_spell_ids)
-        action_spell_ids = character_db.get_character_action_spells(
+        action_buttons = character_db.get_character_action_buttons(
             self.config.database.world_path, self.player_guid
         )
         for opcode, payload in login_packets.build_login_packets(
             self.character, self.config.worldserver.motd, creature_blocks,
-            known_spell_ids, action_spell_ids,
+            known_spell_ids, action_buttons,
         ):
             await self.send_packet(opcode, payload)
         if self._is_death_knight():
@@ -153,8 +153,14 @@ class WorldEntryMixin:
             self._visible_creatures = {}
             self._creature_spawn_cache = {}
             self._creature_scan_pos = None
-            self._get_combat_state()["idle"].clear()
-            self._get_combat_state()["idle_settle"].clear()
+            combat = self._get_combat_state()
+            combat["idle"].clear()
+            combat["idle_settle"].clear()
+            combat["dots"].clear()
+            combat.setdefault("area_effects", []).clear()
+            combat["auras"] = []
+            combat["creature_auras"] = {}
+            combat["aura_state"] = {}
         await self.send_packet(Opcodes.SMSG_LOGOUT_RESPONSE, struct.pack("<IB", 0, 0))
         await self.send_packet(Opcodes.SMSG_LOGOUT_COMPLETE, b"")
 
@@ -249,6 +255,10 @@ class WorldEntryMixin:
         combat["target_guid"] = 0
         combat["pending_cast"] = None
         combat["dots"] = []
+        combat.setdefault("area_effects", []).clear()
+        combat["auras"] = []
+        combat["creature_auras"] = {}
+        combat["aura_state"] = {}
         combat["aggro"].clear()
         # CMaNGOS resurrects with a full rune set; re-init and resync so the
         # client does not keep the cooldowns from before the death.

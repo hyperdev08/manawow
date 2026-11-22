@@ -2258,7 +2258,12 @@ async def worldserver_flow(host: str, port: int, session_key: bytes, realm_id: i
             writer, int(Opcodes.CMSG_CAST_SPELL),
             struct.pack("<BiBI", 2, 78, 0, 0), crypt,
         )
-        opcode, payload = await read_server_packet(reader, crypt)
+        # Idle creatures can send SMSG_MONSTER_MOVE at any moment; skip those
+        # while waiting for the cast result.
+        while True:
+            opcode, payload = await read_server_packet(reader, crypt)
+            if opcode != int(Opcodes.SMSG_MONSTER_MOVE):
+                break
         assert_eq(opcode, int(Opcodes.SMSG_CAST_FAILED), "no-power cast failed opcode")
         assert_eq(payload[0], 2, "no-power cast id")
         assert_eq(struct.unpack_from("<I", payload, 1)[0], 78, "no-power spell id")
@@ -2269,7 +2274,10 @@ async def worldserver_flow(host: str, port: int, session_key: bytes, realm_id: i
             writer, int(Opcodes.CMSG_CAST_SPELL),
             struct.pack("<BiBI", 3, 9700, 0, 0), crypt,
         )
-        opcode, payload = await read_server_packet(reader, crypt)
+        while True:
+            opcode, payload = await read_server_packet(reader, crypt)
+            if opcode != int(Opcodes.SMSG_MONSTER_MOVE):
+                break
         assert_eq(opcode, int(Opcodes.SMSG_CAST_FAILED), "cast failed opcode")
         assert_eq(payload[0], 3, "cast failed cast id")
         assert_eq(struct.unpack_from("<I", payload, 1)[0], 9700, "cast failed spell id")

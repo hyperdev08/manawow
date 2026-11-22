@@ -21,13 +21,12 @@ class WorldServer:
         self.sessions = []
         self.packet_log = get_packet_log()
         self.packet_log.Initialize(config.logging.log_dir)
+        # Creature/spell tables (including the bundled 3.3.5a starter spells)
+        # come first so the character backfill can read them.
+        creature.init_creature_db(config.database.world_path)
         # Ensure the character schema exists and is up to date (adds the
         # orientation column to databases created before world entry existed).
         character_db.init_character_db(config.database.world_path)
-        # Creature/spell tables are created and migrated here as well, so a
-        # checkout that predates a schema addition (spell_duration, movement
-        # columns, ...) works without a manual re-import.
-        creature.init_creature_db(config.database.world_path)
 
     async def handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
         peer = writer.get_extra_info("peername")

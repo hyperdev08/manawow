@@ -293,6 +293,14 @@ class StatsMixin:
         for key in ("str", "agi", "sta", "inte", "spi"):
             stats[key] = int(stats.get(key, 0) or 0) + int(
                 item_totals.get(key, 0) or 0)
+        # Aura stat modifiers (Arcane Intellect, Power Word: Fortitude, ...)
+        # are part of the final attribute values, exactly like item auras.
+        aura_mods = (self._player_aura_mods()
+                     if hasattr(self, "_player_aura_mods") else None)
+        if aura_mods:
+            for key in ("str", "agi", "sta", "inte", "spi"):
+                stats[key] = int(stats.get(key, 0) or 0) + int(
+                    aura_mods["stats"].get(key, 0) or 0)
         self.character["stats"] = stats
 
         item_health = int(item_totals.get("health", 0) or 0)
@@ -307,6 +315,8 @@ class StatsMixin:
             # racial total-percent modifier (Tauren Endurance, 5%).
             health_value = (base_health + item_health
                             + self._health_bonus_from_stamina(stamina))
+            if aura_mods:
+                health_value += aura_mods["health"]
             health_value *= self._RACE_HEALTH_PCT.get(race, 1.0)
             # ``std::round`` rounds halves away from zero; Python's round()
             # uses banker's rounding, so spell it out for exact parity.
@@ -339,6 +349,8 @@ class StatsMixin:
             intellect = max(0, int(stats.get("inte", 0) or 0))
             max_power += item_mana + int(math.floor(
                 self._mana_bonus_from_intellect(intellect) + 0.5))
+            if aura_mods:
+                max_power += int(aura_mods["power"] or 0)
         self.character["max_power"] = max_power
         if "power" not in self.character:
             # Combat resources start empty; mana/energy classes start full.
@@ -352,21 +364,29 @@ class StatsMixin:
 
         # ``Player::UpdateArmor``: item armor plus twice the final agility.
         agility = int(stats.get("agi", 0) or 0)
-        self.character["armor"] = int(
-            item_totals.get("armor", 0) or 0) + agility * 2
+        armor = int(item_totals.get("armor", 0) or 0) + agility * 2
+        if aura_mods:
+            armor += int(aura_mods["armor"] or 0)
+        self.character["armor"] = armor
         for school in ("holy", "fire", "nature", "frost", "shadow", "arcane"):
-            self.character["res_" + school] = int(
-                item_totals.get(school, 0) or 0)
+            value = int(item_totals.get(school, 0) or 0)
+            if aura_mods:
+                value += int(aura_mods["resistances"].get(school, 0) or 0)
+            self.character["res_" + school] = value
 
         # ``Player::UpdateAttackPowerAndDamage``: class/level/stat formula plus
         # flat item attack power.  Ranged AP uses its own class formula and the
         # ``ITEM_MOD_RANGED_ATTACK_POWER`` bonus.
         attack_power = int(self._base_attack_power(char_class, level, stats))
         attack_power += int(item_totals.get("attack_power", 0) or 0)
+        if aura_mods:
+            attack_power += int(aura_mods["attack_power"] or 0)
         self.character["attack_power"] = attack_power
         ranged_ap = int(self._base_ranged_attack_power(
             char_class, level, stats))
         ranged_ap += int(item_totals.get("ranged_attack_power", 0) or 0)
+        if aura_mods:
+            ranged_ap += int(aura_mods["ranged_attack_power"] or 0)
         self.character["ranged_attack_power"] = ranged_ap
 
         self.character["next_level_xp"] = self._xp_to_level(level)
@@ -703,6 +723,12 @@ class StatsMixin:
         combat["dead"] = True
         combat["pending_cast"] = None
         combat["dots"] = []
+        combat.setdefault("area_effects", []).clear()
+        if hasattr(self, "_clear_player_auras"):
+            await self._clear_player_auras()
+        else:
+            combat["auras"] = []
+        combat["creature_auras"] = {}
         # ``CombatStop`` clears the dying rogue's combo points.
         await self._clear_combo_points()
         if combat["target_guid"]:

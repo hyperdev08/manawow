@@ -142,6 +142,8 @@ class CreatureMovementMixin:
         if distance < 0.1:
             return False
         speed = float(state["speed"]) or 2.5
+        if hasattr(self, "_creature_speed_mult"):
+            speed *= max(0.1, self._creature_speed_mult(int(low_guid)))
         duration_ms = int(distance / speed * 1000.0)
         duration_ms = max(IDLE_MOVE_MIN_DURATION_MS,
                           min(duration_ms, IDLE_MOVE_MAX_DURATION_MS))
@@ -191,6 +193,10 @@ class CreatureMovementMixin:
         """One movement tick for a creature that is not fighting this player."""
         if "summoned_by" in spawn.keys() and int(spawn["summoned_by"] or 0):
             return                       # pets follow their owner in _summon_tick
+        if hasattr(self, "_creature_aura_mods"):
+            mods = self._creature_aura_mods(int(low_guid))
+            if mods["rooted"] or mods["stunned"]:
+                return
         combat = self._get_combat_state()
         if int(low_guid) in combat["aggro"]:
             return

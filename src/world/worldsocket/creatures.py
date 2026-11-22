@@ -209,6 +209,8 @@ class CreaturesMixin:
         if int(combat.get("combo_target") or 0) == int(guid):
             await self._clear_combo_points()
         combat["aggro"].pop(low_guid, None)
+        if hasattr(self, "_clear_creature_auras"):
+            self._clear_creature_auras(low_guid)
         # Stop the idle generator: the corpse must not keep walking.
         combat.setdefault("idle", {}).pop(low_guid, None)
         combat.setdefault("idle_settle", {}).pop(low_guid, None)
@@ -233,6 +235,23 @@ class CreaturesMixin:
         if spawn is None or int(spawn["dead_since"] or 0) > 0:
             combat["aggro"].pop(int(low_guid), None)
             return
+
+        # Stunned creatures do nothing at all; rooted ones can still swing and
+        # cast while in range but cannot chase.
+        if hasattr(self, "_creature_aura_mods"):
+            if self._creature_aura_mods(int(low_guid))["stunned"]:
+                ai = (state.get("ai") if state else None)
+                if ai is not None and ai.get("cast") is not None:
+                    ai["cast"] = None
+                return
+            rooted = self._creature_aura_mods(int(low_guid))["rooted"]
+            pacified = self._creature_aura_mods(int(low_guid))["pacified"]
+            melee_interval = self._creature_melee_interval(int(low_guid))
+            speed_mult = self._creature_speed_mult(int(low_guid))
+        else:
+            rooted = pacified = False
+            melee_interval = 2.0
+            speed_mult = 1.0
 
         player = self._player_position()
         here = self._creature_position(int(low_guid))
@@ -276,7 +295,7 @@ class CreaturesMixin:
             await self._face_creature_at_player(int(low_guid), state, spawn,
                                                 here, player, now)
             # In melee range: swing on the creature's own timer.
-            if now - state["last_swing"] >= 2.0:
+            if not pacified and now - state["last_swing"] >= melee_interval:
                 state["last_swing"] = now
                 raw_damage = max(1, int(round(self._creature_damage(spawn))))
                 # ``Unit::CalcArmorReducedDamage``: normal-school melee is
@@ -298,9 +317,11 @@ class CreaturesMixin:
 
         # Out of reach: walk towards the player.  One spline per second keeps
         # the packet rate sane while still looking smooth to the client.
+        if rooted:
+            return
         if now < state["chase_until"]:
             return
-        speed = 7.0
+        speed = 7.0 * max(0.1, speed_mult)
         duration_ms = max(250, int((distance - reach * 0.5) / speed * 1000))
         duration_ms = min(duration_ms, 1500)
         travel = min(distance - 1.0, speed * duration_ms / 1000.0)
@@ -329,6 +350,8 @@ class CreaturesMixin:
         """Leave combat, walk the creature home and heal it back up."""
         combat = self._get_combat_state()
         state = combat["aggro"].pop(int(low_guid), None)
+        if hasattr(self, "_clear_creature_auras"):
+            self._clear_creature_auras(int(low_guid))
         spawn = self._get_creature_spawn(int(low_guid))
         if spawn is None or int(spawn["dead_since"] or 0) > 0:
             return
@@ -418,6 +441,8 @@ class CreaturesMixin:
             combat = self._get_combat_state()
             combat["aggro"].pop(int(low_guid), None)
             combat.setdefault("idle", {}).pop(int(low_guid), None)
+            if hasattr(self, "_clear_creature_auras"):
+                self._clear_creature_auras(int(low_guid))
             combat.setdefault("idle_settle", {}).pop(int(low_guid), None)
             self._creature_spawn_cache.pop(int(low_guid), None)
             if combat["loot_target"] and creature.creature_low_guid(

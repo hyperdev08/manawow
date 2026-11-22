@@ -318,6 +318,12 @@ class SocketBase:
                 "aggro": {},
                 # active damage/heal over time effects
                 "dots": [],
+                # persistent ground AoE effects (Blizzard, Consecration, ...)
+                "area_effects": [],
+                # modifier auras (slow/root/stun/stat/...), player + creatures
+                "auras": [],
+                "creature_auras": {},
+                "aura_state": {},
                 "loot_target": 0,
                 "loot_items": [],
                 "loot_taken": [],

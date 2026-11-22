@@ -341,3 +341,23 @@ CREATE TABLE IF NOT EXISTS spell_duration(
   duration_per_level INTEGER NOT NULL DEFAULT 0,
   max_duration INTEGER NOT NULL DEFAULT 0
 );
+
+-- CMaNGOS ``playercreateinfo_spell``: the exact spells every race/class
+-- combination knows at creation.
+CREATE TABLE IF NOT EXISTS playercreateinfo_spell(
+  race INTEGER NOT NULL DEFAULT 0,
+  class INTEGER NOT NULL DEFAULT 0,
+  spell INTEGER NOT NULL DEFAULT 0,
+  note TEXT NOT NULL DEFAULT '',
+  PRIMARY KEY(race, class, spell)
+);
+
+-- CMaNGOS ``playercreateinfo_action``: the default action bar per race/class.
+CREATE TABLE IF NOT EXISTS playercreateinfo_action(
+  race INTEGER NOT NULL DEFAULT 0,
+  class INTEGER NOT NULL DEFAULT 0,
+  button INTEGER NOT NULL DEFAULT 0,
+  action INTEGER NOT NULL DEFAULT 0,
+  type INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY(race, class, button)
+);

@@ -1,6 +1,7 @@
 """Player spell casting, power/cooldown spend and spell effects."""
 from __future__ import annotations
 
+import math
 import random
 import struct
 import time
@@ -23,6 +24,51 @@ from .constants import (
     SPELL_FAILED_SPELL_UNAVAILABLE,
 )
 
+# ``SpellCastTargetFlags`` (3.3.5a SpellDefines.h).  ``SpellCastTargets::Read``
+# consumes a packed guid for object targets, then item guids, then source/dest
+# locations (each a packed transport guid plus three floats) and finally a
+# string.  Ground-targeted AoE spells put the click position in the dest block.
+TARGET_FLAG_UNIT = 0x00000002
+TARGET_FLAG_ITEM = 0x00000010
+TARGET_FLAG_SOURCE_LOCATION = 0x00000020
+TARGET_FLAG_DEST_LOCATION = 0x00000040
+TARGET_FLAG_CORPSE_ENEMY = 0x00000200
+TARGET_FLAG_GAMEOBJECT = 0x00000800
+TARGET_FLAG_TRADE_ITEM = 0x00001000
+TARGET_FLAG_STRING = 0x00002000
+TARGET_FLAG_CORPSE_ALLY = 0x00008000
+TARGET_FLAG_UNIT_MINIPET = 0x00010000
+
+OBJECT_TARGET_FLAGS = (TARGET_FLAG_UNIT | TARGET_FLAG_UNIT_MINIPET
+                       | TARGET_FLAG_GAMEOBJECT | TARGET_FLAG_CORPSE_ENEMY
+                       | TARGET_FLAG_CORPSE_ALLY)
+ITEM_TARGET_FLAGS = TARGET_FLAG_ITEM | TARGET_FLAG_TRADE_ITEM
+
+# Effect types that can be applied to every unit in an area/cone.  The direct
+# damage and aura branches share the existing single-target code paths.
+AREA_EFFECT_TYPES = frozenset((
+    spells.SPELL_EFFECT_SCHOOL_DAMAGE,
+    spells.SPELL_EFFECT_HEALTH_LEECH,
+    spells.SPELL_EFFECT_WEAPON_DAMAGE,
+    spells.SPELL_EFFECT_WEAPON_DAMAGE_NOSCHOOL,
+    spells.SPELL_EFFECT_NORMALIZED_WEAPON_DMG,
+    spells.SPELL_EFFECT_WEAPON_PERCENT_DAMAGE,
+    spells.SPELL_EFFECT_APPLY_AURA,
+))
+
+DIRECT_DAMAGE_TYPES = frozenset((
+    spells.SPELL_EFFECT_SCHOOL_DAMAGE,
+    spells.SPELL_EFFECT_HEALTH_LEECH,
+    spells.SPELL_EFFECT_WEAPON_DAMAGE,
+    spells.SPELL_EFFECT_WEAPON_DAMAGE_NOSCHOOL,
+    spells.SPELL_EFFECT_NORMALIZED_WEAPON_DMG,
+    spells.SPELL_EFFECT_WEAPON_PERCENT_DAMAGE,
+))
+
+CONE_HALF_ANGLE = math.pi / 4.0        # 90-degree cone, like the 3.3.5 core
+CHAIN_JUMP_RADIUS = 10.0
+CHAIN_DAMAGE_FALLOFF = 0.7
+
 class SpellsMixin:
     async def handle_cast_spell(self, data: bytes):
         """``CMSG_CAST_SPELL``: the client pressed a spell.
@@ -44,16 +90,36 @@ class SpellsMixin:
         send_cast_flags = data[pos] if len(data) > pos else 0
         pos += 1
         target_guid = 0
+        dest = None
         if len(data) >= pos + 4:
             target_flags = struct.unpack_from("<I", data, pos)[0]
             pos += 4
-            if target_flags & 0x0F06:      # UNIT | UNIT_MINIPET | GAMEOBJECT | CORPSE
+            if target_flags & OBJECT_TARGET_FLAGS:
                 target_guid, pos = self._read_packed_guid(data, pos)
+            if target_flags & ITEM_TARGET_FLAGS and pos < len(data):
+                _item_guid, pos = self._read_packed_guid(data, pos)
+            if target_flags & TARGET_FLAG_SOURCE_LOCATION:
+                _transport, pos = self._read_packed_guid(data, pos)
+                if len(data) >= pos + 12:
+                    pos += 12                 # source position (unused)
+            if target_flags & TARGET_FLAG_DEST_LOCATION:
+                _transport, pos = self._read_packed_guid(data, pos)
+                if len(data) >= pos + 12:
+                    dest = struct.unpack_from("<fff", data, pos)
+                    pos += 12
+            # A trailing target string (TARGET_FLAG_STRING) is not used by any
+            # spell the server executes, so the remainder is ignored.
         _ = send_cast_flags
 
         if combat["dead"]:
             await self._cast_failed(cast_id, spell_id, SPELL_FAILED_CASTER_DEAD)
             return
+        if hasattr(self, "_player_aura_mods"):
+            mods = self._player_aura_mods()
+            if mods["stunned"] or mods["silenced"]:
+                await self._cast_failed(cast_id, spell_id,
+                                        SPELL_FAILED_CASTER_AURASTATE)
+                return
         if spell_id not in self.known_spell_ids:
             await self._cast_failed(cast_id, spell_id, SPELL_FAILED_NOT_KNOWN)
             return
@@ -87,6 +153,14 @@ class SpellsMixin:
                                    self._creature_position(target_low))
                         > spell_range + self._melee_reach(spawn)):
                     await self._cast_failed(cast_id, spell_id, SPELL_FAILED_OUT_OF_RANGE)
+                    return
+        if dest is not None:
+            spell_range = template.get_range()
+            if spell_range < 49000.0:
+                spell_range = max(spell_range, 0.5)
+                if self._distance(self._player_position(), dest) > spell_range + 0.5:
+                    await self._cast_failed(cast_id, spell_id,
+                                            SPELL_FAILED_OUT_OF_RANGE)
                     return
 
         # Finishing moves (Eviscerate, Slice and Dice, Kidney Shot, ...) need
@@ -135,6 +209,10 @@ class SpellsMixin:
 
         cast = spells.SpellCast(self.player_guid, spell_id, target_guid)
         cast.template = template
+        if dest is not None:
+            cast.x, cast.y, cast.z = (float(dest[0]), float(dest[1]),
+                                      float(dest[2]))
+            cast.has_dest = True
         cast_time_ms = template.get_casting_time_ms()
         # ``Spell::SendSpellStart`` also sets ``CAST_FLAG_NO_GCD`` for rune
         # spells ("not needed, but B sends it"), so mirror the reference.
@@ -159,6 +237,7 @@ class SpellsMixin:
                 "spell_id": spell_id,
                 "target_guid": target_guid,
                 "template": template,
+                "dest": dest,
                 "finish_at": now + cast_time_ms / 1000.0,
             }
             return
@@ -387,9 +466,32 @@ class SpellsMixin:
         combo_points = 0
         if target_guid and int(target_guid) == self._combo_target():
             combo_points = self._combo_points()
+        ground_started = False
+        aura_patterns: set = set()
         for index, effect in enumerate(template.effects):
             etype = int(effect["effect"])
             if not etype:
+                continue
+            # Persistent ground auras (Blizzard, Consecration, Death and Decay,
+            # ...) are created once per cast; their companion
+            # PERIODIC_TRIGGER_SPELL effect supplies the tick damage.
+            if etype == spells.SPELL_EFFECT_PERSISTENT_AREA_AURA:
+                if template.is_ground_area(index) and not ground_started:
+                    ground_started = True
+                    self._start_ground_area(cast, template, index, caster_level)
+                continue
+            area_kind = template.effect_area_kind(index)
+            if area_kind is not None and etype in AREA_EFFECT_TYPES:
+                await self._apply_area_effect(
+                    cast, template, index, effect, area_kind, target_guid,
+                    combo_points, caster_level)
+                continue
+            chain_count = int(effect.get("chain_targets") or 0)
+            if (chain_count > 1 and target_guid
+                    and etype in DIRECT_DAMAGE_TYPES):
+                await self._apply_chain_effect(
+                    cast, template, index, effect, target_guid,
+                    combo_points, caster_level, chain_count)
                 continue
             if etype == spells.SPELL_EFFECT_SCHOOL_DAMAGE:
                 if not target_guid:
@@ -402,15 +504,14 @@ class SpellsMixin:
                 )
             elif etype in (spells.SPELL_EFFECT_WEAPON_DAMAGE,
                            spells.SPELL_EFFECT_WEAPON_DAMAGE_NOSCHOOL,
-                           spells.SPELL_EFFECT_NORMALIZED_WEAPON_DMG):
+                           spells.SPELL_EFFECT_NORMALIZED_WEAPON_DMG,
+                           spells.SPELL_EFFECT_WEAPON_PERCENT_DAMAGE):
                 if not target_guid:
                     continue
-                weapon = self._player_weapon_stats()
-                amount = int(random.uniform(weapon["min"], weapon["max"]))
-                amount += template.effect_value(index, caster_level, combo_points)
-                amount += max(1, int(caster_level * 0.5))
+                amount = self._direct_effect_damage(
+                    etype, template, index, effect, caster_level, combo_points)
                 await self._deal_damage_to_target(
-                    target_guid, max(1, amount), 1, template.id, player_guid
+                    target_guid, amount, 1, template.id, player_guid
                 )
             elif etype == spells.SPELL_EFFECT_ATTACK:
                 if not target_guid:
@@ -490,6 +591,301 @@ class SpellsMixin:
             elif etype == spells.SPELL_EFFECT_APPLY_AURA:
                 self._apply_periodic_aura(template, effect, index, caster_level,
                                           target_guid, combo_points)
+                if hasattr(self, "_apply_aura_from_effect"):
+                    target_a = int(effect.get("target_a") or 0)
+                    target_b = int(effect.get("target_b") or 0)
+                    if (not target_guid or target_a in (1, 22)
+                            or target_b in (1, 22)):
+                        target_kind = "player"
+                        aura_target = int(self.player_guid)
+                    else:
+                        target_kind = None
+                        aura_target = target_guid
+                    pattern = (target_a, target_b)
+                    if pattern not in aura_patterns:
+                        aura_patterns.add(pattern)
+                        await self._apply_aura_from_effect(
+                            template, effect, index, player_guid, aura_target,
+                            caster_level, combo_points, target_kind=target_kind)
+
+    # ------------------------------------------------------------------
+    # Area of effect (AoE)
+    # ------------------------------------------------------------------
+    def _direct_effect_damage(self, etype: int, template, index: int,
+                              effect: dict, caster_level: int,
+                              combo_points: int = 0) -> int:
+        """Damage one target of a direct-damage effect would take."""
+        if etype in (spells.SPELL_EFFECT_SCHOOL_DAMAGE,
+                     spells.SPELL_EFFECT_HEALTH_LEECH):
+            return max(0, template.effect_value(index, caster_level,
+                                                combo_points))
+        weapon = self._player_weapon_stats()
+        roll = random.uniform(weapon["min"], weapon["max"])
+        if etype == spells.SPELL_EFFECT_WEAPON_PERCENT_DAMAGE:
+            percent = (int(effect.get("base_points") or 0) + 1) / 100.0
+            return max(1, int(roll * percent))
+        amount = int(roll)
+        amount += template.effect_value(index, caster_level, combo_points)
+        amount += max(1, int(caster_level * 0.5))
+        return max(1, amount)
+
+    def _area_center(self, template, index: int, cast, target_guid: int):
+        """Reference position for an area/cone effect."""
+        effect = template.get_effect(index)
+        a = int(effect.get("target_a") or 0) if effect else 0
+        b = int(effect.get("target_b") or 0) if effect else 0
+        # Caster-centred spells (Arcane Explosion 22/15, Consecration 18/16,
+        # Whirlwind 22/15) never use the click location.
+        if (a in (spells.TARGET_DEST_CASTER, spells.TARGET_SRC_CASTER)
+                or b == spells.TARGET_UNIT_SRC_AREA_ENEMY):
+            return self._player_position()
+        if cast is not None and getattr(cast, "has_dest", False):
+            return (float(cast.x), float(cast.y), float(cast.z))
+        if (target_guid and not self._is_player_guid(target_guid)):
+            low = creature.creature_low_guid(target_guid)
+            if self._get_creature_spawn(low) is not None:
+                return self._creature_position(low)
+        return self._player_position()
+
+    def _select_area_targets(self, center, radius: float, kind: str,
+                             max_targets: int = 0):
+        """Return ``[(low_guid, spawn), ...]`` inside an area or cone."""
+        facing = float(self.character.get("o", 0.0) or 0.0)
+        gathered = []
+        for low_guid, spawn in list(self._creature_spawn_cache.items()):
+            if int(low_guid) in getattr(self, "_summoned_creatures", {}):
+                continue
+            if spawn is None or int(spawn["dead_since"] or 0) > 0:
+                continue
+            pos = self._creature_position(int(low_guid))
+            distance = self._distance(center, pos)
+            if radius > 0.0 and distance > radius + 0.5:
+                continue
+            if kind == "cone":
+                angle = math.atan2(pos[1] - center[1], pos[0] - center[0])
+                delta = (angle - facing + math.pi) % (2.0 * math.pi) - math.pi
+                if abs(delta) > CONE_HALF_ANGLE:
+                    continue
+            gathered.append((distance, int(low_guid), spawn))
+        gathered.sort(key=lambda item: item[0])
+        if max_targets and max_targets > 0:
+            gathered = gathered[:max_targets]
+        return [(low_guid, spawn) for _distance, low_guid, spawn in gathered]
+
+    async def _apply_area_effect(self, cast, template, index: int, effect: dict,
+                                 kind: str, target_guid: int,
+                                 combo_points: int, caster_level: int) -> None:
+        """Apply one direct/aura effect to every unit in its area or cone."""
+        etype = int(effect["effect"])
+        player_guid = int(self.player_guid)
+        if kind == "ally":
+            # Party/raid membership is not modelled; the caster is always in
+            # their own area effect, so at least self-heals/buffs work.
+            if etype in (spells.SPELL_EFFECT_HEAL,
+                         spells.SPELL_EFFECT_HEAL_MAX_HEALTH):
+                amount = template.effect_value(index, caster_level, combo_points)
+                if amount > 0:
+                    healed, overheal = await self._heal_player(amount)
+                    await self._send_spell_heal_log(
+                        player_guid, player_guid, template.id, healed, overheal)
+            elif etype == spells.SPELL_EFFECT_APPLY_AURA:
+                self._apply_periodic_aura(template, effect, index, caster_level,
+                                          player_guid, combo_points)
+                if hasattr(self, "_apply_aura_from_effect"):
+                    await self._apply_aura_from_effect(
+                        template, effect, index, player_guid, player_guid,
+                        caster_level, combo_points, target_kind="player")
+            return
+        radius = template.effect_radius(index)
+        if radius <= 0.0:
+            radius = 10.0
+        center = self._area_center(template, index, cast, target_guid)
+        targets = self._select_area_targets(center, radius, kind,
+                                            template.max_targets)
+        if not targets:
+            return
+        amount = 0
+        if etype in DIRECT_DAMAGE_TYPES:
+            amount = self._direct_effect_damage(
+                etype, template, index, effect, caster_level, combo_points)
+        for low_guid, spawn in targets:
+            guid = self._creature_object_guid(low_guid, int(spawn["entry"]))
+            if etype in (spells.SPELL_EFFECT_SCHOOL_DAMAGE,
+                         spells.SPELL_EFFECT_WEAPON_DAMAGE,
+                         spells.SPELL_EFFECT_WEAPON_DAMAGE_NOSCHOOL,
+                         spells.SPELL_EFFECT_NORMALIZED_WEAPON_DMG,
+                         spells.SPELL_EFFECT_WEAPON_PERCENT_DAMAGE):
+                if amount <= 0:
+                    continue
+                await self._deal_damage_to_target(
+                    guid, amount, template.school or 1, template.id, player_guid)
+            elif etype == spells.SPELL_EFFECT_HEALTH_LEECH:
+                if amount <= 0:
+                    continue
+                await self._deal_damage_to_target(
+                    guid, amount, template.school or 1, template.id, player_guid)
+                healed, _ = await self._heal_player(amount)
+                await self._send_spell_heal_log(
+                    player_guid, player_guid, template.id, healed, 0)
+            elif etype == spells.SPELL_EFFECT_APPLY_AURA:
+                self._apply_periodic_aura(template, effect, index, caster_level,
+                                          guid, combo_points)
+                if hasattr(self, "_apply_aura_from_effect"):
+                    await self._apply_aura_from_effect(
+                        template, effect, index, player_guid, guid,
+                        caster_level, combo_points, target_kind="creature")
+
+    async def _apply_chain_effect(self, cast, template, index: int,
+                                  effect: dict, target_guid: int,
+                                  combo_points: int, caster_level: int,
+                                  chain_count: int) -> None:
+        """Chain Lightning/Multi-Shot: primary target plus nearby jumps."""
+        etype = int(effect["effect"])
+        player_guid = int(self.player_guid)
+        if etype not in (spells.SPELL_EFFECT_SCHOOL_DAMAGE,
+                         spells.SPELL_EFFECT_WEAPON_DAMAGE,
+                         spells.SPELL_EFFECT_WEAPON_DAMAGE_NOSCHOOL,
+                         spells.SPELL_EFFECT_NORMALIZED_WEAPON_DMG,
+                         spells.SPELL_EFFECT_WEAPON_PERCENT_DAMAGE):
+            return
+        base = self._direct_effect_damage(
+            etype, template, index, effect, caster_level, combo_points)
+        hit: list[int] = []
+        current = int(target_guid)
+        for jump in range(max(1, chain_count)):
+            if not current:
+                break
+            low = creature.creature_low_guid(current)
+            if low in getattr(self, "_summoned_creatures", {}):
+                break
+            spawn = self._get_creature_spawn(low)
+            if spawn is None or int(spawn["dead_since"] or 0) > 0:
+                break
+            amount = max(1, int(base * (CHAIN_DAMAGE_FALLOFF ** jump)))
+            await self._deal_damage_to_target(
+                current, amount, template.school or 1, template.id, player_guid)
+            hit.append(current)
+            # Find the closest not-yet-hit enemy near the last jump target.
+            here = self._creature_position(low)
+            candidates = []
+            for other_low, other in list(self._creature_spawn_cache.items()):
+                if other is None or int(other["dead_since"] or 0) > 0:
+                    continue
+                other_guid = self._creature_object_guid(
+                    int(other_low), int(other["entry"]))
+                if other_guid in hit:
+                    continue
+                if int(other_low) in getattr(self, "_summoned_creatures", {}):
+                    continue
+                distance = self._distance(
+                    here, self._creature_position(int(other_low)))
+                if distance <= CHAIN_JUMP_RADIUS:
+                    candidates.append((distance, other_guid))
+            candidates.sort(key=lambda item: item[0])
+            current = candidates[0][1] if candidates else 0
+
+    def _start_ground_area(self, cast, template, index: int,
+                           caster_level: int, center=None,
+                           caster_guid: int | None = None,
+                           hostile_to_player: bool = False) -> None:
+        """Create a persistent ground effect (Blizzard, Consecration, ...)."""
+        effect = template.get_effect(index)
+        if effect is None:
+            return
+        radius = template.effect_radius(index)
+        if radius <= 0.0:
+            radius = 10.0
+        if center is None:
+            center = self._area_center(template, index, cast, 0)
+        duration_ms = spells.spell_duration_ms(
+            self.config.database.world_path, template.duration_index,
+            caster_level)
+        if duration_ms <= 0:
+            duration_ms = 8000
+        interval = max(250, int(effect.get("amplitude") or 1000)) / 1000.0
+        amount = template.effect_value(index, caster_level)
+        school = int(template.school) or 1
+        aura = int(effect.get("apply_aura") or 0)
+        # Blizzard/Rain of Fire/Volley/Hurricane keep the damage in a companion
+        # PERIODIC_TRIGGER_SPELL effect; the persistent aura itself is a dummy.
+        for other in template.effects:
+            if int(other.get("apply_aura") or 0) != spells.SPELL_AURA_PERIODIC_TRIGGER_SPELL:
+                continue
+            trigger_id = int(other.get("trigger_spell") or 0)
+            if not trigger_id:
+                continue
+            triggered = spells.get_spell_template(
+                self.config.database.world_path, trigger_id)
+            if triggered is None:
+                break
+            for trigger_index, trigger_effect in enumerate(triggered.effects):
+                if int(trigger_effect.get("effect") or 0) == \
+                        spells.SPELL_EFFECT_SCHOOL_DAMAGE:
+                    amount = triggered.effect_value(trigger_index, caster_level)
+                    school = int(triggered.school) or school
+                    break
+            interval = max(250, int(other.get("amplitude") or 1000)) / 1000.0
+            break
+        if aura in (spells.SPELL_AURA_PERIODIC_DAMAGE,
+                    spells.SPELL_AURA_PERIODIC_DUMMY):
+            interval = max(250, int(effect.get("amplitude") or 1000)) / 1000.0
+        if amount <= 0:
+            return
+        now = time.monotonic()
+        combat = self._get_combat_state()
+        effects = combat.setdefault("area_effects", [])
+        effects.append({
+            "spell_id": int(template.id),
+            "caster_guid": int(caster_guid if caster_guid is not None
+                               else self.player_guid),
+            "center": (float(center[0]), float(center[1]), float(center[2])),
+            "radius": float(radius),
+            "school": int(school),
+            "amount": max(1, int(amount)),
+            "interval": float(interval),
+            "next_tick": now + float(interval),
+            "expires": now + duration_ms / 1000.0,
+            "max_targets": int(template.max_targets or 0),
+            "hostile_to_player": bool(hostile_to_player),
+        })
+        self.log.debug(
+            f"Ground AoE {template.name} ({template.id}) at {center} "
+            f"r={radius:.1f} for {duration_ms} ms"
+        )
+
+    async def _tick_area_effects(self, now: float) -> None:
+        """Tick persistent ground effects (Blizzard, Consecration, ...)."""
+        combat = self._get_combat_state()
+        effects = combat.get("area_effects")
+        if not effects:
+            return
+        alive = []
+        for area in effects:
+            if area["expires"] <= now:
+                continue
+            if area["next_tick"] <= now:
+                area["next_tick"] = now + area["interval"]
+                targets = self._select_area_targets(
+                    area["center"], area["radius"], "enemy",
+                    area.get("max_targets") or 0)
+                for low_guid, spawn in targets:
+                    guid = self._creature_object_guid(
+                        low_guid, int(spawn["entry"]))
+                    await self._deal_damage_to_target(
+                        guid, area["amount"], area["school"],
+                        area["spell_id"], area["caster_guid"])
+                if (area.get("hostile_to_player")
+                        and self._distance(area["center"],
+                                           self._player_position())
+                        <= area["radius"] + 0.5):
+                    await self._damage_player(
+                        area["amount"], f"spell {area['spell_id']}")
+                    await self._send_spell_damage_log(
+                        int(self.player_guid), int(area["caster_guid"]),
+                        int(area["spell_id"]), int(area["amount"]),
+                        int(area["school"]) or 1, periodic=1)
+            alive.append(area)
+        combat["area_effects"] = alive
 
     async def _cast_triggered(self, spell_id: int, target_guid: int) -> None:
         """Cast a triggered spell immediately, ignoring costs and cooldowns."""
@@ -509,31 +905,56 @@ class SpellsMixin:
     def _apply_periodic_aura(self, template, effect, index: int,
                              caster_level: int, target_guid: int,
                              combo_points: int = 0) -> None:
-        """Register a damage/heal over-time effect on the target."""
+        """Register a damage/heal/energize over-time effect on the target."""
         aura = int(effect["apply_aura"])
         if aura not in (spells.SPELL_AURA_PERIODIC_DAMAGE,
                         spells.SPELL_AURA_PERIODIC_HEAL,
-                        spells.SPELL_AURA_PERIODIC_LEECH):
+                        spells.SPELL_AURA_PERIODIC_LEECH,
+                        spells.SPELL_AURA_PERIODIC_ENERGIZE):
             return
         if not target_guid:
             return
-        amplitude = max(1, int(effect["amplitude"] or 2000)) // 1000
+        amplitude = max(250, int(effect["amplitude"] or 2000)) / 1000.0
         amount = template.effect_value(index, caster_level, combo_points)
         if amount <= 0:
             return
-        # ``SpellDuration.dbc`` is not imported, so a periodic aura simply runs
-        # for 15 s; re-casting refreshes it.
+        duration_ms = spells.spell_duration_ms(
+            self.config.database.world_path, template.duration_index,
+            caster_level)
+        if duration_ms <= 0:
+            duration_ms = 15000
         now = time.monotonic()
         combat = self._get_combat_state()
+        # Re-casting the same periodic aura refreshes it instead of stacking a
+        # second copy on the target.
+        for dot in combat["dots"]:
+            if (dot["spell_id"] == int(template.id)
+                    and int(dot["target_guid"]) == int(target_guid)
+                    and int(dot.get("caster_guid") or self.player_guid)
+                    == int(self.player_guid)):
+                dot["amount"] = amount
+                dot["interval"] = float(amplitude)
+                dot["next_tick"] = now + float(amplitude)
+                dot["expires"] = now + duration_ms / 1000.0
+                dot["school"] = int(template.school)
+                dot["is_heal"] = aura == spells.SPELL_AURA_PERIODIC_HEAL
+                dot["energize"] = (int(effect.get("misc_value") or 0)
+                                   if aura == spells.SPELL_AURA_PERIODIC_ENERGIZE
+                                   else None)
+                return
         combat["dots"].append({
             "target_guid": int(target_guid),
+            "caster_guid": int(self.player_guid),
             "spell_id": int(template.id),
             "amount": amount,
             "school": int(template.school),
             "interval": float(amplitude),
             "next_tick": now + float(amplitude),
-            "expires": now + 15.0,
+            "expires": now + duration_ms / 1000.0,
             "is_heal": aura == spells.SPELL_AURA_PERIODIC_HEAL,
+            "energize": (int(effect.get("misc_value") or 0)
+                         if aura == spells.SPELL_AURA_PERIODIC_ENERGIZE
+                         else None),
         })
 
     async def _deal_damage_to_target(self, target_guid: int, damage: int,
@@ -554,6 +975,11 @@ class SpellsMixin:
         target_guid = pending["target_guid"]
         cast = spells.SpellCast(self.player_guid, pending["spell_id"], target_guid)
         cast.template = template
+        dest = pending.get("dest")
+        if dest is not None:
+            cast.x, cast.y, cast.z = (float(dest[0]), float(dest[1]),
+                                      float(dest[2]))
+            cast.has_dest = True
         # ``Spell::update`` -> ``finish``: pay for the spell, then tell the
         # client it went off.  Both the ``SMSG_POWER_UPDATE`` from the spend and
         # the predicted power inside ``SMSG_SPELL_GO`` therefore carry the same
@@ -586,12 +1012,36 @@ class SpellsMixin:
         # Player casts tag the dot with the player; creature spells carry their
         # own caster guid so the combat log names the right source.
         caster_guid = int(dot.get("caster_guid") or self.player_guid)
+        if dot.get("energize") is not None:
+            power_type = int(dot["energize"])
+            if self._is_player_guid(target_guid) \
+                    and power_type == self._power_type():
+                current = int(self.character.get("power", 0))
+                await self._set_player_power(
+                    min(self._max_power(), current + amount))
+            return
         if dot["is_heal"]:
             if self._is_player_guid(target_guid):
                 healed, _ = await self._heal_player(amount)
                 await self._send_spell_heal_log(
                     target_guid, caster_guid, dot["spell_id"], healed, 0,
                 )
+            else:
+                low = creature.creature_low_guid(target_guid)
+                spawn = self._get_creature_spawn(low)
+                if spawn is not None:
+                    current = self._creature_health(low)
+                    maximum = self._creature_max_health(spawn)
+                    healed = min(maximum - current, amount)
+                    if healed > 0:
+                        self._set_creature_health(low, current + healed)
+                        await self._send_creature_fields(low, {
+                            F.UNIT_FIELD_HEALTH: current + healed,
+                            F.UNIT_FIELD_MAXHEALTH: maximum,
+                        })
+                    await self._send_spell_heal_log(
+                        target_guid, caster_guid, dot["spell_id"],
+                        max(0, healed), max(0, amount - healed))
             return
         if self._is_player_guid(target_guid):
             await self._damage_player(amount, f"periodic {dot['spell_id']}")

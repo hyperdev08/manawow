@@ -110,42 +110,54 @@ def build_initial_spells(char: Mapping, known_spell_ids: Optional[List[int]] = N
     is 1; with 0 it treats the packet as a partial resync and the spells never
     show up in the spellbook or on the action bar.
 
-    We send the character's known spells (from character_spells table) plus
-    all language spells so the client populates m_languageSpells for every
-    language. The spell slot is the action bar slot (0 = not on action bar).
+    The known spells come from the authentic ``playercreateinfo_spell`` data,
+    which already contains the character's racial languages (Language Common,
+    Orcish, ...).  The client builds ``m_languageSpells`` from those
+    ``SPELL_EFFECT_LANGUAGE`` spells, exactly like the reference core.
     """
     if known_spell_ids is None:
         known_spell_ids = []
-    
-    # Combine known spells with language spells (deduplicate)
-    all_spell_ids = list(dict.fromkeys(known_spell_ids + _ALL_LANGUAGE_SPELLS))
+
+    spell_ids = list(dict.fromkeys(int(s) for s in known_spell_ids))
 
     out = bytearray()
     out += struct.pack("<B", 1)          # initial login (rebuild spellbook)
-    out += struct.pack("<H", len(all_spell_ids))  # spell count
-    for spell_id in all_spell_ids:
+    out += struct.pack("<H", len(spell_ids))  # spell count
+    for spell_id in spell_ids:
         out += struct.pack("<IH", spell_id, 0)  # spell_id, slot (0 = not on action bar)
     out += struct.pack("<H", 0)          # cooldown count = 0
     return bytes(out)
 
 
-def build_action_buttons(spell_ids: Optional[List[int]] = None) -> bytes:
-    """``SMSG_ACTION_BUTTONS`` with one spell action per bar slot.
+def build_action_buttons(buttons: Optional[dict] = None) -> bytes:
+    """``SMSG_ACTION_BUTTONS`` with one action per bar slot.
 
     ``UpdateActionButtons::Write`` sends ``uint8 reason`` followed by exactly
-    144 packed uint32 buttons.  A spell button is ``spell_id | (type << 24)``
-    with type 0 (ACTION_BUTTON_SPELL).  TrinityCore sends reason 1 for the
-    initial action buttons; the client then validates that every spell is
-    present in ``SMSG_INITIAL_SPELLS``, which is why that packet has to be sent
-    first.
+    144 packed uint32 buttons.  A spell button is ``(action & 0xFFFFFF) |
+    (type << 24)``; ``type`` is 0 for a spell and 128 for a macro.  The usual
+    argument is the ``{slot: (action, type)}`` mapping returned by
+    ``get_character_action_buttons``.  A plain list of spell ids is still
+    accepted and placed from slot 0.
+    TrinityCore sends reason 1 for the initial action buttons; the client then
+    validates that every spell is present in ``SMSG_INITIAL_SPELLS``, which is
+    why that packet has to be sent first.
     """
-    buttons = [0] * MAX_ACTION_BUTTONS
-    for index, spell_id in enumerate(spell_ids or []):
-        if index >= MAX_ACTION_BUTTONS:
-            break
-        buttons[index] = (int(spell_id) & 0xFFFFFF) | (0 << 24)
+    slots = [0] * MAX_ACTION_BUTTONS
+    if isinstance(buttons, dict):
+        for index, value in buttons.items():
+            index = int(index)
+            if not 0 <= index < MAX_ACTION_BUTTONS:
+                continue
+            action, action_type = value
+            slots[index] = ((int(action) & 0xFFFFFF)
+                            | ((int(action_type) & 0xFF) << 24))
+    else:
+        for index, spell_id in enumerate(buttons or []):
+            if index >= MAX_ACTION_BUTTONS:
+                break
+            slots[index] = (int(spell_id) & 0xFFFFFF) | (0 << 24)
     out = bytearray([1])                 # reason: initial action buttons
-    out += struct.pack(f"<{MAX_ACTION_BUTTONS}I", *buttons)
+    out += struct.pack(f"<{MAX_ACTION_BUTTONS}I", *slots)
     return bytes(out)
 
 
@@ -167,6 +179,22 @@ def build_init_world_states(char: Mapping) -> bytes:
 
 def build_login_set_time_speed(now: float | None = None) -> bytes:
     return struct.pack("<IfI", _packed_wow_time(now), TIME_SPEED, 0)
+
+
+def build_force_run_speed(guid: int, speed: float) -> bytes:
+    """``SMSG_FORCE_RUN_SPEED_CHANGE``: packed guid, uint32 0, float speed."""
+    return (object_update.pack_guid(int(guid))
+            + struct.pack("<If", 0, float(speed)))
+
+
+def build_force_move_root(guid: int) -> bytes:
+    """``SMSG_FORCE_MOVE_ROOT``: packed guid, uint32 0."""
+    return object_update.pack_guid(int(guid)) + struct.pack("<I", 0)
+
+
+def build_force_move_unroot(guid: int) -> bytes:
+    """``SMSG_FORCE_MOVE_UNROOT``: packed guid, uint32 0."""
+    return object_update.pack_guid(int(guid)) + struct.pack("<I", 0)
 
 
 def build_name_query_response(char: Mapping) -> bytes:
@@ -646,20 +674,12 @@ TEXT_EMOTE_DANCE = 26
 TEXT_EMOTE_WAVE = 27
 
 
-# Language spell IDs for 3.3.5a (spells with SPELL_EFFECT_LANGUAGE = 39).
-# Each spell teaches one language via its effectMiscValue[0] (the language ID).
-# The client iterates SMSG_INITIAL_SPELLS and for each spell with that effect:
-#   m_languageSpells[effectMiscValue] = spellId
-# Then GetLanguageSkill(language) looks up the spell and uses SpellTableLookupAbility
-# to find the skill line, then checks if the player has that skill.
-#
-# Known language spells (from TrinityCore 3.3.5a):
-#   668 -> Common (lang 7)     669 -> Orcish (lang 1)     670 -> Dwarven (lang 6)
-#   671 -> Darnassian (lang 2)  672 -> Gutterspeak (lang 33)  673 -> Taurahe (lang 3)
-#   674 -> Draenei (lang 35)    675 -> Thalassian (lang 10)   676 -> Gnomish (lang 13)
-#   677 -> Zandali (lang 14)    678 -> Goblin (lang 15, not playable)
-# We send ALL of them for every race so the client can speak/understand any language.
-_ALL_LANGUAGE_SPELLS = [668, 669, 670, 671, 672, 673, 674, 675, 676, 677, 678]
+# Language spell IDs taught by ``playercreateinfo_spell`` in 3.3.5a:
+#   668 Common, 669 Orcish, 670 Taurahe, 671 Darnassian, 672 Dwarven,
+#   813 Thalassian, 7340 Gnomish, 7341 Troll (Zandali),
+#   17737 Gutterspeak, 29932 Draenei.
+# The authentic starter table already grants the right ones per race, so
+# ``SMSG_INITIAL_SPELLS`` simply sends the character's known spells.
 
 
 def build_message_chat_payload(message_type: int, language: int, sender_guid: int,
@@ -824,7 +844,7 @@ def build_item_push_result(
 def build_login_packets(char: Mapping, motd: str,
                         creature_blocks: List[bytes] | None = None,
                         known_spell_ids: Optional[List[int]] = None,
-                        action_spell_ids: Optional[List[int]] = None) -> List[Tuple[int, bytes]]:
+                        action_buttons: Optional[dict] = None) -> List[Tuple[int, bytes]]:
     """Return ``[(opcode, payload), ...]`` in the order the client expects.
 
     Order mirrors TrinityCore 3.3.5a ``WorldSession::HandlePlayerLogin`` +
@@ -850,7 +870,7 @@ def build_login_packets(char: Mapping, motd: str,
         (Opcodes.SMSG_LEARNED_DANCE_MOVES, struct.pack("<II", 0, 0)),
         (Opcodes.SMSG_BINDPOINTUPDATE, build_bind_point(char)),
         (Opcodes.SMSG_INITIAL_SPELLS, build_initial_spells(char, known_spell_ids)),
-        (Opcodes.SMSG_ACTION_BUTTONS, build_action_buttons(action_spell_ids)),
+        (Opcodes.SMSG_ACTION_BUTTONS, build_action_buttons(action_buttons)),
         (Opcodes.SMSG_INITIALIZE_FACTIONS, build_initialize_factions()),
         (Opcodes.SMSG_LOGIN_SETTIMESPEED, build_login_set_time_speed()),
         (Opcodes.SMSG_NAME_QUERY_RESPONSE, build_name_query_response(char)),

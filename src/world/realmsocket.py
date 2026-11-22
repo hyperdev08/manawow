@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from src.protocol.opcodes import Opcodes
 from src.world.worldsocket.auth import AuthMixin
+from src.world.worldsocket.auras import AurasMixin
 from src.world.worldsocket.base import SocketBase
 from src.world.worldsocket.characters import CharactersMixin
 from src.world.worldsocket.chat import ChatMixin
@@ -47,6 +48,7 @@ class WorldSocket(
     PlayerMovementMixin,
     ChatMixin,
     StatsMixin,
+    AurasMixin,
     RunesMixin,
     SpellsMixin,
     CombatMixin,

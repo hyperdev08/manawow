@@ -52,7 +52,9 @@ A real 3.3.5a client can now log in, pick a character and **enter the world**:
 - Spawn visibility: each session keeps only a 150-yard neighbourhood, scanned using the `(map, x, y)` index and repeated after the player has moved 25 yards
 
 ### Combat + spells (real 3.3.5a layouts)
-- `character_spells` stores the spells a character knows; each class gets its 3.3.5a starter kit on creation
+- `character_spells` stores the spells a character knows; each race/class combination gets the exact 3.3.5a level-1 spellbook from CMaNGOS `playercreateinfo_spell` (2919 rows across all 62 legal pairs), including racials, languages, armor and weapon proficiencies
+- The default action bar comes from `playercreateinfo_action` (351 rows): Attack, the class's first ability, racials, and the second bar page; the default Attack macros become a normal Attack button because this server has no macro storage
+- `Summon Imp` (688) is the only deliberate addition to the authentic list: it is trainer-taught at level 1 and this server has no class trainers, so warlocks would otherwise have no summon
 - `SMSG_LOGIN_VERIFY_WORLD` is the first world packet, followed by `SMSG_INITIAL_SPELLS` and `SMSG_ACTION_BUTTONS`
 - `CMSG_CAST_SPELL` / `CMSG_CANCEL_CAST` use imported `spell_templates`: cast time, range, power cost, GCD (`StartRecoveryTime`), school, damage/heal rolls and effect/aura enums
 - Melee auto-attack, weapon damage/delay, creature aggro + chase + leash AI, creature melee, death, respawn, XP and level-up
@@ -67,6 +69,24 @@ A real 3.3.5a client can now log in, pick a character and **enter the world**:
 - Armed items add primary stats, flat health/mana, attack power and resistances, mirroring `Player::_ApplyItemMods`
 - Creature melee is mitigated by armor with `Unit::CalcArmorReducedDamage`
 - Death knight runes are real state: blood, blood, unholy, unholy, frost, frost, regenerated at 0.1 per second
+- Area-of-effect spells use the real 3.3.5 `EffectImplicitTarget`/`SpellRadius.dbc` data:
+  - self-centred areas (Arcane Explosion, Thunder Clap, Frost Nova, Whirlwind, Blood Boil, Consecration) select every enemy within the effect radius
+  - ground-targeted areas (Flamestrike, Blizzard, Rain of Fire, Volley, Earthquake, Death and Decay) read the click destination from the cast packet and place the effect there
+  - 90-degree cones (Cone of Cold, Shockwave) check the caster's facing
+  - chain spells (Chain Lightning, Multi-Shot) jump through up to `EffectChainTargets` nearby enemies with the reference 30% falloff per jump
+  - persistent ground effects tick from `SpellDuration.dbc` and take their damage from the periodic aura or its `PERIODIC_TRIGGER_SPELL` (e.g. Blizzard 42208, Rain of Fire 42223)
+  - `MaxTargets` is honoured (Whirlwind hits four), the caster's own pet is excluded, and creature AoE (Flamestrike) damages the player and leaves a hostile ground effect
+  - party/raid-only heals apply to the caster because there is no group system yet; slow/root components are not implemented
+
+### Auras (buffs, debuffs and movement effects)
+- A real aura registry for players (`combat["auras"]`) and creatures (`combat["creature_auras"]`), keyed by spell so a recast refreshes the duration and stacks up to `Spell.dbc` `StackAmount`
+- Components implemented: periodic damage/heal/leech, periodic energize, stun (12), root (26), silence (27), pacify (25), movement increase/decrease (31/33), primary stats (29), health/energy (34/35), armor/resistances (22), attack power (99/124) and melee haste (138)
+- Durations come from `SpellDuration.dbc` (full 3.3.5 fallback table); expired auras remove their modifiers and resend the affected fields
+- Player movement: `SMSG_FORCE_RUN_SPEED_CHANGE`, `SMSG_FORCE_MOVE_ROOT` / `SMSG_FORCE_MOVE_UNROOT`; stuns additionally set `UNIT_FLAG_STUNNED`
+- Creature movement: slows scale chase/idle speed, roots stop chasing and idle wandering, stuns stop the AI entirely and are mirrored with `UNIT_FLAG_STUNNED`; silence blocks casts and pacify blocks melee swings
+- Player melee damage now includes the `attack_power / 14 * weapon speed` contribution, so Battle Shout and stat auras change real swings
+- Periodic auras refresh instead of stacking duplicate DoTs and use their real duration (Fireball's 4 s burn instead of a flat 15 s)
+- `SMSG_AURA_UPDATE` (buff/debuff icons) is not sent yet; dispels, immunities and charm/fear are also not implemented, and auras are session-scoped (they do not survive logout)
 
 ### Summoning (pets and guardians)
 - `SPELL_EFFECT_SUMMON_PET` (56, e.g. Summon Imp/Voidwalker/Succubus/Felhunter) and `SPELL_EFFECT_SUMMON` (28, guardians such as Mirror Image) create a session-local creature next to the caster
@@ -251,6 +271,7 @@ wow335a-pyserver/
         │   ├── player_movement.py
         │   ├── chat.py
         │   ├── stats.py
+        │   ├── auras.py
         │   ├── runes.py
         │   ├── spells.py
         │   ├── combat.py
@@ -267,6 +288,7 @@ wow335a-pyserver/
         ├── creature.py
         ├── spells.py
         ├── rune_costs.py
+        ├── playercreateinfo.sql  # authentic level-1 spells + action bars
         ├── update_fields.py
         ├── login_packets.py
         ├── character_db.py

@@ -112,8 +112,8 @@ def init_databases(cfg: Config) -> None:
     finally:
         con.close()
 
-    init_character_db(cfg.database.world_path)
     init_creature_db(cfg.database.world_path)
+    init_character_db(cfg.database.world_path)
 
 
 def load_config() -> Config:

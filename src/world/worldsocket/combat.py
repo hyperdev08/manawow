@@ -14,6 +14,7 @@ from src.world import spells
 from .constants import (
     COMBAT_TICK_INTERVAL,
     RESPAWN_SCAN_INTERVAL,
+    SPELL_FAILED_INTERRUPTED,
 )
 
 class CombatMixin:
@@ -54,7 +55,16 @@ class CombatMixin:
 
         # 1. finish a cast whose casting time elapsed
         pending = combat["pending_cast"]
-        if pending and pending["finish_at"] <= now:
+        if pending and hasattr(self, "_player_aura_mods") \
+                and self._player_aura_mods()["stunned"]:
+            combat["pending_cast"] = None
+            await self.send_packet(
+                Opcodes.SMSG_SPELL_FAILURE,
+                spells.build_spell_failure(
+                    self.player_guid, pending["cast_id"], pending["spell_id"],
+                    SPELL_FAILED_INTERRUPTED),
+            )
+        elif pending and pending["finish_at"] <= now:
             combat["pending_cast"] = None
             await self._apply_pending_cast(pending)
 
@@ -76,6 +86,12 @@ class CombatMixin:
                     await self._apply_dot_tick(dot)
                 alive.append(dot)
             combat["dots"] = alive
+
+        # 3b. persistent ground AoE effects
+        await self._tick_area_effects(now)
+
+        # 3c. expire modifier auras
+        await self._tick_auras(now)
 
         # 4. creatures that are fighting us
         if combat["aggro"] and not combat["dead"]:
@@ -189,6 +205,11 @@ class CombatMixin:
 
         damage = random.uniform(weapon["min"], weapon["max"])
         damage += max(1.0, int(self.character.get("level", 1)) * 0.5)
+        # ``Player::UpdateAttackPowerAndDamage`` contributions: attack power is
+        # converted to weapon damage with the standard ``AP / 14 * delay``
+        # formula, so Battle Shout and stat auras actually change swings.
+        damage += (int(self.character.get("attack_power", 0) or 0) / 14.0
+                   * float(weapon.get("delay", 2.0) or 2.0))
         missed = random.random() < 0.08
         crit = (not missed) and random.random() < 0.10
         if crit:
@@ -237,7 +258,12 @@ class CombatMixin:
             return dict(self._BARE_HAND)
         if low <= 0.0:
             low = max(1.0, high * 0.5)
-        return {"min": low, "max": high, "delay": max(800, delay) / 1000.0}
+        delay = max(800, delay) / 1000.0
+        # Melee haste auras (Thunder Clap's attack-speed slow, haste buffs).
+        if hasattr(self, "_player_aura_mods"):
+            haste = float(self._player_aura_mods()["melee_haste"])
+            delay /= max(0.1, 1.0 + haste / 100.0)
+        return {"min": low, "max": high, "delay": delay}
 
     def _victim_health(self, victim_guid: int) -> int:
         """Health the victim has *before* the hit we are about to report.

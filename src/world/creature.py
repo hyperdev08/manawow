@@ -23,6 +23,7 @@ that the worldserver needs to put a creature in front of the client:
 """
 from __future__ import annotations
 
+import os
 import sqlite3
 from typing import List, Optional
 
@@ -611,6 +612,28 @@ CREATE TABLE IF NOT EXISTS spell_duration(
   max_duration INTEGER NOT NULL DEFAULT 0
 );
 
+-- CMaNGOS ``playercreateinfo_spell``: the exact spells every race/class
+-- combination knows at creation, including racials, languages, armor and
+-- weapon proficiencies.  Seeded from playercreateinfo.sql on first open.
+CREATE TABLE IF NOT EXISTS playercreateinfo_spell(
+  race INTEGER NOT NULL DEFAULT 0,
+  class INTEGER NOT NULL DEFAULT 0,
+  spell INTEGER NOT NULL DEFAULT 0,
+  note TEXT NOT NULL DEFAULT '',
+  PRIMARY KEY(race, class, spell)
+);
+
+-- CMaNGOS ``playercreateinfo_action``: the default action bar per race/class.
+-- ``type`` is 0 for a spell and 128 for a macro button.
+CREATE TABLE IF NOT EXISTS playercreateinfo_action(
+  race INTEGER NOT NULL DEFAULT 0,
+  class INTEGER NOT NULL DEFAULT 0,
+  button INTEGER NOT NULL DEFAULT 0,
+  action INTEGER NOT NULL DEFAULT 0,
+  type INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY(race, class, button)
+);
+
 """
 
 # The demo population of Northshire Valley (map 0, zone 12).  Display ids are
@@ -731,6 +754,28 @@ _TEMPLATE_COLUMNS = _schema_columns(CREATE_CREATURE_SQL, "creature_templates")
 _SPAWN_COLUMNS = _schema_columns(CREATE_CREATURE_SQL, "creature_spawns")
 
 
+_PLAYERCREATEINFO_SQL = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "playercreateinfo.sql")
+
+
+def _seed_playercreateinfo(con: sqlite3.Connection) -> None:
+    """Load the bundled 3.3.5a starter spell/action tables once.
+
+    ``playercreateinfo.sql`` is generated from the CMaNGOS WoTLKDB dump, so a
+    fresh database starts with the exact level-1 spellbook and action bar of
+    every race/class combination even before the world dump is imported.
+    """
+    count = con.execute(
+        "SELECT COUNT(*) FROM playercreateinfo_spell").fetchone()[0]
+    if count:
+        return
+    if not os.path.exists(_PLAYERCREATEINFO_SQL):
+        return
+    with open(_PLAYERCREATEINFO_SQL, encoding="utf-8") as handle:
+        con.executescript(handle.read())
+    con.commit()
+
+
 def init_creature_db(path: str) -> None:
     """Create/upgrade the creature tables.
 
@@ -755,6 +800,9 @@ def init_creature_db(path: str) -> None:
                 con.execute(
                     f"ALTER TABLE creature_spawns ADD COLUMN {column} {declaration}"
                 )
+        # Level-1 spells and action buttons have no connection to the spawn
+        # table, so seed them before the demo-population early return.
+        _seed_playercreateinfo(con)
         if con.execute("SELECT COUNT(*) FROM creature_spawns").fetchone()[0]:
             con.commit()
             return
