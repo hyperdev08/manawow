@@ -1118,7 +1118,13 @@ def get_equipped_item_totals(path: str, character_guid: int) -> Dict[str, int]:
     totals: Dict[str, int] = {
         "str": 0, "agi": 0, "sta": 0, "inte": 0, "spi": 0,
         "health": 0, "mana": 0,
-        "attack_power": 0, "ranged_attack_power": 0,
+        "attack_power": 0, "ranged_attack_power": 0, "spell_power": 0,
+        "hit_rating": 0, "crit_rating": 0, "haste_rating": 0,
+        "defense_rating": 0, "dodge_rating": 0, "parry_rating": 0,
+        "block_rating": 0, "block_value": 0,
+        "resilience": 0, "armor_penetration": 0, "expertise": 0,
+        "spell_penetration": 0, "healing_power": 0,
+        "shield": 0,
         "armor": 0, "holy": 0, "fire": 0, "nature": 0,
         "frost": 0, "shadow": 0, "arcane": 0,
     }
@@ -1131,7 +1137,8 @@ def get_equipped_item_totals(path: str, character_guid: int) -> Dict[str, int]:
     con = sqlite3.connect(path)
     try:
         rows = con.execute(
-            f"SELECT {resistance_columns}, {stat_columns} "
+            f"SELECT {resistance_columns}, {stat_columns},"
+            " it.subclass, it.inventory_type "
             "FROM character_items ci "
             "JOIN item_templates it ON ci.item_entry = it.entry "
             "WHERE ci.character_guid = ? AND ci.slot BETWEEN 0 AND 18",
@@ -1146,6 +1153,10 @@ def get_equipped_item_totals(path: str, character_guid: int) -> Dict[str, int]:
         for index, (key, _column) in enumerate(_ITEM_RESISTANCES):
             totals[key] += int(row[index] or 0)
         offset = len(_ITEM_RESISTANCES)
+        subclass = int(row[offset + 20] or 0)
+        inventory_type = int(row[offset + 21] or 0)
+        if subclass == 6 or inventory_type == 14:      # shield
+            totals["shield"] = 1
         for stat_index in range(10):
             stat_type = int(row[offset + stat_index * 2] or 0)
             stat_value = int(row[offset + stat_index * 2 + 1] or 0)
@@ -1161,6 +1172,34 @@ def get_equipped_item_totals(path: str, character_guid: int) -> Dict[str, int]:
                 totals["attack_power"] += stat_value
             elif stat_type == 39:           # ITEM_MOD_RANGED_ATTACK_POWER
                 totals["ranged_attack_power"] += stat_value
+            elif stat_type == 45:           # ITEM_MOD_SPELL_POWER
+                totals["spell_power"] += stat_value
+            elif stat_type == 12:           # ITEM_MOD_DEFENSE_SKILL_RATING
+                totals["defense_rating"] += stat_value
+            elif stat_type == 13:           # ITEM_MOD_DODGE_RATING
+                totals["dodge_rating"] += stat_value
+            elif stat_type == 14:           # ITEM_MOD_PARRY_RATING
+                totals["parry_rating"] += stat_value
+            elif stat_type == 15:           # ITEM_MOD_BLOCK_RATING
+                totals["block_rating"] += stat_value
+            elif stat_type in (16, 17, 18, 31):  # melee/ranged/spell hit rating
+                totals["hit_rating"] += stat_value
+            elif stat_type in (19, 20, 21, 32):  # melee/ranged/spell crit rating
+                totals["crit_rating"] += stat_value
+            elif stat_type in (28, 29, 30, 36):  # melee/ranged/spell haste rating
+                totals["haste_rating"] += stat_value
+            elif stat_type == 35:           # ITEM_MOD_RESILIENCE_RATING
+                totals["resilience"] += stat_value
+            elif stat_type == 37:           # ITEM_MOD_EXPERTISE_RATING
+                totals["expertise"] += stat_value
+            elif stat_type == 44:           # ITEM_MOD_ARMOR_PENETRATION_RATING
+                totals["armor_penetration"] += stat_value
+            elif stat_type == 47:           # ITEM_MOD_SPELL_PENETRATION
+                totals["spell_penetration"] += stat_value
+            elif stat_type in (41, 42):     # healing / spell damage
+                totals["healing_power"] += stat_value
+            elif stat_type == 48:           # ITEM_MOD_BLOCK_VALUE
+                totals["block_value"] += stat_value
     return totals
 
 

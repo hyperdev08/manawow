@@ -195,7 +195,8 @@ class CreatureMovementMixin:
             return                       # pets follow their owner in _summon_tick
         if hasattr(self, "_creature_aura_mods"):
             mods = self._creature_aura_mods(int(low_guid))
-            if mods["rooted"] or mods["stunned"]:
+            if (mods["rooted"] or mods["stunned"] or mods["feared"]
+                    or mods["confused"] or mods["charmed"]):
                 return
         combat = self._get_combat_state()
         if int(low_guid) in combat["aggro"]:

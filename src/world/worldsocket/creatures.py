@@ -124,6 +124,9 @@ class CreaturesMixin:
         self._set_creature_health(low_guid, new_health)
         combat = self._get_combat_state()
         combat["in_combat"] = True
+        self._aggro_creature(low_guid)
+        self._add_threat(low_guid, int(attacker_guid or self.player_guid or 0),
+                         max(1.0, float(damage)))
         if new_health <= 0:
             await self._on_creature_killed(guid)
             return True
@@ -132,7 +135,6 @@ class CreaturesMixin:
             F.UNIT_FIELD_MAXHEALTH: max_health,
             F.UNIT_DYNAMIC_FLAGS: 0,
         })
-        self._aggro_creature(low_guid)
         return False
 
     def _aggro_creature(self, low_guid: int) -> None:
@@ -157,7 +159,18 @@ class CreaturesMixin:
                 # Lazily built on the first AI tick: spell list, mana pool,
                 # cooldowns and the spell currently being cast.
                 "ai": None,
+                # 3.3.5-style threat bookkeeping.  There is one player per
+                # session, but the table is keyed by guid so taunt/target
+                # switching and future party support have a real state.
+                "threat": 0.0,
+                "threat_table": {int(self.player_guid or 0): 0.0},
+                "taunt_until": 0.0,
+                "fleeing": False,
+                "flee_until": 0.0,
+                "last_mana_regen": now,
+                "last_power_update": now,
             }
+            self._call_for_help(int(low_guid))
         con = sqlite3.connect(self.config.database.world_path)
         try:
             con.execute(
@@ -168,6 +181,54 @@ class CreaturesMixin:
             con.commit()
         finally:
             con.close()
+
+    def _add_threat(self, low_guid: int, source_guid: int,
+                    amount: float) -> None:
+        """Add threat to a creature's table (``ThreatManager::AddThreat``)."""
+        state = self._get_combat_state().get("aggro", {}).get(int(low_guid))
+        if state is None:
+            return
+        table = state.setdefault("threat_table", {})
+        key = int(source_guid or self.player_guid or 0)
+        table[key] = max(0.0, float(table.get(key, 0.0)) + float(amount))
+        state["threat"] = max(float(state.get("threat", 0.0)),
+                              float(table[key]))
+
+    def _call_for_help(self, low_guid: int) -> None:
+        """Nearby same-faction creatures join a fight (social aggro)."""
+        combat = self._get_combat_state()
+        spawn = self._get_creature_spawn(int(low_guid))
+        if spawn is None:
+            return
+        home = (float(spawn["x"]), float(spawn["y"]), float(spawn["z"]))
+        faction = int(spawn["faction"] or 0) if "faction" in spawn.keys() else 0
+        helped = 0
+        for other_low, other in list(self._visible_creatures.items()
+                                     if hasattr(self, "_visible_creatures")
+                                     else ()):
+            other_low = int(other_low)
+            if other_low == int(low_guid) or other_low in combat["aggro"]:
+                continue
+            other_spawn = self._get_creature_spawn(other_low)
+            if other_spawn is None or int(other_spawn["dead_since"] or 0) > 0:
+                continue
+            if other_low in getattr(self, "_summoned_creatures", {}):
+                continue
+            other_faction = int(other_spawn["faction"] or 0) \
+                if "faction" in other_spawn.keys() else 0
+            if faction and other_faction and faction != other_faction:
+                continue
+            pos = (float(other_spawn["x"]), float(other_spawn["y"]),
+                   float(other_spawn["z"]))
+            if self._distance(home, pos) > 12.0:
+                continue
+            self._aggro_creature(other_low)
+            helped += 1
+            if helped >= 3:
+                break
+        if helped:
+            self.log.debug(
+                f"Creature {spawn['entry']} called {helped} ally/allies for help")
 
     async def _on_creature_killed(self, guid: int) -> None:
         """Handle creature death: stop combat, award XP and make a corpse."""
@@ -211,7 +272,8 @@ class CreaturesMixin:
         combat["aggro"].pop(low_guid, None)
         if hasattr(self, "_clear_creature_auras"):
             self._clear_creature_auras(low_guid)
-        # Stop the idle generator: the corpse must not keep walking.
+        if hasattr(self, "_sync_creature_flags"):
+            await self._sync_creature_flags(int(low_guid))
         combat.setdefault("idle", {}).pop(low_guid, None)
         combat.setdefault("idle_settle", {}).pop(low_guid, None)
         self._creature_spawn_cache.pop(low_guid, None)
@@ -236,16 +298,57 @@ class CreaturesMixin:
             combat["aggro"].pop(int(low_guid), None)
             return
 
+        # Low-health humanoids flee instead of fighting to the death
+        # (``CreatureAI::DamageTaken`` -> ``SetCombatMovement``).  Fleeing
+        # creatures run away from the player and stop attacking/casting.
+        creature_type = int(spawn["type"] or 0) if "type" in spawn.keys() else 0
+        health = self._creature_health(int(low_guid))
+        maximum = self._creature_max_health(spawn)
+        if (creature_type == 7 and maximum > 0
+                and health > maximum * 0.30 and state.get("fled")):
+            state["fled"] = False
+        if (creature_type == 7 and maximum > 0
+                and health < maximum * 0.15
+                and not state.get("fleeing")
+                and not state.get("fled")):
+            state["fleeing"] = True
+            state["flee_until"] = now + 6.0
+            if state.get("ai"):
+                state["ai"]["cast"] = None
+            self.log.debug(f"Creature {spawn['entry']} is fleeing")
+        if state.get("fleeing"):
+            if now >= float(state.get("flee_until") or 0.0):
+                state["fleeing"] = False
+                state["fled"] = True
+            else:
+                await self._creature_flee_move(int(low_guid), spawn, state,
+                                               now)
+                return
+
         # Stunned creatures do nothing at all; rooted ones can still swing and
         # cast while in range but cannot chase.
         if hasattr(self, "_creature_aura_mods"):
-            if self._creature_aura_mods(int(low_guid))["stunned"]:
+            mods = self._creature_aura_mods(int(low_guid))
+            if mods["stunned"]:
                 ai = (state.get("ai") if state else None)
                 if ai is not None and ai.get("cast") is not None:
                     ai["cast"] = None
                 return
-            rooted = self._creature_aura_mods(int(low_guid))["rooted"]
-            pacified = self._creature_aura_mods(int(low_guid))["pacified"]
+            if mods["feared"] or mods["confused"]:
+                ai = (state.get("ai") if state else None)
+                if ai is not None:
+                    ai["cast"] = None
+                if mods["rooted"]:
+                    return
+                await self._creature_flee_move(int(low_guid), spawn, state, now)
+                return
+            if mods["charmed"]:
+                ai = (state.get("ai") if state else None)
+                if ai is not None:
+                    ai["cast"] = None
+                return
+            rooted = mods["rooted"]
+            pacified = mods["pacified"]
             melee_interval = self._creature_melee_interval(int(low_guid))
             speed_mult = self._creature_speed_mult(int(low_guid))
         else:
@@ -267,6 +370,20 @@ class CreaturesMixin:
 
         in_melee = distance <= reach
         ai = await self._creature_ai_state(int(low_guid), spawn, now)
+
+        # Creatures regenerate mana in combat from their class base pool.  The
+        # update packet is throttled to once every two seconds.
+        if ai is not None and int(ai.get("max_mana") or 0) > 0:
+            last_regen = float(ai.get("last_mana_regen") or now)
+            if now - last_regen >= 1.0:
+                ai["last_mana_regen"] = now
+                gain = max(1, int(ai["max_mana"]) // 50)
+                ai["mana"] = min(int(ai["max_mana"]),
+                                 int(ai["mana"]) + gain)
+                if now - float(ai.get("last_power_update") or 0.0) >= 2.0:
+                    ai["last_power_update"] = now
+                    self._set_creature_power(int(low_guid), ai["mana"])
+                    await self._send_creature_power(int(low_guid), ai)
 
         # A creature that is casting stands still, faces its victim and neither
         # swings nor chases until the cast has finished (Spell::update runs
@@ -297,22 +414,80 @@ class CreaturesMixin:
             # In melee range: swing on the creature's own timer.
             if not pacified and now - state["last_swing"] >= melee_interval:
                 state["last_swing"] = now
+                if hasattr(self, "_player_aura_mods"):
+                    immune = self._player_aura_mods()
+                    if (immune.get("school_immune", 0) & 1
+                            or immune.get("damage_immune", 0) & 1):
+                        await self._send_attacker_state_update(
+                            self._creature_object_guid(
+                                int(low_guid), int(spawn["entry"])),
+                            self.player_guid, 0, is_miss=True)
+                        return
+                creature_level = max(1, int(spawn["min_level"] or 1))
+                outcome = self._roll_melee(
+                    self._creature_melee_table(creature_level))
+                if outcome == "miss":
+                    await self._send_attacker_state_update(
+                        self._creature_object_guid(
+                            int(low_guid), int(spawn["entry"])),
+                        self.player_guid, 0, is_miss=True)
+                    return
+                if outcome in ("dodge", "parry"):
+                    await self._send_attacker_state_update(
+                        self._creature_object_guid(
+                            int(low_guid), int(spawn["entry"])),
+                        self.player_guid, 0,
+                        victim_state=2 if outcome == "dodge" else 3)
+                    return
                 raw_damage = max(1, int(round(self._creature_damage(spawn))))
                 # ``Unit::CalcArmorReducedDamage``: normal-school melee is
                 # mitigated by the player's armor (item armor + agility*2)
-                # before it reaches the health pool.  The client shows the
-                # mitigated number, so the attacker-state update uses it too.
+                # before it reaches the health pool.
                 damage = self._armor_reduced_damage(
                     raw_damage, int(self.character.get("armor", 0) or 0),
-                    int(spawn["min_level"] or 1))
+                    creature_level)
+                hit_info = 0
+                victim_state = 1
+                if outcome == "block":
+                    blocked = max(
+                        int(self.character.get("block_value", 0) or 0),
+                        int(damage * 0.3))
+                    damage = max(1, damage - blocked)
+                    hit_info |= 0x00002000      # HITINFO_BLOCK
+                    victim_state = 5           # VICTIMSTATE_BLOCKS
+                elif outcome == "crushing":
+                    damage = int(damage * 1.5)
+                    hit_info |= 0x00020000      # HITINFO_CRUSHING
+                elif outcome == "crit":
+                    damage *= 2
+                if hasattr(self, "_apply_damage_modifiers"):
+                    damage = self._apply_damage_modifiers(
+                        "player", self.player_guid, 1, damage)
                 await self._send_attacker_state_update(
                     self._creature_object_guid(int(low_guid), int(spawn["entry"])),
                     self.player_guid, damage,
+                    is_crit=(outcome == "crit"),
+                    victim_state=victim_state, hit_info=hit_info,
                 )
                 # Creature auto-attacks are normal-school melee, the only
                 # damage source that fills a warrior's rage bar.
                 await self._damage_player(damage, str(spawn["name"]),
                                           physical=True)
+                if hasattr(self, "_break_cc_on_damage"):
+                    await self._break_cc_on_damage(
+                        "player", self.player_guid, 0)
+                # Thorns/Damage Shield retaliates against the melee attacker.
+                if hasattr(self, "_player_aura_mods"):
+                    thorns = int(self._player_aura_mods().get("thorns", 0) or 0)
+                    if thorns > 0:
+                        await self._deal_damage_to_creature(
+                            self._creature_object_guid(
+                                int(low_guid), int(spawn["entry"])),
+                            thorns, self.player_guid)
+                        await self._send_spell_damage_log(
+                            self._creature_object_guid(
+                                int(low_guid), int(spawn["entry"])),
+                            self.player_guid, 0, thorns, 1)
             return
 
         # Out of reach: walk towards the player.  One spline per second keeps
@@ -346,12 +521,43 @@ class CreaturesMixin:
             ),
         )
 
+    async def _creature_flee_move(self, low_guid: int, spawn, state: dict,
+                                  now: float) -> None:
+        """Run a fleeing creature directly away from the player."""
+        if now < float(state.get("chase_until") or 0.0):
+            return
+        here = self._creature_position(int(low_guid))
+        player = self._player_position()
+        dx = here[0] - player[0]
+        dy = here[1] - player[1]
+        length = max(0.1, (dx * dx + dy * dy) ** 0.5)
+        distance = 8.0
+        dest = (here[0] + dx / length * distance,
+                here[1] + dy / length * distance, here[2])
+        duration_ms = 1000
+        state["pos"] = dest
+        state["chase_until"] = now + duration_ms / 1000.0
+        facing = math.atan2(dest[1] - here[1], dest[0] - here[0])
+        state["facing"] = facing
+        await self.send_packet(
+            Opcodes.SMSG_MONSTER_MOVE,
+            object_update.build_monster_move(
+                self._creature_object_guid(int(low_guid), int(spawn["entry"])),
+                here[0], here[1], here[2], facing,
+                dest[0], dest[1], dest[2],
+                duration_ms=duration_ms,
+                move_id=self._next_move_id(),
+            ),
+        )
+
     async def _reset_creature(self, low_guid: int) -> None:
         """Leave combat, walk the creature home and heal it back up."""
         combat = self._get_combat_state()
         state = combat["aggro"].pop(int(low_guid), None)
         if hasattr(self, "_clear_creature_auras"):
             self._clear_creature_auras(int(low_guid))
+        if hasattr(self, "_sync_creature_flags"):
+            await self._sync_creature_flags(int(low_guid))
         spawn = self._get_creature_spawn(int(low_guid))
         if spawn is None or int(spawn["dead_since"] or 0) > 0:
             return
@@ -470,6 +676,22 @@ class CreaturesMixin:
     def _creature_damage(self, spawn) -> float:
         """A creature's melee damage roll, scaled from its level."""
         level = max(1, int(spawn["min_level"] or 1))
-        low = max(1.0, level * 0.9)
-        high = max(low + 1.0, level * 1.6)
+        low = float(spawn["min_damage"] or 0.0)
+        high = float(spawn["max_damage"] or 0.0)
+        if high <= 0.0:
+            low = max(1.0, level * 0.9)
+            high = max(low + 1.0, level * 1.6)
+        else:
+            low = max(1.0, low)
+        attack_power = int(spawn["attack_power"] or 0)
+        if hasattr(self, "_creature_aura_mods"):
+            aura_low = spawn["guid"] if "guid" in spawn.keys() else 0
+            mods = self._creature_aura_mods(int(aura_low))
+            attack_power += int(mods.get("attack_power", 0) or 0)
+            attack_power = int(attack_power * (
+                1.0 + float(mods.get("attack_power_pct", 0.0) or 0.0) / 100.0))
+        if attack_power > 0:
+            delay = max(800, int(spawn["melee_attack_speed"] or 2000)) / 1000.0
+            low += attack_power / 14.0 * delay
+            high += attack_power / 14.0 * delay
         return random.uniform(low, high)

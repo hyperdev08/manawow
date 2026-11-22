@@ -134,6 +134,8 @@ class WorldEntryMixin:
         self.world_entry_complete = True
         await self.send_peer_spawns()
         await self.announce_self_to_peers()
+        if hasattr(self, "_send_all_auras"):
+            await self._send_all_auras()
 
     async def handle_logout_request(self, data: bytes):
         if self.in_world:

@@ -8,6 +8,7 @@ import time
 
 from src.protocol.opcodes import Opcodes
 from src.world import creature
+from src.world import object_update
 from src.world import spells
 
 from .constants import (
@@ -114,9 +115,15 @@ class SpellsMixin:
         if combat["dead"]:
             await self._cast_failed(cast_id, spell_id, SPELL_FAILED_CASTER_DEAD)
             return
-        if hasattr(self, "_player_aura_mods"):
+        if hasattr(self, "_player_can_cast"):
+            if not self._player_can_cast(spell_id):
+                await self._cast_failed(cast_id, spell_id,
+                                        SPELL_FAILED_CASTER_AURASTATE)
+                return
+        elif hasattr(self, "_player_aura_mods"):
             mods = self._player_aura_mods()
-            if mods["stunned"] or mods["silenced"]:
+            if (mods["stunned"] or mods["silenced"] or mods["feared"]
+                    or mods["confused"] or mods["charmed"]):
                 await self._cast_failed(cast_id, spell_id,
                                         SPELL_FAILED_CASTER_AURASTATE)
                 return
@@ -126,6 +133,24 @@ class SpellsMixin:
         template = spells.get_spell_template(self.config.database.world_path, spell_id)
         if template is None:
             await self._cast_failed(cast_id, spell_id, SPELL_FAILED_SPELL_UNAVAILABLE)
+            return
+        # Auto Shot / Shoot / Throw toggle the ranged auto-attack instead of
+        # running a normal spell effect loop.
+        if int(template.id) in (75, 2764, 5019):
+            cast = spells.SpellCast(self.player_guid, spell_id, target_guid)
+            cast.template = template
+            await self.send_packet(
+                Opcodes.SMSG_SPELL_START,
+                spells.build_spell_start(cast, self.player_guid, target_guid,
+                                         cast_id),
+            )
+            await self.send_packet(
+                Opcodes.SMSG_SPELL_GO,
+                spells.build_spell_go(
+                    cast, self.player_guid, target_guid, cast_id,
+                    timestamp_ms=self._server_tick_ms(), off_gcd=True),
+            )
+            await self._start_ranged_attack(target_guid, int(template.id))
             return
         if combat["pending_cast"]:
             await self._cast_failed(cast_id, spell_id, SPELL_FAILED_SPELL_IN_PROGRESS)
@@ -142,9 +167,28 @@ class SpellsMixin:
         # A live target must be within the spell's range before anything else.
         target_low = creature.creature_low_guid(target_guid) if target_guid else 0
         spawn = self._get_creature_spawn(target_low) if target_low else None
-        if target_guid and not self._is_player_guid(target_guid) and spawn is None:
+        is_peer_target = bool(
+            hasattr(self, "_is_peer_player_guid") and target_guid
+            and self._is_peer_player_guid(target_guid))
+        target_peer = (self._peer_session_for_guid(target_guid)
+                       if is_peer_target
+                       and hasattr(self, "_peer_session_for_guid") else None)
+        if (target_guid and not self._is_player_guid(target_guid)
+                and not is_peer_target and spawn is None):
             await self._cast_failed(cast_id, spell_id, SPELL_FAILED_BAD_TARGETS)
             return
+        if target_peer is not None and target_peer.character:
+            spell_range = template.get_range()
+            if spell_range < 49000.0:
+                spell_range = max(spell_range, 0.5)
+                peer_pos = (
+                    float(target_peer.character.get("x", 0.0)),
+                    float(target_peer.character.get("y", 0.0)),
+                    float(target_peer.character.get("z", 0.0)))
+                if self._distance(self._player_position(), peer_pos) > spell_range:
+                    await self._cast_failed(cast_id, spell_id,
+                                            SPELL_FAILED_OUT_OF_RANGE)
+                    return
         if spawn is not None:
             spell_range = template.get_range()
             if spell_range < 49000.0:
@@ -213,7 +257,8 @@ class SpellsMixin:
             cast.x, cast.y, cast.z = (float(dest[0]), float(dest[1]),
                                       float(dest[2]))
             cast.has_dest = True
-        cast_time_ms = template.get_casting_time_ms()
+        cast_time_ms = self._spell_cast_time_ms(template)
+        cast.cast_time_ms = cast_time_ms
         # ``Spell::SendSpellStart`` also sets ``CAST_FLAG_NO_GCD`` for rune
         # spells ("not needed, but B sends it"), so mirror the reference.
         start_flags = spells.CAST_FLAG_SPELL_START
@@ -259,6 +304,8 @@ class SpellsMixin:
         # value that already includes rage gained by the cast itself.
         await self._send_spell_go(cast, template, target_guid, cast_id)
         await self._apply_spell_effects(cast, template, target_guid)
+        if template.is_channeled():
+            await self._start_channel(cast, template, target_guid, cast_id)
         # ``Spell::finish`` clears the combo points after the effects have run,
         # so the finisher itself still scales with the full count.
         if template.needs_combo_points():
@@ -266,6 +313,16 @@ class SpellsMixin:
         self.log.info(
             f"'{self.character['name']}' casts {template.name} ({spell_id})"
         )
+
+    def _spell_cast_time_ms(self, template) -> int:
+        """Cast time after spell haste, preserving instant casts."""
+        base = int(template.get_casting_time_ms())
+        if base <= 0:
+            return 0
+        haste = float(self.character.get("spell_haste", 0.0) or 0.0)
+        if not haste and hasattr(self, "_player_aura_mods"):
+            haste = float(self._player_aura_mods().get("spell_haste", 0.0))
+        return max(50, int(base / max(0.05, 1.0 + haste / 100.0)))
 
     async def _send_spell_go(self, cast, template, target_guid: int,
                              cast_id: int = 0) -> None:
@@ -323,6 +380,98 @@ class SpellsMixin:
                 off_gcd=template.start_recovery_time == 0,
             ),
         )
+
+    async def _start_channel(self, cast, template, target_guid: int,
+                             cast_id: int = 0) -> None:
+        """Begin a channelled spell and schedule its periodic trigger."""
+        caster_level = int(self.character.get("level", 1))
+        duration_ms = spells.spell_duration_ms(
+            self.config.database.world_path, template.duration_index,
+            caster_level)
+        if duration_ms <= 0:
+            duration_ms = 3000
+        interval_ms = 1000
+        trigger_spell = 0
+        for effect in template.effects:
+            if int(effect.get("apply_aura") or 0) not in (
+                    spells.SPELL_AURA_PERIODIC_TRIGGER_SPELL,
+                    spells.SPELL_AURA_PERIODIC_TRIGGER_SPELL_WITH_VALUE):
+                continue
+            interval_ms = max(250, int(effect.get("amplitude") or 1000))
+            trigger_spell = int(effect.get("trigger_spell") or 0)
+            break
+        now = time.monotonic()
+        self._get_combat_state()["channel"] = {
+            "spell_id": int(template.id),
+            "template": template,
+            "target_guid": int(target_guid or 0),
+            "caster_guid": int(self.player_guid),
+            "cast_id": int(cast_id) & 0xFF,
+            "expires": now + duration_ms / 1000.0,
+            "next_tick": now + interval_ms / 1000.0,
+            "interval": interval_ms / 1000.0,
+            "trigger_spell": trigger_spell,
+            "ticks": 0,
+        }
+        await self.send_packet(
+            Opcodes.MSG_CHANNEL_START,
+            spells.pack_guid(int(self.player_guid))
+            + struct.pack("<II", int(template.id) & 0xFFFFFFFF,
+                          int(duration_ms) & 0xFFFFFFFF),
+        )
+
+    async def _tick_channel(self, now: float) -> None:
+        """Run the periodic trigger of the player's active channel."""
+        combat = self._get_combat_state()
+        channel = combat.get("channel")
+        if not channel:
+            return
+        if now >= float(channel["expires"]):
+            await self._finish_channel()
+            return
+        if channel.get("trigger_spell") and now >= float(channel["next_tick"]):
+            channel["next_tick"] = now + float(channel["interval"])
+            channel["ticks"] = int(channel["ticks"]) + 1
+            await self._cast_triggered(
+                int(channel["trigger_spell"]), int(channel["target_guid"]))
+
+    async def _finish_channel(self) -> None:
+        combat = self._get_combat_state()
+        channel = combat.get("channel")
+        if not channel:
+            return
+        combat["channel"] = None
+        await self.send_packet(
+            Opcodes.MSG_CHANNEL_UPDATE,
+            spells.pack_guid(int(self.player_guid)) + struct.pack("<I", 0),
+        )
+        self.log.debug(f"Channel of {channel['spell_id']} finished")
+
+    async def _interrupt_player_cast(self, reason: int) -> None:
+        """Cancel a pending cast/channel after damage, movement or an interrupt."""
+        combat = self._get_combat_state()
+        pending = combat.get("pending_cast")
+        if pending:
+            combat["pending_cast"] = None
+            await self.send_packet(
+                Opcodes.SMSG_SPELL_FAILURE,
+                spells.build_spell_failure(
+                    self.player_guid, pending["cast_id"], pending["spell_id"],
+                    reason),
+            )
+        if combat.get("channel"):
+            channel = combat["channel"]
+            combat["channel"] = None
+            await self.send_packet(
+                Opcodes.SMSG_SPELL_FAILURE,
+                spells.build_spell_failure(
+                    self.player_guid, channel.get("cast_id", 0),
+                    channel["spell_id"], reason),
+            )
+            await self.send_packet(
+                Opcodes.MSG_CHANNEL_UPDATE,
+                spells.pack_guid(int(self.player_guid)) + struct.pack("<I", 0),
+            )
 
     async def _cast_failed(self, cast_id: int, spell_id: int, reason: int) -> None:
         """Report a rejected cast; the client shows the matching error text."""
@@ -455,8 +604,563 @@ class SpellsMixin:
         if gcd_ms > 0:
             combat["gcd_until"] = now + gcd_ms / 1000.0
 
+    def _spell_target_kind(self, target_guid: int) -> str:
+        if self._is_player_guid(target_guid):
+            return "player"
+        if hasattr(self, "_is_peer_player_guid") \
+                and self._is_peer_player_guid(target_guid):
+            return "peer"
+        return "creature"
+
+    def _spell_target_level(self, target_guid: int) -> int:
+        if self._is_player_guid(target_guid):
+            return max(1, int(self.character.get("level", 1)))
+        if hasattr(self, "_is_peer_player_guid") \
+                and self._is_peer_player_guid(target_guid):
+            return max(1, int(self.character.get("level", 1)))
+        low = creature.creature_low_guid(int(target_guid or 0))
+        spawn = self._get_creature_spawn(low)
+        if spawn is None:
+            return 1
+        return max(1, int(spawn["min_level"] or 1))
+
+    @staticmethod
+    def _effect_is_harmful(template, effect: dict) -> bool:
+        etype = int(effect.get("effect") or 0)
+        if etype in DIRECT_DAMAGE_TYPES or etype in (
+                spells.SPELL_EFFECT_INSTAKILL,
+                spells.SPELL_EFFECT_INTERRUPT_CAST,
+                spells.SPELL_EFFECT_DISPEL,
+                spells.SPELL_EFFECT_STEAL_BENEFICIAL):
+            return True
+        aura = int(effect.get("apply_aura") or 0)
+        if aura in (
+                spells.SPELL_AURA_PERIODIC_DAMAGE,
+                spells.SPELL_AURA_PERIODIC_LEECH,
+                spells.SPELL_AURA_MOD_STUN,
+                spells.SPELL_AURA_MOD_ROOT,
+                spells.SPELL_AURA_MOD_FEAR,
+                spells.SPELL_AURA_MOD_CHARM,
+                spells.SPELL_AURA_MOD_CONFUSE,
+                spells.SPELL_AURA_MOD_SILENCE,
+                spells.SPELL_AURA_MOD_PACIFY,
+                spells.SPELL_AURA_MOD_PACIFY_SILENCE,
+                spells.SPELL_AURA_MOD_DECREASE_SPEED,
+                spells.SPELL_AURA_MOD_DAMAGE_PERCENT_TAKEN):
+            return True
+        return bool(aura) and template.is_harmful()
+
+    def _spell_attack_roll(self, target_guid: int, template,
+                           effect: dict | None = None) -> dict:
+        """Resolve one spell hit/crit against a hostile target.
+
+        A synthetic/test session that has never run ``_apply_combat_stats`` has
+        no ``spell_hit_chance`` and always lands, which keeps the simulator
+        deterministic for unit tests.  In a real session the 3.3.5 base 4%
+        miss against an equal-level target applies, modified by hit rating.
+        """
+        result = {"hit": True, "crit": False,
+                  "miss_type": spells.SPELL_MISS_NONE}
+        if not target_guid or self._is_player_guid(target_guid):
+            return result
+        if hasattr(self, "_is_peer_player_guid") \
+                and self._is_peer_player_guid(target_guid):
+            return result
+        if template.attributes_ex3 & spells.SPELL_ATTR_EX3_CANT_MISS:
+            return result
+        if "spell_hit_chance" not in self.character:
+            return result
+        etype = int((effect or {}).get("effect") or 0)
+        if etype in DIRECT_DAMAGE_TYPES and etype != spells.SPELL_EFFECT_SCHOOL_DAMAGE \
+                and hasattr(self, "_player_melee_table"):
+            target_level = self._spell_target_level(target_guid)
+            outcome = self._roll_melee(
+                self._player_melee_table(target_level))
+            if outcome == "miss":
+                result["hit"] = False
+                result["miss_type"] = spells.SPELL_MISS_MISS
+            elif outcome == "dodge":
+                result["hit"] = False
+                result["miss_type"] = spells.SPELL_MISS_DODGE
+            elif outcome == "parry":
+                result["hit"] = False
+                result["miss_type"] = spells.SPELL_MISS_PARRY
+            elif outcome == "crit":
+                result["crit"] = True
+            return result
+        target_level = self._spell_target_level(target_guid)
+        caster_level = max(1, int(self.character.get("level", 1)))
+        level_delta = target_level - caster_level
+        base_miss = 4.0 + max(0, level_delta) * 2.0
+        hit_bonus = max(0.0, float(self.character.get("spell_hit_chance", 5.0))
+                        - 5.0)
+        miss_chance = max(0.0, min(100.0, base_miss - hit_bonus))
+        roll = random.uniform(0.0, 100.0)
+        if roll < miss_chance:
+            result["hit"] = False
+            result["miss_type"] = spells.SPELL_MISS_MISS
+            return result
+        crit_chance = max(0.0, float(
+            self.character.get("spell_crit_chance", 0.0) or 0.0))
+        if crit_chance and random.uniform(0.0, 100.0) < crit_chance:
+            result["crit"] = True
+        return result
+
+    def _spell_resist_amount(self, target_guid: int, school: int,
+                             damage: int) -> int:
+        """Partial resistance using the 3.3.5 resistance-to-level ratio."""
+        if damage <= 0 or not school:
+            return 0
+        kind = self._spell_target_kind(target_guid)
+        name = ""
+        for bit, school_name in spells.RESISTANCE_AURA_SCHOOLS:
+            if school & bit:
+                name = school_name
+                break
+        if not name:
+            return 0
+        if kind == "creature":
+            spawn = self._get_creature_spawn(
+                creature.creature_low_guid(target_guid))
+            if spawn is not None and ("resistance_" + name) in spawn.keys():
+                resistance = int(spawn["resistance_" + name] or 0)
+                level = max(1, int(spawn["min_level"] or 1))
+            else:
+                return 0
+            penetration = int(self.character.get(
+                "spell_penetration", 0) or 0)
+            resistance = max(0, resistance - penetration)
+            if not resistance:
+                return 0
+            chance = min(0.75, resistance / (5.0 * level))
+            return max(0, int(damage * random.uniform(0.0, chance)))
+        if kind != "player":
+            return 0
+        resistance = max(0, int(self.character.get("res_" + name, 0) or 0))
+        penetration = int(self.character.get("spell_penetration", 0) or 0)
+        resistance = max(0, resistance - penetration)
+        if not resistance:
+            return 0
+        level = max(1, int(self.character.get("level", 1)))
+        chance = min(0.75, resistance / (5.0 * level))
+        return max(0, int(damage * random.uniform(0.0, chance)))
+
+    def _spell_reflects(self, target_guid: int) -> bool:
+        kind = self._spell_target_kind(target_guid)
+        if kind == "player":
+            if not hasattr(self, "_player_aura_mods"):
+                return False
+            mods = self._player_aura_mods()
+        elif kind == "creature":
+            if not hasattr(self, "_creature_aura_mods"):
+                return False
+            mods = self._creature_aura_mods(
+                creature.creature_low_guid(target_guid))
+        else:
+            return False
+        return bool(mods["reflect"])
+
+    async def _send_spell_miss_log(self, target_guid: int, caster_guid: int,
+                                   spell_id: int, miss_type: int,
+                                   reflect_result: int = 0) -> None:
+        payload = bytearray()
+        payload += struct.pack("<I", int(spell_id) & 0xFFFFFFFF)
+        payload += struct.pack("<Q", int(caster_guid) & 0xFFFFFFFFFFFFFFFF)
+        payload += struct.pack("<B", 0)
+        payload += struct.pack("<I", 1)
+        payload += struct.pack("<Q", int(target_guid) & 0xFFFFFFFFFFFFFFFF)
+        payload += struct.pack("<B", int(miss_type) & 0xFF)
+        if int(miss_type) == spells.SPELL_MISS_REFLECT:
+            payload += struct.pack("<B", int(reflect_result) & 0xFF)
+        await self.send_packet(Opcodes.SMSG_SPELLLOGMISS, bytes(payload))
+
+    async def _resolve_spell_target(self, target_guid: int, template,
+                                    effect: dict, rolls: dict) -> dict | None:
+        """Return a successful roll for a hostile target, or ``None``.
+
+        Sends the appropriate miss/immune/reflect packet when the effect cannot
+        land.  The cache keyed by target makes a multi-effect spell (Frostbolt's
+        slow + damage, for example) share one roll.
+        """
+        if not target_guid or self._is_player_guid(target_guid):
+            return {"hit": True, "crit": False, "miss_type": 0}
+        kind = self._spell_target_kind(target_guid)
+        if kind == "peer":
+            return {"hit": True, "crit": False, "miss_type": 0}
+        key = (int(target_guid), int(template.id))
+        if key not in rolls:
+            if hasattr(self, "_spell_immune") and self._spell_immune(
+                    "creature", target_guid, template, effect):
+                await self._send_spell_miss_log(
+                    target_guid, self.player_guid, template.id,
+                    spells.SPELL_MISS_IMMUNE)
+                rolls[key] = None
+            elif self._spell_reflects(target_guid):
+                await self._send_spell_miss_log(
+                    target_guid, self.player_guid, template.id,
+                    spells.SPELL_MISS_REFLECT, 0)
+                rolls[key] = {"hit": False, "crit": False, "reflect": True}
+            else:
+                roll = self._spell_attack_roll(target_guid, template, effect)
+                if not roll["hit"]:
+                    await self._send_spell_miss_log(
+                        target_guid, self.player_guid, template.id,
+                        roll["miss_type"])
+                    rolls[key] = None
+                else:
+                    rolls[key] = roll
+        return rolls.get(key)
+
+    def _spell_power_bonus(self, effect: dict, healing: bool = False) -> int:
+        coefficient = float(effect.get("bonus_coefficient") or 0.0)
+        if coefficient <= 0.0:
+            return 0
+        power = int(self.character.get("spell_power", 0) or 0)
+        if healing:
+            power = max(power, int(
+                self.character.get("healing_power", 0) or 0))
+        return int(power * coefficient)
+
+    def _apply_damage_done(self, school: int, amount: int) -> int:
+        modifier = getattr(self, "_damage_done_modifier", None)
+        if modifier is None:
+            return max(0, int(amount))
+        return modifier(school, max(0, int(amount)))
+
+    async def _break_cc_on_damage(self, target_kind: str, target_guid: int,
+                                  spell_id: int) -> None:
+        """Damage breaks polymorph/sleep effects (not roots or fears)."""
+        if not hasattr(self, "_aura_store"):
+            return
+        entries = self._aura_store(target_kind, target_guid)
+        broken = []
+        for aura in list(entries):
+            if int(aura.get("spell_id") or 0) == int(spell_id):
+                continue
+            if int(aura.get("mechanic") or 0) not in (
+                    spells.MECHANIC_POLYMORPH, spells.MECHANIC_SLEEP,
+                    spells.MECHANIC_DISORIENTED):
+                continue
+            entries.remove(aura)
+            broken.append(aura)
+        if not broken:
+            return
+        if hasattr(self, "_normalise_aura_slots"):
+            self._normalise_aura_slots(entries)
+        for aura in broken:
+            if hasattr(self, "_send_aura_update"):
+                await self._send_aura_update(
+                    target_kind, target_guid, aura, remove=True)
+        if target_kind == "player" and hasattr(self, "_refresh_player_auras"):
+            await self._refresh_player_auras()
+        elif target_kind == "creature" and hasattr(self, "_sync_creature_flags"):
+            await self._sync_creature_flags(
+                creature.creature_low_guid(target_guid))
+
+    async def _deal_spell_damage(self, target_guid: int, amount: int,
+                                 school: int, template, caster_guid: int,
+                                 critical: bool = False,
+                                 periodic: bool = False) -> bool:
+        """Apply spell damage with resistance, absorbs and damage modifiers."""
+        amount = max(0, int(amount))
+        if amount <= 0:
+            return False
+        kind = self._spell_target_kind(target_guid)
+        if kind in ("player", "creature") and hasattr(self, "_spell_immune") \
+                and self._spell_immune(kind, target_guid, template):
+            if hasattr(self, "_send_spell_miss_log"):
+                await self._send_spell_miss_log(
+                    target_guid, caster_guid, template.id,
+                    spells.SPELL_MISS_IMMUNE)
+            return False
+        # Synthetic test sessions only implement the old target helper.
+        if (kind not in ("player", "peer")
+                and not hasattr(self, "_deal_damage_to_creature")):
+            await self._deal_damage_to_target(
+                target_guid, amount, school, template.id, caster_guid)
+            return False
+        if int(school) & 1 and hasattr(self, "_armor_reduced_damage"):
+            if kind == "player":
+                armor = int(self.character.get("armor", 0) or 0)
+            else:
+                spawn = self._get_creature_spawn(
+                    creature.creature_low_guid(target_guid))
+                armor = int(spawn["armor"] or 0) \
+                    if spawn is not None and "armor" in spawn.keys() else 0
+                if hasattr(self, "_creature_aura_mods"):
+                    mods = self._creature_aura_mods(
+                        creature.creature_low_guid(target_guid))
+                    armor += int(mods.get("armor", 0) or 0)
+                    armor = int(armor * (1.0 + float(
+                        mods.get("armor_pct", 0.0) or 0.0) / 100.0))
+            amount = self._armor_reduced_damage(
+                amount, armor, self._spell_target_level(target_guid))
+        absorbed = 0
+        depleted = []
+        if hasattr(self, "_absorb_damage"):
+            absorbed, depleted = self._absorb_damage(
+                "player" if kind == "player" else "creature",
+                target_guid, school, amount)
+            for aura in depleted:
+                if hasattr(self, "_send_aura_update"):
+                    await self._send_aura_update(
+                        "player" if kind == "player" else "creature",
+                        target_guid, aura, remove=True)
+        resisted = self._spell_resist_amount(target_guid, school, amount)
+        remaining = max(0, amount - absorbed - resisted)
+        if hasattr(self, "_apply_damage_modifiers"):
+            remaining = self._apply_damage_modifiers(
+                "player" if kind == "player" else "creature",
+                target_guid, school, remaining)
+        died = False
+        if kind == "player":
+            if remaining > 0:
+                await self._damage_player(remaining, f"spell {template.id}")
+            overkill = max(0, remaining - (
+                self._victim_health(target_guid)
+                if hasattr(self, "_victim_health") else 0))
+        elif kind == "peer":
+            peer = (self._peer_session_for_guid(target_guid)
+                    if hasattr(self, "_peer_session_for_guid") else None)
+            if peer is not None and remaining > 0:
+                await peer._damage_player(
+                    remaining, f"{self.character.get('name', 'player')}'s "
+                    f"{template.name}")
+            overkill = 0
+        else:
+            overkill = max(0, remaining - (
+                self._victim_health(target_guid)
+                if hasattr(self, "_victim_health") else 0))
+            if remaining > 0:
+                died = await self._deal_damage_to_creature(
+                    target_guid, remaining, caster_guid)
+        await self._send_spell_damage_log(
+            target_guid, caster_guid, template.id, remaining, school or 1,
+            periodic=1 if periodic else 0,
+            critical=1 if critical else 0,
+            overkill=overkill, absorbed=absorbed, resisted=resisted)
+        if remaining > 0 and kind in ("player", "creature"):
+            await self._break_cc_on_damage(kind, target_guid, template.id)
+        # Damage shields (Thorns, Lightning Shield, ...) retaliate against the
+        # caster of a direct hostile spell.
+        if not periodic and remaining > 0 and caster_guid:
+            if kind == "player" and hasattr(self, "_player_aura_mods"):
+                thorns = int(self._player_aura_mods().get("thorns", 0) or 0)
+                if thorns and not self._is_player_guid(caster_guid):
+                    await self._deal_damage_to_creature(
+                        caster_guid, thorns, self.player_guid)
+            elif kind == "creature" and hasattr(self, "_creature_aura_mods"):
+                thorns = int(self._creature_aura_mods(
+                    creature.creature_low_guid(target_guid)).get("thorns", 0)
+                    or 0)
+                if thorns:
+                    await self._damage_player(thorns, "damage shield")
+        if depleted:
+            if kind == "player" and hasattr(self, "_refresh_player_auras"):
+                await self._refresh_player_auras()
+            elif kind == "creature" and hasattr(self, "_sync_creature_flags"):
+                await self._sync_creature_flags(
+                    creature.creature_low_guid(target_guid))
+        return died
+
+    async def _apply_knockback(self, target_guid: int, speed: int,
+                               school: int = 1) -> None:
+        """Push a unit away from the caster (``SPELL_EFFECT_KNOCK_BACK``)."""
+        speed = max(5, min(60, int(speed)))
+        if self._is_player_guid(target_guid):
+            caster = self._player_position()
+            target = self._player_position()
+            dx = target[0] - caster[0]
+            dy = target[1] - caster[1]
+            length = max(0.001, (dx * dx + dy * dy) ** 0.5)
+            await self.send_packet(
+                Opcodes.SMSG_MOVE_KNOCK_BACK,
+                spells.pack_guid(int(self.player_guid))
+                + struct.pack("<Iffff", 0, dx / length, dy / length,
+                              float(speed), 3.0),
+            )
+            return
+        low = creature.creature_low_guid(int(target_guid))
+        spawn = self._get_creature_spawn(low)
+        if spawn is None:
+            return
+        here = self._creature_position(low)
+        caster = self._player_position()
+        dx = here[0] - caster[0]
+        dy = here[1] - caster[1]
+        length = max(0.001, (dx * dx + dy * dy) ** 0.5)
+        travel = min(10.0, speed * 0.15)
+        dest = (here[0] + dx / length * travel,
+                here[1] + dy / length * travel, here[2])
+        combat = self._get_combat_state()
+        state = combat.get("aggro", {}).get(low)
+        if state is not None:
+            state["pos"] = dest
+            state["chase_until"] = time.monotonic() + 0.25
+        await self.send_packet(
+            Opcodes.SMSG_MONSTER_MOVE,
+            object_update.build_monster_move(
+                self._creature_object_guid(low, int(spawn["entry"])),
+                here[0], here[1], here[2],
+                math.atan2(dest[1] - here[1], dest[0] - here[0]),
+                dest[0], dest[1], dest[2], duration_ms=250,
+                move_id=self._next_move_id()),
+        )
+
+    async def _interrupt_target_cast(self, target_guid: int,
+                                     school: int) -> None:
+        """``SPELL_EFFECT_INTERRUPT_CAST``: stop a cast and lock its school."""
+        now = time.monotonic()
+        if self._is_player_guid(target_guid):
+            combat = self._get_combat_state()
+            school_mask = int(school or 1)
+            combat.setdefault("school_lockout", {})[school_mask] = now + 4.0
+            await self._interrupt_player_cast(SPELL_FAILED_INTERRUPTED)
+            return
+        low = creature.creature_low_guid(int(target_guid))
+        state = self._get_combat_state().get("aggro", {}).get(low)
+        if state is None:
+            return
+        ai = state.get("ai")
+        if ai is None:
+            return
+        cast = ai.get("cast")
+        if cast is not None:
+            ai["cast"] = None
+            await self.send_packet(
+                Opcodes.SMSG_SPELL_FAILURE,
+                spells.build_spell_failure(
+                    self._creature_object_guid(low, ai["entry"]),
+                    cast.get("cast_id", 0), int(cast["spell_id"]),
+                    SPELL_FAILED_INTERRUPTED),
+            )
+        ai["school_lockout"] = {
+            "school": int(school or 1),
+            "until": now + 4.0,
+        }
+        self.log.debug(
+            f"Interrupted creature {low} and locked school {school}")
+
+    def _dispel_candidates(self, target_kind: str, target_guid: int,
+                           dispel_type: int, offensive: bool) -> list:
+        """Auras on ``target_guid`` matching a dispel type and polarity."""
+        entries = self._aura_store(target_kind, target_guid)
+        mask = (spells.DISPEL_ALL_MASK if int(dispel_type) in (0, spells.DISPEL_ALL)
+                else 1 << int(dispel_type))
+        result = []
+        for aura in entries:
+            aura_dispel = int(aura.get("dispel_type") or 0)
+            if not aura_dispel or not (mask & (1 << aura_dispel)):
+                continue
+            # Offensive dispels remove buffs; defensive dispels remove debuffs.
+            if offensive and not aura.get("positive"):
+                continue
+            if not offensive and aura.get("positive"):
+                continue
+            result.append(aura)
+        return result
+
+    async def _dispel_target(self, target_guid: int, dispel_type: int,
+                             count: int = 1, offensive: bool = False) -> None:
+        """Remove up to ``count`` matching auras and send the dispel log."""
+        kind = self._spell_target_kind(target_guid)
+        if kind == "peer":
+            peer = self._peer_session_for_guid(target_guid)
+            if peer is not None and hasattr(peer, "_dispel_target"):
+                return await peer._dispel_target(
+                    int(peer.player_guid), dispel_type, count,
+                    offensive=offensive)
+            return
+        if hasattr(self, "_dispel_immune") and self._dispel_immune(
+                kind, target_guid, int(dispel_type)):
+            await self._send_dispel_failed(target_guid, dispel_type)
+            return
+        candidates = self._dispel_candidates(
+            kind, target_guid, int(dispel_type), offensive)
+        if not candidates:
+            await self._send_dispel_failed(target_guid, dispel_type)
+            return
+        removed = candidates[:max(1, int(count))]
+        entries = self._aura_store(kind, target_guid)
+        for aura in removed:
+            if aura in entries:
+                entries.remove(aura)
+                if hasattr(self, "_remove_dots_for_aura"):
+                    self._remove_dots_for_aura(
+                        kind, target_guid, int(aura["spell_id"]))
+                if hasattr(self, "_send_aura_update"):
+                    await self._send_aura_update(
+                        kind, target_guid, aura, remove=True)
+        if kind == "player":
+            if hasattr(self, "_refresh_player_auras"):
+                await self._refresh_player_auras()
+        else:
+            low = creature.creature_low_guid(target_guid)
+            if hasattr(self, "_sync_creature_flags"):
+                await self._sync_creature_flags(low)
+        payload = bytearray()
+        payload += spells.pack_guid(int(target_guid))
+        payload += spells.pack_guid(int(self.player_guid))
+        payload += struct.pack("<I", int(getattr(self, "_last_cast_spell_id", 0) or 0))
+        payload += struct.pack("<B", 0)
+        payload += struct.pack("<I", len(removed))
+        for aura in removed:
+            payload += struct.pack("<I", int(aura["spell_id"]))
+            payload += struct.pack("<B", 0)
+        await self.send_packet(Opcodes.SMSG_SPELLDISPELLOG, bytes(payload))
+
+    async def _send_dispel_failed(self, target_guid: int,
+                                  dispel_type: int) -> None:
+        payload = (struct.pack("<Q", int(self.player_guid))
+                   + struct.pack("<Q", int(target_guid))
+                   + struct.pack("<I", int(getattr(self, "_last_cast_spell_id", 0) or 0)))
+        await self.send_packet(Opcodes.SMSG_DISPEL_FAILED, payload)
+
+    async def _steal_beneficial(self, target_guid: int) -> None:
+        """``SPELL_EFFECT_STEAL_BENEFICIAL``: move a buff from target to self."""
+        kind = self._spell_target_kind(target_guid)
+        if kind != "creature":
+            return
+        candidates = [aura for aura in self._dispel_candidates(
+            kind, target_guid, spells.DISPEL_ALL, offensive=True)
+            if aura.get("positive")]
+        if not candidates:
+            await self._send_dispel_failed(target_guid, spells.DISPEL_ALL)
+            return
+        aura = candidates[0]
+        entries = self._aura_store(kind, target_guid)
+        if aura in entries:
+            entries.remove(aura)
+        if hasattr(self, "_remove_dots_for_aura"):
+            self._remove_dots_for_aura(kind, target_guid, int(aura["spell_id"]))
+        await self._send_aura_update(kind, target_guid, aura, remove=True)
+        # Re-apply the stolen aura on the caster with its remaining duration.
+        target_entries = self._aura_store("player", self.player_guid)
+        copy = dict(aura)
+        copy["caster_guid"] = int(self.player_guid)
+        copy["expires"] = time.monotonic() + min(
+            10.0, max(1.0, float(aura.get("expires", 0)) - time.monotonic()))
+        copy["max_duration"] = max(
+            1.0, float(copy["expires"]) - time.monotonic())
+        copy["caster_level"] = int(self.character.get("level", 1))
+        target_entries.append(copy)
+        self._normalise_aura_slots(target_entries)
+        await self._refresh_player_auras()
+        await self._send_aura_update("player", self.player_guid, copy)
+        payload = bytearray()
+        payload += spells.pack_guid(int(target_guid))
+        payload += spells.pack_guid(int(self.player_guid))
+        payload += struct.pack("<I", int(getattr(
+            self, "_last_cast_spell_id", 0) or 0))
+        payload += struct.pack("<B", 0)
+        payload += struct.pack("<I", 1)
+        payload += struct.pack("<I", int(aura["spell_id"]))
+        payload += struct.pack("<B", 1)
+        await self.send_packet(Opcodes.SMSG_SPELLSTEALLOG, bytes(payload))
+
     async def _apply_spell_effects(self, cast, template, target_guid: int) -> None:
         """Roll and apply every effect of a completed cast."""
+        self._last_cast_spell_id = int(template.id)
         caster_level = int(self.character.get("level", 1))
         player_guid = int(self.player_guid)
         # ``WorldObject::CalculateSpellEffectValue`` adds the per-combo-point
@@ -468,6 +1172,7 @@ class SpellsMixin:
             combo_points = self._combo_points()
         ground_started = False
         aura_patterns: set = set()
+        rolls: dict = {}
         for index, effect in enumerate(template.effects):
             etype = int(effect["effect"])
             if not etype:
@@ -484,24 +1189,49 @@ class SpellsMixin:
             if area_kind is not None and etype in AREA_EFFECT_TYPES:
                 await self._apply_area_effect(
                     cast, template, index, effect, area_kind, target_guid,
-                    combo_points, caster_level)
+                    combo_points, caster_level, rolls)
                 continue
             chain_count = int(effect.get("chain_targets") or 0)
             if (chain_count > 1 and target_guid
                     and etype in DIRECT_DAMAGE_TYPES):
                 await self._apply_chain_effect(
                     cast, template, index, effect, target_guid,
-                    combo_points, caster_level, chain_count)
+                    combo_points, caster_level, chain_count, rolls)
                 continue
+
+            # One hit/crit roll per hostile target and spell, shared by all of
+            # its effects (Frostbolt's chill and damage, Flame Shock's direct
+            # hit and DoT, ...).  Self and friendly effects never miss.
+            harmful = self._effect_is_harmful(template, effect)
+            roll = None
+            if harmful and target_guid and not self._is_player_guid(target_guid):
+                roll = await self._resolve_spell_target(
+                    target_guid, template, effect, rolls)
+                if roll is None:
+                    continue
+            critical = bool(roll and roll.get("crit"))
+
             if etype == spells.SPELL_EFFECT_SCHOOL_DAMAGE:
                 if not target_guid:
                     continue
                 amount = template.effect_value(index, caster_level, combo_points)
+                amount += self._spell_power_bonus(effect)
+                amount = self._apply_damage_done(
+                    int(template.school), max(0, amount))
+                if critical:
+                    amount = int(amount * 2.0)
                 if amount <= 0:
                     continue
-                await self._deal_damage_to_target(
-                    target_guid, amount, template.school, template.id, player_guid
-                )
+                if roll and roll.get("reflect"):
+                    await self._damage_player(
+                        amount, f"reflected {template.name}")
+                    await self._send_spell_damage_log(
+                        self.player_guid, target_guid, template.id, amount,
+                        template.school or 1, critical=1 if critical else 0)
+                    continue
+                await self._deal_spell_damage(
+                    target_guid, amount, template.school or 1, template,
+                    player_guid, critical=critical)
             elif etype in (spells.SPELL_EFFECT_WEAPON_DAMAGE,
                            spells.SPELL_EFFECT_WEAPON_DAMAGE_NOSCHOOL,
                            spells.SPELL_EFFECT_NORMALIZED_WEAPON_DMG,
@@ -510,50 +1240,110 @@ class SpellsMixin:
                     continue
                 amount = self._direct_effect_damage(
                     etype, template, index, effect, caster_level, combo_points)
-                await self._deal_damage_to_target(
-                    target_guid, amount, 1, template.id, player_guid
-                )
+                amount = self._apply_damage_done(1, max(0, amount))
+                if critical:
+                    amount = int(amount * 2.0)
+                await self._deal_spell_damage(
+                    target_guid, amount, 1, template, player_guid,
+                    critical=critical)
             elif etype == spells.SPELL_EFFECT_ATTACK:
                 if not target_guid:
                     continue
                 weapon = self._player_weapon_stats()
                 amount = int(random.uniform(weapon["min"], weapon["max"]))
                 amount += max(1, int(caster_level * 0.5))
-                await self._send_attacker_state_update(
-                    player_guid, target_guid, max(1, amount)
-                )
-                await self._deal_damage_to_target(
-                    target_guid, max(1, amount), 1, template.id, player_guid
-                )
+                if critical:
+                    amount *= 2
+                await self._deal_spell_damage(
+                    target_guid, max(1, amount), 1, template, player_guid,
+                    critical=critical)
             elif etype in (spells.SPELL_EFFECT_HEAL,
                            spells.SPELL_EFFECT_HEAL_MAX_HEALTH):
-                amount = template.effect_value(index, caster_level, combo_points)
+                if etype == spells.SPELL_EFFECT_HEAL_MAX_HEALTH:
+                    amount = self._max_health()
+                else:
+                    amount = template.effect_value(
+                        index, caster_level, combo_points)
+                    amount += self._spell_power_bonus(effect, healing=True)
+                amount = int(amount * (
+                    1.0 + float(self.character.get("healing_pct", 0.0) or 0.0)
+                    / 100.0))
+                heal_crit = False
+                crit_chance = float(
+                    self.character.get("spell_crit_chance", 0.0) or 0.0)
+                if crit_chance and random.uniform(0.0, 100.0) < crit_chance:
+                    amount = int(amount * 1.5)
+                    heal_crit = True
                 if amount <= 0:
                     continue
-                healed, overheal = await self._heal_player(amount)
+                peer = (self._peer_session_for_guid(target_guid)
+                        if target_guid and hasattr(self, "_peer_session_for_guid")
+                        else None)
+                if peer is not None:
+                    healed, overheal = await peer._heal_player(amount)
+                else:
+                    healed, overheal = await self._heal_player(amount)
                 await self._send_spell_heal_log(
                     target_guid or player_guid, player_guid, template.id,
-                    healed, overheal,
+                    healed, overheal, critical=heal_crit,
                 )
             elif etype == spells.SPELL_EFFECT_HEALTH_LEECH:
                 if not target_guid:
                     continue
                 amount = template.effect_value(index, caster_level, combo_points)
+                amount += self._spell_power_bonus(effect)
+                if critical:
+                    amount = int(amount * 2.0)
                 if amount <= 0:
                     continue
-                await self._deal_damage_to_target(
-                    target_guid, amount, template.school, template.id, player_guid
-                )
+                await self._deal_spell_damage(
+                    target_guid, amount, template.school or 1, template,
+                    player_guid, critical=critical)
                 healed, _ = await self._heal_player(amount)
                 await self._send_spell_heal_log(
                     player_guid, player_guid, template.id, healed, 0
                 )
             elif etype == spells.SPELL_EFFECT_INSTAKILL:
                 if target_guid:
-                    await self._deal_damage_to_target(
-                        target_guid, 1 << 24, template.school, template.id,
-                        player_guid,
-                    )
+                    await self._deal_spell_damage(
+                        target_guid, 1 << 24, template.school or 1, template,
+                        player_guid)
+            elif etype == spells.SPELL_EFFECT_KNOCK_BACK:
+                if target_guid:
+                    await self._apply_knockback(
+                        target_guid, int(template.effect_value(
+                            index, caster_level) or 20),
+                        template.school or 1)
+            elif etype == spells.SPELL_EFFECT_INTERRUPT_CAST:
+                if target_guid:
+                    await self._interrupt_target_cast(
+                        target_guid, int(template.school) or 1)
+            elif etype == spells.SPELL_EFFECT_DISPEL:
+                if target_guid:
+                    count = int(effect.get("base_points") or 0) + 1
+                    offensive = (not self._is_player_guid(target_guid)
+                                 and not (hasattr(self, "_is_peer_player_guid")
+                                          and self._is_peer_player_guid(
+                                              target_guid)))
+                    await self._dispel_target(
+                        target_guid, int(effect.get("misc_value") or 0),
+                        max(1, count), offensive=offensive)
+            elif etype == spells.SPELL_EFFECT_STEAL_BENEFICIAL:
+                if target_guid:
+                    await self._steal_beneficial(target_guid)
+            elif etype == spells.SPELL_EFFECT_ENERGIZE:
+                amount = template.effect_value(index, caster_level, combo_points)
+                if amount <= 0:
+                    continue
+                power_type = int(effect.get("misc_value") or 0)
+                victim = int(target_guid or self.player_guid)
+                if self._is_player_guid(victim):
+                    if power_type == self._power_type():
+                        current = int(self.character.get("power", 0))
+                        await self._set_player_power(
+                            min(self._max_power(), current + amount))
+                await self._send_spell_energize_log(
+                    victim, player_guid, template.id, power_type, amount)
             elif etype == spells.SPELL_EFFECT_TRIGGER_SPELL:
                 triggered = int(effect["trigger_spell"])
                 if triggered:
@@ -589,6 +1379,11 @@ class SpellsMixin:
                 if points > 0:
                     await self._add_combo_points(target_guid, points)
             elif etype == spells.SPELL_EFFECT_APPLY_AURA:
+                if roll and roll.get("reflect"):
+                    continue
+                if roll is None and harmful and target_guid \
+                        and not self._is_player_guid(target_guid):
+                    continue
                 self._apply_periodic_aura(template, effect, index, caster_level,
                                           target_guid, combo_points)
                 if hasattr(self, "_apply_aura_from_effect"):
@@ -624,10 +1419,21 @@ class SpellsMixin:
         if etype == spells.SPELL_EFFECT_WEAPON_PERCENT_DAMAGE:
             percent = (int(effect.get("base_points") or 0) + 1) / 100.0
             return max(1, int(roll * percent))
+        if etype == spells.SPELL_EFFECT_NORMALIZED_WEAPON_DMG:
+            # ``WeaponDamageRange`` normalized to a 2.4 s weapon, then the
+            # ability's flat bonus (Mortal Strike, Bloodthirst, ...).
+            delay = max(0.5, float(weapon.get("delay", 2.0) or 2.0))
+            normalized = (roll / delay) * 2.4
+            normalized += (int(self.character.get("attack_power", 0) or 0)
+                           / 14.0 * 2.4)
+            return max(1, int(normalized + template.effect_value(
+                index, caster_level, combo_points)))
         amount = int(roll)
         amount += template.effect_value(index, caster_level, combo_points)
         amount += max(1, int(caster_level * 0.5))
-        return max(1, amount)
+        amount += (int(self.character.get("attack_power", 0) or 0) / 14.0
+                   * float(weapon.get("delay", 2.0) or 2.0))
+        return max(1, int(amount))
 
     def _area_center(self, template, index: int, cast, target_guid: int):
         """Reference position for an area/cone effect."""
@@ -674,20 +1480,40 @@ class SpellsMixin:
 
     async def _apply_area_effect(self, cast, template, index: int, effect: dict,
                                  kind: str, target_guid: int,
-                                 combo_points: int, caster_level: int) -> None:
+                                 combo_points: int, caster_level: int,
+                                 rolls: dict | None = None) -> None:
         """Apply one direct/aura effect to every unit in its area or cone."""
         etype = int(effect["effect"])
         player_guid = int(self.player_guid)
+        rolls = rolls if rolls is not None else {}
         if kind == "ally":
-            # Party/raid membership is not modelled; the caster is always in
-            # their own area effect, so at least self-heals/buffs work.
+            # Party/raid membership is not modelled, so every friendly player
+            # in the area receives the effect (and the caster is always in it).
+            radius = max(5.0, template.effect_radius(index) or 10.0)
+            center = self._area_center(template, index, cast, target_guid)
             if etype in (spells.SPELL_EFFECT_HEAL,
                          spells.SPELL_EFFECT_HEAL_MAX_HEALTH):
-                amount = template.effect_value(index, caster_level, combo_points)
+                amount = (self._max_health()
+                          if etype == spells.SPELL_EFFECT_HEAL_MAX_HEALTH
+                          else template.effect_value(
+                              index, caster_level, combo_points)
+                          + self._spell_power_bonus(effect, healing=True))
                 if amount > 0:
                     healed, overheal = await self._heal_player(amount)
                     await self._send_spell_heal_log(
                         player_guid, player_guid, template.id, healed, overheal)
+                    for peer in (self.peers() if hasattr(self, "peers") else ()):
+                        peer_pos = (
+                            float(peer.character.get("x", 0.0)),
+                            float(peer.character.get("y", 0.0)),
+                            float(peer.character.get("z", 0.0)))
+                        if self._distance(center, peer_pos) > radius + 0.5:
+                            continue
+                        peer_healed, peer_overheal = await peer._heal_player(
+                            amount)
+                        await self._send_spell_heal_log(
+                            int(peer.player_guid), player_guid, template.id,
+                            peer_healed, peer_overheal)
             elif etype == spells.SPELL_EFFECT_APPLY_AURA:
                 self._apply_periodic_aura(template, effect, index, caster_level,
                                           player_guid, combo_points)
@@ -695,6 +1521,21 @@ class SpellsMixin:
                     await self._apply_aura_from_effect(
                         template, effect, index, player_guid, player_guid,
                         caster_level, combo_points, target_kind="player")
+                    for peer in (self.peers() if hasattr(self, "peers") else ()):
+                        peer_pos = (
+                            float(peer.character.get("x", 0.0)),
+                            float(peer.character.get("y", 0.0)),
+                            float(peer.character.get("z", 0.0)))
+                        if self._distance(center, peer_pos) > radius + 0.5:
+                            continue
+                        if hasattr(peer, "_apply_periodic_aura"):
+                            peer._apply_periodic_aura(
+                                template, effect, index, caster_level,
+                                int(peer.player_guid), combo_points)
+                        await peer._apply_aura_from_effect(
+                            template, effect, index, player_guid,
+                            int(peer.player_guid), caster_level, combo_points,
+                            target_kind="player")
             return
         radius = template.effect_radius(index)
         if radius <= 0.0:
@@ -704,10 +1545,15 @@ class SpellsMixin:
                                             template.max_targets)
         if not targets:
             return
-        amount = 0
+        base_amount = 0
         if etype in DIRECT_DAMAGE_TYPES:
-            amount = self._direct_effect_damage(
+            base_amount = self._direct_effect_damage(
                 etype, template, index, effect, caster_level, combo_points)
+            if etype in (spells.SPELL_EFFECT_SCHOOL_DAMAGE,
+                         spells.SPELL_EFFECT_HEALTH_LEECH):
+                base_amount += self._spell_power_bonus(effect)
+            base_amount = self._apply_damage_done(
+                int(template.school) or 1, base_amount)
         for low_guid, spawn in targets:
             guid = self._creature_object_guid(low_guid, int(spawn["entry"]))
             if etype in (spells.SPELL_EFFECT_SCHOOL_DAMAGE,
@@ -715,19 +1561,40 @@ class SpellsMixin:
                          spells.SPELL_EFFECT_WEAPON_DAMAGE_NOSCHOOL,
                          spells.SPELL_EFFECT_NORMALIZED_WEAPON_DMG,
                          spells.SPELL_EFFECT_WEAPON_PERCENT_DAMAGE):
-                if amount <= 0:
+                if base_amount <= 0:
                     continue
-                await self._deal_damage_to_target(
-                    guid, amount, template.school or 1, template.id, player_guid)
+                roll = await self._resolve_spell_target(
+                    guid, template, effect, rolls)
+                if roll is None:
+                    continue
+                amount = int(base_amount * (2.0 if roll.get("crit") else 1.0))
+                if roll.get("reflect"):
+                    await self._damage_player(
+                        amount, f"reflected {template.name}")
+                    continue
+                await self._deal_spell_damage(
+                    guid, amount, template.school or 1, template, player_guid,
+                    critical=bool(roll.get("crit")))
             elif etype == spells.SPELL_EFFECT_HEALTH_LEECH:
-                if amount <= 0:
+                if base_amount <= 0:
                     continue
-                await self._deal_damage_to_target(
-                    guid, amount, template.school or 1, template.id, player_guid)
+                roll = await self._resolve_spell_target(
+                    guid, template, effect, rolls)
+                if roll is None:
+                    continue
+                amount = int(base_amount * (2.0 if roll.get("crit") else 1.0))
+                await self._deal_spell_damage(
+                    guid, amount, template.school or 1, template, player_guid,
+                    critical=bool(roll.get("crit")))
                 healed, _ = await self._heal_player(amount)
                 await self._send_spell_heal_log(
                     player_guid, player_guid, template.id, healed, 0)
             elif etype == spells.SPELL_EFFECT_APPLY_AURA:
+                if self._effect_is_harmful(template, effect):
+                    roll = await self._resolve_spell_target(
+                        guid, template, effect, rolls)
+                    if roll is None:
+                        continue
                 self._apply_periodic_aura(template, effect, index, caster_level,
                                           guid, combo_points)
                 if hasattr(self, "_apply_aura_from_effect"):
@@ -738,10 +1605,12 @@ class SpellsMixin:
     async def _apply_chain_effect(self, cast, template, index: int,
                                   effect: dict, target_guid: int,
                                   combo_points: int, caster_level: int,
-                                  chain_count: int) -> None:
+                                  chain_count: int,
+                                  rolls: dict | None = None) -> None:
         """Chain Lightning/Multi-Shot: primary target plus nearby jumps."""
         etype = int(effect["effect"])
         player_guid = int(self.player_guid)
+        rolls = rolls if rolls is not None else {}
         if etype not in (spells.SPELL_EFFECT_SCHOOL_DAMAGE,
                          spells.SPELL_EFFECT_WEAPON_DAMAGE,
                          spells.SPELL_EFFECT_WEAPON_DAMAGE_NOSCHOOL,
@@ -750,6 +1619,9 @@ class SpellsMixin:
             return
         base = self._direct_effect_damage(
             etype, template, index, effect, caster_level, combo_points)
+        if etype == spells.SPELL_EFFECT_SCHOOL_DAMAGE:
+            base += self._spell_power_bonus(effect)
+        base = self._apply_damage_done(int(template.school) or 1, base)
         hit: list[int] = []
         current = int(target_guid)
         for jump in range(max(1, chain_count)):
@@ -762,8 +1634,15 @@ class SpellsMixin:
             if spawn is None or int(spawn["dead_since"] or 0) > 0:
                 break
             amount = max(1, int(base * (CHAIN_DAMAGE_FALLOFF ** jump)))
-            await self._deal_damage_to_target(
-                current, amount, template.school or 1, template.id, player_guid)
+            roll = await self._resolve_spell_target(
+                current, template, effect, rolls)
+            if roll is not None:
+                critical = bool(roll.get("crit"))
+                if critical:
+                    amount *= 2
+                await self._deal_spell_damage(
+                    current, amount, template.school or 1, template,
+                    player_guid, critical=critical)
             hit.append(current)
             # Find the closest not-yet-hit enemy near the last jump target.
             here = self._creature_position(low)
@@ -806,6 +1685,11 @@ class SpellsMixin:
         amount = template.effect_value(index, caster_level)
         school = int(template.school) or 1
         aura = int(effect.get("apply_aura") or 0)
+        slow_amount = 0
+        slow_spell_id = 0
+        if aura == spells.SPELL_AURA_MOD_DECREASE_SPEED:
+            slow_amount = abs(amount)
+            slow_spell_id = int(template.id)
         # Blizzard/Rain of Fire/Volley/Hurricane keep the damage in a companion
         # PERIODIC_TRIGGER_SPELL effect; the persistent aura itself is a dummy.
         for other in template.effects:
@@ -823,12 +1707,20 @@ class SpellsMixin:
                         spells.SPELL_EFFECT_SCHOOL_DAMAGE:
                     amount = triggered.effect_value(trigger_index, caster_level)
                     school = int(triggered.school) or school
-                    break
+                if int(trigger_effect.get("apply_aura") or 0) == \
+                        spells.SPELL_AURA_MOD_DECREASE_SPEED:
+                    slow_amount = abs(triggered.effect_value(
+                        trigger_index, caster_level))
+                    slow_spell_id = int(triggered.id)
             interval = max(250, int(other.get("amplitude") or 1000)) / 1000.0
             break
         if aura in (spells.SPELL_AURA_PERIODIC_DAMAGE,
                     spells.SPELL_AURA_PERIODIC_DUMMY):
             interval = max(250, int(effect.get("amplitude") or 1000)) / 1000.0
+        if amount <= 0:
+            return
+        if caster_guid is None or int(caster_guid) == int(self.player_guid or 0):
+            amount = self._apply_damage_done(int(school) or 1, int(amount))
         if amount <= 0:
             return
         now = time.monotonic()
@@ -847,6 +1739,8 @@ class SpellsMixin:
             "expires": now + duration_ms / 1000.0,
             "max_targets": int(template.max_targets or 0),
             "hostile_to_player": bool(hostile_to_player),
+            "slow_amount": int(slow_amount or 0),
+            "slow_spell_id": int(slow_spell_id or 0),
         })
         self.log.debug(
             f"Ground AoE {template.name} ({template.id}) at {center} "
@@ -874,18 +1768,69 @@ class SpellsMixin:
                     await self._deal_damage_to_target(
                         guid, area["amount"], area["school"],
                         area["spell_id"], area["caster_guid"])
+                    if int(area.get("slow_amount") or 0):
+                        await self._apply_ground_slow(
+                            low_guid, area)
                 if (area.get("hostile_to_player")
                         and self._distance(area["center"],
                                            self._player_position())
                         <= area["radius"] + 0.5):
-                    await self._damage_player(
-                        area["amount"], f"spell {area['spell_id']}")
-                    await self._send_spell_damage_log(
-                        int(self.player_guid), int(area["caster_guid"]),
-                        int(area["spell_id"]), int(area["amount"]),
-                        int(area["school"]) or 1, periodic=1)
+                    trigger = spells.get_spell_template(
+                        self.config.database.world_path,
+                        int(area["spell_id"]))
+                    if trigger is not None and hasattr(self, "_deal_spell_damage"):
+                        await self._deal_spell_damage(
+                            int(self.player_guid), int(area["amount"]),
+                            int(area["school"]) or 1, trigger,
+                            int(area["caster_guid"]), periodic=True)
+                    else:
+                        await self._damage_player(
+                            area["amount"], f"spell {area['spell_id']}")
+                        await self._send_spell_damage_log(
+                            int(self.player_guid), int(area["caster_guid"]),
+                            int(area["spell_id"]), int(area["amount"]),
+                            int(area["school"]) or 1, periodic=1)
             alive.append(area)
         combat["area_effects"] = alive
+
+    async def _apply_ground_slow(self, low_guid: int, area: dict) -> None:
+        """Refresh a short movement-slow aura from a ground effect tick."""
+        if not hasattr(self, "_aura_store"):
+            return
+        now = time.monotonic()
+        entries = self._aura_store("creature", low_guid)
+        spell_id = int(area.get("slow_spell_id") or area["spell_id"])
+        component = {
+            "type": spells.SPELL_AURA_MOD_DECREASE_SPEED,
+            "amount": -abs(int(area.get("slow_amount") or 0)),
+            "misc": 0,
+            "misc_b": 0,
+            "amplitude": 0,
+            "trigger_spell": 0,
+        }
+        for aura in entries:
+            if int(aura["spell_id"]) == spell_id:
+                aura["components"] = [component]
+                aura["expires"] = now + float(area["interval"]) + 0.5
+                aura["max_duration"] = float(area["interval"]) + 0.5
+                return
+        entry = {
+            "spell_id": spell_id,
+            "name": "Ground Slow",
+            "caster_guid": int(area.get("caster_guid") or self.player_guid),
+            "caster_level": int(self.character.get("level", 1)),
+            "expires": now + float(area["interval"]) + 0.5,
+            "max_duration": float(area["interval"]) + 0.5,
+            "components": [component],
+            "stacks": 1,
+            "max_stacks": 1,
+            "dispel_type": 0,
+            "mechanic": 0,
+            "positive": False,
+            "slot": len(entries),
+        }
+        entries.append(entry)
+        self._normalise_aura_slots(entries)
 
     async def _cast_triggered(self, spell_id: int, target_guid: int) -> None:
         """Cast a triggered spell immediately, ignoring costs and cooldowns."""
@@ -916,6 +1861,13 @@ class SpellsMixin:
             return
         amplitude = max(250, int(effect["amplitude"] or 2000)) / 1000.0
         amount = template.effect_value(index, caster_level, combo_points)
+        if aura == spells.SPELL_AURA_PERIODIC_HEAL:
+            amount += self._spell_power_bonus(effect, healing=True)
+        elif aura in (spells.SPELL_AURA_PERIODIC_DAMAGE,
+                      spells.SPELL_AURA_PERIODIC_LEECH):
+            amount += self._spell_power_bonus(effect)
+            amount = self._apply_damage_done(
+                int(template.school) or 1, max(0, amount))
         if amount <= 0:
             return
         duration_ms = spells.spell_duration_ms(
@@ -938,6 +1890,7 @@ class SpellsMixin:
                 dot["expires"] = now + duration_ms / 1000.0
                 dot["school"] = int(template.school)
                 dot["is_heal"] = aura == spells.SPELL_AURA_PERIODIC_HEAL
+                dot["leech"] = aura == spells.SPELL_AURA_PERIODIC_LEECH
                 dot["energize"] = (int(effect.get("misc_value") or 0)
                                    if aura == spells.SPELL_AURA_PERIODIC_ENERGIZE
                                    else None)
@@ -952,6 +1905,7 @@ class SpellsMixin:
             "next_tick": now + float(amplitude),
             "expires": now + duration_ms / 1000.0,
             "is_heal": aura == spells.SPELL_AURA_PERIODIC_HEAL,
+            "leech": aura == spells.SPELL_AURA_PERIODIC_LEECH,
             "energize": (int(effect.get("misc_value") or 0)
                          if aura == spells.SPELL_AURA_PERIODIC_ENERGIZE
                          else None),
@@ -959,15 +1913,24 @@ class SpellsMixin:
 
     async def _deal_damage_to_target(self, target_guid: int, damage: int,
                                      school: int, spell_id: int,
-                                     caster_guid: int) -> None:
+                                     caster_guid: int,
+                                     periodic: bool = False) -> bool:
         """Damage a creature (or the player) and write the combat-log packet."""
+        template = spells.get_spell_template(
+            self.config.database.world_path, int(spell_id))
+        if template is not None and hasattr(self, "_deal_spell_damage"):
+            return await self._deal_spell_damage(
+                target_guid, damage, school or 1, template, caster_guid,
+                periodic=periodic)
         if self._is_player_guid(target_guid):
             await self._damage_player(damage, f"spell {spell_id}")
-            return
+            return False
         died = await self._deal_damage_to_creature(target_guid, damage, caster_guid)
         await self._send_spell_damage_log(
-            target_guid, caster_guid, spell_id, damage, school or 1
+            target_guid, caster_guid, spell_id, damage, school or 1,
+            periodic=1 if periodic else 0
         )
+        return died
 
     async def _apply_pending_cast(self, pending: dict) -> None:
         """Finish a cast whose casting time has elapsed."""
@@ -998,6 +1961,9 @@ class SpellsMixin:
         await self._send_spell_go(cast, template, target_guid,
                                   pending["cast_id"])
         await self._apply_spell_effects(cast, template, target_guid)
+        if template.is_channeled():
+            await self._start_channel(cast, template, target_guid,
+                                      pending["cast_id"])
         if template.needs_combo_points():
             await self._clear_combo_points()
         self.log.info(
@@ -1019,6 +1985,9 @@ class SpellsMixin:
                 current = int(self.character.get("power", 0))
                 await self._set_player_power(
                     min(self._max_power(), current + amount))
+                await self._send_spell_energize_log(
+                    target_guid, caster_guid, dot["spell_id"], power_type,
+                    amount)
             return
         if dot["is_heal"]:
             if self._is_player_guid(target_guid):
@@ -1044,18 +2013,42 @@ class SpellsMixin:
                         max(0, healed), max(0, amount - healed))
             return
         if self._is_player_guid(target_guid):
-            await self._damage_player(amount, f"periodic {dot['spell_id']}")
-            await self._send_spell_damage_log(
-                target_guid, caster_guid, dot["spell_id"], amount,
-                dot["school"] or 1, periodic=1,
-            )
+            await self._deal_damage_to_target(
+                target_guid, amount, dot["school"] or 1, dot["spell_id"],
+                caster_guid, periodic=True)
+            if dot.get("leech") and caster_guid:
+                if self._is_player_guid(caster_guid):
+                    healed, _ = await self._heal_player(amount)
+                    await self._send_spell_heal_log(
+                        caster_guid, caster_guid, dot["spell_id"], healed, 0)
+                elif hasattr(self, "_heal_creature"):
+                    low = creature.creature_low_guid(caster_guid)
+                    spawn = self._get_creature_spawn(low)
+                    if spawn is not None:
+                        await self._heal_creature(
+                            low, spawn, amount,
+                            spells.get_spell_template(
+                                self.config.database.world_path,
+                                int(dot["spell_id"])), caster_guid)
             return
-        died = await self._deal_damage_to_creature(target_guid, amount,
-                                                   caster_guid)
-        await self._send_spell_damage_log(
-            target_guid, caster_guid, dot["spell_id"], amount,
-            dot["school"] or 1, periodic=1,
-        )
+        died = await self._deal_damage_to_target(
+            target_guid, amount, dot["school"] or 1, dot["spell_id"],
+            caster_guid, periodic=True)
+        if dot.get("leech") and caster_guid and self._is_player_guid(caster_guid):
+            healed, _ = await self._heal_player(amount)
+            await self._send_spell_heal_log(
+                caster_guid, caster_guid, dot["spell_id"], healed, 0)
+        elif dot.get("leech") and caster_guid \
+                and not self._is_player_guid(caster_guid) \
+                and hasattr(self, "_heal_creature"):
+            low = creature.creature_low_guid(caster_guid)
+            spawn = self._get_creature_spawn(low)
+            if spawn is not None:
+                await self._heal_creature(
+                    low, spawn, amount,
+                    spells.get_spell_template(
+                        self.config.database.world_path,
+                        int(dot["spell_id"])), caster_guid)
         if died:
             dot["expires"] = 0.0
 
@@ -1075,6 +2068,40 @@ class SpellsMixin:
             combat["pending_cast"] = None
             self.log.debug(f"Cancelled cast of spell {spell_id}")
 
+    async def handle_cancel_channel(self, data: bytes):
+        """``CMSG_CANCEL_CHANNELLING``: stop the player's active channel."""
+        if len(data) < 4:
+            return
+        spell_id = struct.unpack_from("<I", data, 0)[0]
+        combat = self._get_combat_state()
+        channel = combat.get("channel")
+        if channel and int(channel["spell_id"]) == int(spell_id):
+            combat["channel"] = None
+            await self.send_packet(
+                Opcodes.MSG_CHANNEL_UPDATE,
+                spells.pack_guid(int(self.player_guid)) + struct.pack("<I", 0),
+            )
+            self.log.debug(f"Cancelled channel of spell {spell_id}")
+
+    async def handle_cancel_aura(self, data: bytes):
+        """``CMSG_CANCEL_AURA``: right-click a buff to remove it."""
+        if len(data) < 4:
+            return
+        spell_id = struct.unpack_from("<I", data, 0)[0]
+        combat = self._get_combat_state()
+        entries = combat.get("auras", [])
+        for aura in list(entries):
+            if int(aura["spell_id"]) != int(spell_id):
+                continue
+            if aura.get("positive"):
+                entries.remove(aura)
+                self._normalise_aura_slots(entries)
+                await self._send_aura_update(
+                    "player", self.player_guid, aura, remove=True)
+                await self._refresh_player_auras()
+                self.log.debug(f"Cancelled aura {spell_id}")
+                return
+
     async def handle_set_selection(self, data: bytes):
         """``CMSG_SET_SELECTION``: the client selected a target."""
         if len(data) >= 8:
@@ -1084,22 +2111,35 @@ class SpellsMixin:
 
     async def _send_spell_damage_log(self, victim_guid: int, caster_guid: int,
                                      spell_id: int, damage: int, school: int,
-                                     periodic: int = 0, critical: int = 0) -> None:
-        """Send ``SMSG_SPELLNONMELEEDAMAGELOG`` (overkill/absorb/resist = 0)."""
+                                     periodic: int = 0, critical: int = 0,
+                                     overkill: int = 0, absorbed: int = 0,
+                                     resisted: int = 0) -> None:
+        """Send ``SMSG_SPELLNONMELEEDAMAGELOG`` with mitigation fields."""
         out = bytearray()
         out += spells.pack_guid(int(victim_guid))
         out += spells.pack_guid(int(caster_guid))
         out += struct.pack("<ii", int(spell_id) & 0xFFFFFFFF, int(damage))
-        out += struct.pack("<i", 0)                  # overkill
+        out += struct.pack("<i", max(0, int(overkill)))
         out += struct.pack("<B", school & 0xFF)      # school mask
-        out += struct.pack("<I", 0)                  # absorbed
-        out += struct.pack("<I", 0)                  # resisted
+        out += struct.pack("<I", max(0, int(absorbed)) & 0xFFFFFFFF)
+        out += struct.pack("<I", max(0, int(resisted)) & 0xFFFFFFFF)
         out += struct.pack("<B", periodic & 0xFF)
         out += struct.pack("<B", 0)                  # unused
         out += struct.pack("<I", 0)                  # shield block
         out += struct.pack("<I", 2 if critical else 0)  # SPELL_HIT_TYPE_CRIT
         out += struct.pack("<B", 0)                  # no debug info
         await self.send_packet(Opcodes.SMSG_SPELLNONMELEEDAMAGELOG, bytes(out))
+
+    async def _send_spell_energize_log(self, victim_guid: int, caster_guid: int,
+                                       spell_id: int, power_type: int,
+                                       amount: int) -> None:
+        out = bytearray()
+        out += spells.pack_guid(int(victim_guid))
+        out += spells.pack_guid(int(caster_guid))
+        out += struct.pack("<III", int(spell_id) & 0xFFFFFFFF,
+                           int(power_type) & 0xFFFFFFFF,
+                           max(0, int(amount)) & 0xFFFFFFFF)
+        await self.send_packet(Opcodes.SMSG_SPELLENERGIZELOG, bytes(out))
 
     async def _send_spell_heal_log(self, target_guid: int, healer_guid: int,
                                    spell_id: int, heal: int, overheal: int,
@@ -1119,7 +2159,9 @@ class SpellsMixin:
     async def _send_attacker_state_update(self, attacker_guid: int, victim_guid: int,
                                           damage: int, is_miss: bool = False,
                                           is_crit: bool = False,
-                                          school: int = 1) -> None:
+                                          school: int = 1,
+                                          victim_state: int = 0,
+                                          hit_info: int = 0) -> None:
         """Send ``SMSG_ATTACKERSTATEUPDATE`` for one melee hit.
 
         Layout from CMaNGOS 3.3.5 ``Unit::SendAttackStateUpdate``: ``uint32
@@ -1132,11 +2174,11 @@ class SpellsMixin:
         the damage is applied -- the newer core's ``-1`` sentinel is a post-3.3.5
         convention and the 3.3.5 client renders it as a nonsense overkill value.
         """
-        flags = 0
-        victim_state = 0
+        flags = int(hit_info)
         if not is_miss:
             flags |= 0x00000002          # HITINFO_AFFECTS_VICTIM
-            victim_state = 1             # VICTIMSTATE_HIT
+            if victim_state == 0:
+                victim_state = 1         # VICTIMSTATE_HIT
             if is_crit:
                 flags |= 0x00000200      # HITINFO_CRITICALHIT
         else:

@@ -277,6 +277,10 @@ class SocketBase:
                 await self.handle_cast_spell(data)
             elif opcode == Opcodes.CMSG_CANCEL_CAST:
                 await self.handle_cancel_cast(data)
+            elif opcode == Opcodes.CMSG_CANCEL_CHANNELLING:
+                await self.handle_cancel_channel(data)
+            elif opcode == Opcodes.CMSG_CANCEL_AURA:
+                await self.handle_cancel_aura(data)
             elif opcode == Opcodes.CMSG_SET_SELECTION:
                 await self.handle_set_selection(data)
             elif opcode == Opcodes.CMSG_LOOT:
@@ -310,9 +314,15 @@ class SocketBase:
                 "in_combat": False,
                 "target_guid": 0,
                 "auto_attacking": False,
+                "ranged_attacking": False,
+                "ranged_spell_id": 75,
+                "last_ranged_swing": 0.0,
+                "ranged_interval": 2.0,
                 "last_swing": 0.0,
                 "swing_interval": 2.0,
                 "pending_cast": None,
+                "channel": None,
+                "school_lockout": {},
                 "cooldowns": {},
                 # low_guid -> {last_swing, chase_until}
                 "aggro": {},

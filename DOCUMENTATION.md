@@ -68,6 +68,13 @@ A real 3.3.5a client can now log in, pick a character and **enter the world**:
 - Starting attributes come from imported CMaNGOS `player_levelstats` rows
 - Armed items add primary stats, flat health/mana, attack power and resistances, mirroring `Player::_ApplyItemMods`
 - Creature melee is mitigated by armor with `Unit::CalcArmorReducedDamage`
+- Melee swings use a real hit table: miss, dodge, parry, glancing, block, crushing and crit, modified by the attacker's hit/crit/expertise ratings, the player's dodge/parry/block/resilience and level difference; dual wield adds the off-hand swing with its 15% extra miss chance and 50% damage
+- Armor penetration reduces creature armor; creature attack power (and AP auras) feeds creature damage
+- Ranged auto-attack (Auto Shot/Shoot/wand) uses the ranged slot's weapon damage, ranged attack power, ranged haste and the same hit/crit table, with a 41-yard maximum range
+- Spell casts use the 3.3.5 hit/miss and partial-resistance rules: 4% base miss at equal level modified by spell hit rating and level difference, spell crit rating, per-school resistances reduced by spell penetration, absorb shields, school/mechanic/effect immunities and spell reflection
+- Direct damage/heals scale with spell power/healing power using the DBC bonus coefficient; heals crit for 1.5x and damage for 2x
+- Damage taken while casting pushes the cast back (up to two 0.25-0.5 s delays) and shortens an active channel; moving out of range cancels the cast/channel
+- Out-of-combat health regeneration uses the spirit/level formula instead of a flat percentage
 - Death knight runes are real state: blood, blood, unholy, unholy, frost, frost, regenerated at 0.1 per second
 - Area-of-effect spells use the real 3.3.5 `EffectImplicitTarget`/`SpellRadius.dbc` data:
   - self-centred areas (Arcane Explosion, Thunder Clap, Frost Nova, Whirlwind, Blood Boil, Consecration) select every enemy within the effect radius
@@ -76,17 +83,22 @@ A real 3.3.5a client can now log in, pick a character and **enter the world**:
   - chain spells (Chain Lightning, Multi-Shot) jump through up to `EffectChainTargets` nearby enemies with the reference 30% falloff per jump
   - persistent ground effects tick from `SpellDuration.dbc` and take their damage from the periodic aura or its `PERIODIC_TRIGGER_SPELL` (e.g. Blizzard 42208, Rain of Fire 42223)
   - `MaxTargets` is honoured (Whirlwind hits four), the caster's own pet is excluded, and creature AoE (Flamestrike) damages the player and leaves a hostile ground effect
-  - party/raid-only heals apply to the caster because there is no group system yet; slow/root components are not implemented
+  - party/raid-only heals and buffs are applied to the caster and to every other in-world player inside the area (there is no formal group system yet)
+  - ground effects with a slow component (Blizzard, Hurricane, ...) also refresh a short movement-slow aura on each hit target
 
-### Auras (buffs, debuffs and movement effects)
+### Auras (buffs, debuffs, control and mitigation)
 - A real aura registry for players (`combat["auras"]`) and creatures (`combat["creature_auras"]`), keyed by spell so a recast refreshes the duration and stacks up to `Spell.dbc` `StackAmount`
-- Components implemented: periodic damage/heal/leech, periodic energize, stun (12), root (26), silence (27), pacify (25), movement increase/decrease (31/33), primary stats (29), health/energy (34/35), armor/resistances (22), attack power (99/124) and melee haste (138)
-- Durations come from `SpellDuration.dbc` (full 3.3.5 fallback table); expired auras remove their modifiers and resend the affected fields
-- Player movement: `SMSG_FORCE_RUN_SPEED_CHANGE`, `SMSG_FORCE_MOVE_ROOT` / `SMSG_FORCE_MOVE_UNROOT`; stuns additionally set `UNIT_FLAG_STUNNED`
-- Creature movement: slows scale chase/idle speed, roots stop chasing and idle wandering, stuns stop the AI entirely and are mirrored with `UNIT_FLAG_STUNNED`; silence blocks casts and pacify blocks melee swings
-- Player melee damage now includes the `attack_power / 14 * weapon speed` contribution, so Battle Shout and stat auras change real swings
+- Components implemented: periodic damage/heal/leech/energize, stun, root, fear, confuse, charm, silence, pacify, sleep/polymorph/banish/shackle mechanics, movement increase/decrease, primary stats and percentage/total-stat modifiers, health/energy (flat and percent), armor/resistances (flat and percent), attack power/ranged AP (flat and percent), spell/healing power and percent, melee/ranged/spell haste, hit/crit/dodge/parry/block ratings, damage-done and damage-taken modifiers, damage shields/Thorns, spell reflection, school/mechanic/effect/dispel immunities and school absorb shields
+- Durations come from `SpellDuration.dbc` (full 3.3.5 fallback table); expired auras remove their modifiers, send a removal `SMSG_AURA_UPDATE` and resend the affected fields
+- Every applied/refreshed/removed aura is sent with `SMSG_AURA_UPDATE`: 3.3.5 slot, spell id, flags (effect bits, self-cast/negative/duration), caster level, stacks, optional caster guid and max/remaining duration; creature auras are sent too
+- Player movement: `SMSG_FORCE_RUN_SPEED_CHANGE`, `SMSG_FORCE_MOVE_ROOT` / `SMSG_FORCE_MOVE_UNROOT`; stun/fear/confuse/silence/pacify set the corresponding `UNIT_FIELD_FLAGS` bits
+- Creature movement: slows scale chase/idle speed, roots stop chasing and idle wandering, stuns stop the AI entirely, fear/confuse make the creature run away, silence blocks casts and pacify blocks melee swings
+- Crowd control uses a per-target diminishing-returns ladder (100% / 50% / 25% / immune) with the 15-second reset, grouped by stun, root, fear, polymorph, charm, sleep and silence mechanics
+- Polymorph/sleep/disorient break when the victim takes damage; charm and mind-control currently stop the victim's AI/casting but do not transfer client control or a pet bar
+- Absorb shields (Power Word: Shield, Ice Barrier, ...) drain before health and are removed when depleted; spell reflection sends the 3.3.5 reflect miss; dispel/steal effects remove matching auras and send `SMSG_SPELLDISPELLOG` / `SMSG_SPELLSTEALLOG`
+- Player melee damage includes the `attack_power / 14 * weapon speed` contribution, so Battle Shout and stat auras change real swings
 - Periodic auras refresh instead of stacking duplicate DoTs and use their real duration (Fireball's 4 s burn instead of a flat 15 s)
-- `SMSG_AURA_UPDATE` (buff/debuff icons) is not sent yet; dispels, immunities and charm/fear are also not implemented, and auras are session-scoped (they do not survive logout)
+- Auras are session-scoped, matching the reference server's behaviour for temporary buffs (they do not survive logout); passive/area aura persistence is not modelled yet
 
 ### Summoning (pets and guardians)
 - `SPELL_EFFECT_SUMMON_PET` (56, e.g. Summon Imp/Voidwalker/Succubus/Felhunter) and `SPELL_EFFECT_SUMMON` (28, guardians such as Mirror Image) create a session-local creature next to the caster
@@ -106,7 +118,12 @@ A real 3.3.5a client can now log in, pick a character and **enter the world**:
 - Target ids below 100 use hardcoded rules; ids 100+ resolve through `creature_spell_targeting`
 - Creatures with `SpellList = 0` fall back to legacy `creature_template_spells` plus `creature_cooldowns`
 - `SPELL_ATTR_EX_NO_AUTOCAST_AI` (`0x00020000`) spells are skipped
+- Creature casts pay mana, observe cooldowns/categories and regenerate mana in combat; an interrupt effect cancels the cast and locks the spell school for four seconds
+- Creature spells use the same immunity/reflect/absorb/resistance path as player spells, and apply the same auras/DoTs to the player
+- A threat table records damage threat per player guid; nearby same-faction creatures are called for help when a fight starts
+- Low-health humanoid creatures flee for six seconds instead of fighting to the death
 - `SPELL_EFFECT_ACTIVATE_RUNE` (146) not implemented
+- There is no terrain/LOS data in the repository, so chase and flee moves are still straight-line splines (no pathfinding around obstacles); creature summons/totems and ranged creature auto-attacks are not modelled yet
 
 ### Idle creature movement
 - Wander: random destination within `spawndist` radius, pause 3-10 s, walk speed, max 3 consecutive moves
@@ -304,3 +321,7 @@ Useful details are documented in the code:
 - Server headers are `uint16 size` (big-endian, payload + 2-byte opcode) + `uint16 opcode` (little-endian); packets over `0x7FFF` use a 3-byte size.
 - Only world packet **headers** are RC4-encrypted; payloads stay plaintext.
 - The 40-byte SRP6 session key is `SHA1Interleave(S)` and must be stored exactly as 40 bytes.
+- `SMSG_AURA_UPDATE` is `packed target guid`, then `u8 slot`, and either `u32 0` for removal or `u32 spell, u8 flags, u8 caster level, u8 stacks`; unless `AFLAG_CASTER` (0x08) is set, a packed caster guid follows; with `AFLAG_DURATION` (0x20), `u32 max duration` and `u32 remaining` follow.
+- `SMSG_SPELLLOGMISS` is `u32 spell, raw u64 caster, u8 unknown, u32 count`, then each miss as `raw u64 target, u8 miss type` (plus a `u8 reflect result` for reflected spells).
+- `MSG_CHANNEL_START` is `packed caster, u32 spell, u32 duration`; `MSG_CHANNEL_UPDATE` is `packed caster, u32 remaining`.
+- `SMSG_SPELLENERGIZELOG` is `packed victim, packed caster, u32 spell, u32 power type, u32 amount`.

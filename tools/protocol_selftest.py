@@ -723,7 +723,12 @@ def world_data_checks(temp_dir: str, world_db: str) -> None:
     assert_eq(totals, {
         "str": 5, "agi": 4, "sta": 3, "inte": 2, "spi": 1,
         "health": 50, "mana": 30,
-        "attack_power": 10, "ranged_attack_power": 0,
+        "attack_power": 10, "ranged_attack_power": 0, "spell_power": 0,
+        "hit_rating": 0, "crit_rating": 0, "haste_rating": 0,
+        "defense_rating": 0, "dodge_rating": 0, "parry_rating": 0,
+        "block_rating": 0, "block_value": 0,
+        "resilience": 0, "armor_penetration": 0, "expertise": 0,
+        "spell_penetration": 0, "healing_power": 0, "shield": 0,
         "armor": 100, "holy": 0, "fire": 7, "nature": 0,
         "frost": 0, "shadow": 0, "arcane": 0,
     }, "equipped item totals")

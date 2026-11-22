@@ -17,6 +17,7 @@ from src.world import update_fields as F
 from .constants import (
     CREATURE_SPELL_GCD,
     CREATURE_SPELL_LIST_INTERVAL,
+    SPELL_FAILED_INTERRUPTED,
     SPELL_LIST_FLAG_CATEGORY_COOLDOWN,
     SPELL_LIST_FLAG_RANGED_ACTION,
     SPELL_LIST_FLAG_SUPPORT_ACTION,
@@ -298,6 +299,11 @@ class CreatureAIMixin:
                     and ranged_roll > ranged_chance):
                 continue
             template = entry["template"]
+            lockout = ai.get("school_lockout") or {}
+            if lockout and float(lockout.get("until", 0)) > now \
+                    and int(lockout.get("school", 0)) & (
+                        int(template.school) or 1):
+                continue
             cost = self._creature_spell_cost(template, ai["max_mana"])
             if cost > ai["mana"]:
                 continue
@@ -461,6 +467,36 @@ class CreatureAIMixin:
         await self._apply_creature_spell_effects(
             low_guid, spawn, ai, template, target_guid)
 
+    async def _creature_spell_lands(self, template, target_guid: int,
+                                    effect: dict | None = None,
+                                    caster_guid: int = 0) -> bool:
+        """Check immunities/reflect for a creature spell.
+
+        Creatures always land their spells against an equal-level player in
+        this simulator; what matters for 3.3.5 feel is the immunity/reflect
+        layer, which is driven by auras.  Sending the miss packet is enough for
+        the client to show "Immune" or "Reflected".
+        """
+        if not target_guid:
+            return True
+        kind = self._spell_target_kind(target_guid)
+        if kind == "peer":
+            return True
+        if hasattr(self, "_spell_immune") and self._spell_immune(
+                kind, target_guid, template, effect):
+            await self._send_spell_miss_log(
+                target_guid, caster_guid or self.player_guid, template.id,
+                spells.SPELL_MISS_IMMUNE)
+            return False
+        if hasattr(self, "_spell_reflects") and self._spell_reflects(
+                target_guid):
+            await self._send_spell_miss_log(
+                target_guid, caster_guid or self.player_guid, template.id,
+                spells.SPELL_MISS_REFLECT, 0)
+            return False
+        return True
+
+
     async def _apply_creature_spell_effects(self, low_guid: int, spawn,
                                             ai: dict, template,
                                             target_guid: int) -> None:
@@ -525,14 +561,17 @@ class CreatureAIMixin:
                     amount = template.effect_value(index, level)
                     if amount <= 0:
                         continue
+                    lands = getattr(self, "_creature_spell_lands", None)
+                    if lands is not None and not await lands(
+                            template, int(self.player_guid), effect,
+                            caster_guid):
+                        continue
                     critical = random.uniform(0.0, 100.0) < crit_chance
                     if critical:
                         amount *= 2
-                    await self._damage_player(
-                        amount, f"{spawn['name']}'s {template.name}")
-                    await self._send_spell_damage_log(
-                        int(self.player_guid), caster_guid, template.id, amount,
-                        template.school or 1, critical=1 if critical else 0)
+                    await self._deal_spell_damage(
+                        int(self.player_guid), amount, template.school or 1,
+                        template, caster_guid, critical=critical)
                     if etype == spells.SPELL_EFFECT_HEALTH_LEECH:
                         await self._heal_creature(low_guid, spawn, amount,
                                                   template, caster_guid)
@@ -548,6 +587,11 @@ class CreatureAIMixin:
                         amount, f"{spawn['name']}'s {template.name}")
                 elif etype == spells.SPELL_EFFECT_APPLY_AURA:
                     aura = int(effect["apply_aura"])
+                    if self._effect_is_harmful(template, effect):
+                        if not await self._creature_spell_lands(
+                                template, int(self.player_guid), effect,
+                                caster_guid):
+                            continue
                     if aura == spells.SPELL_AURA_PERIODIC_DAMAGE:
                         amount = template.effect_value(index, level)
                         if amount <= 0:
@@ -570,6 +614,7 @@ class CreatureAIMixin:
                             "next_tick": now + float(amplitude),
                             "expires": now + duration_ms / 1000.0,
                             "is_heal": False,
+                            "leech": aura == spells.SPELL_AURA_PERIODIC_LEECH,
                         })
                     if hasattr(self, "_apply_aura_from_effect"):
                         await self._apply_aura_from_effect(
@@ -583,19 +628,16 @@ class CreatureAIMixin:
                 amount = template.effect_value(index, level)
                 if amount <= 0:
                     continue
+                lands = getattr(self, "_creature_spell_lands", None)
+                if lands is not None and not await lands(
+                        template, target_guid, effect, caster_guid):
+                    continue
                 critical = random.uniform(0.0, 100.0) < crit_chance
                 if critical:
                     amount *= 2
-                if self._is_player_guid(target_guid):
-                    await self._damage_player(
-                        amount, f"{spawn['name']}'s {template.name}")
-                else:
-                    await self._deal_damage_to_creature(
-                        target_guid, amount, caster_guid)
-                await self._send_spell_damage_log(
-                    target_guid, caster_guid, template.id, amount,
-                    template.school or 1, critical=1 if critical else 0,
-                )
+                await self._deal_spell_damage(
+                    target_guid, amount, template.school or 1, template,
+                    caster_guid, critical=critical)
                 if etype == spells.SPELL_EFFECT_HEALTH_LEECH:
                     await self._heal_creature(low_guid, spawn, amount,
                                               template, caster_guid)
@@ -625,12 +667,26 @@ class CreatureAIMixin:
                 if triggered:
                     await self._cast_creature_triggered(
                         low_guid, spawn, ai, triggered, target_guid)
+            elif etype == spells.SPELL_EFFECT_INTERRUPT_CAST:
+                if target_guid and self._is_player_guid(target_guid):
+                    combat = self._get_combat_state()
+                    mask = int(template.school) or 1
+                    combat.setdefault("school_lockout", {})[
+                        mask] = time.monotonic() + 4.0
+                    if hasattr(self, "_interrupt_player_cast"):
+                        await self._interrupt_player_cast(
+                            SPELL_FAILED_INTERRUPTED)
             elif etype == spells.SPELL_EFFECT_INSTAKILL:
                 if target_guid and self._is_player_guid(target_guid):
                     await self._damage_player(
                         1 << 24, f"{spawn['name']}'s {template.name}")
             elif etype == spells.SPELL_EFFECT_APPLY_AURA:
                 aura = int(effect["apply_aura"])
+                if target_guid and self._effect_is_harmful(template, effect):
+                    lands = getattr(self, "_creature_spell_lands", None)
+                    if lands is not None and not await lands(
+                            template, target_guid, effect, caster_guid):
+                        continue
                 if (aura == spells.SPELL_AURA_PERIODIC_DAMAGE
                         and target_guid):
                     amount = template.effect_value(index, level)
@@ -653,6 +709,7 @@ class CreatureAIMixin:
                         "next_tick": now + float(amplitude),
                         "expires": now + duration_ms / 1000.0,
                         "is_heal": False,
+                        "leech": aura == spells.SPELL_AURA_PERIODIC_LEECH,
                     })
                 if hasattr(self, "_apply_aura_from_effect"):
                     target_a = int(effect.get("target_a") or 0)
