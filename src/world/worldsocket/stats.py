@@ -4,6 +4,7 @@ from __future__ import annotations
 import math
 import sqlite3
 import struct
+import time
 
 from src.protocol.opcodes import Opcodes
 from src.world import character_db

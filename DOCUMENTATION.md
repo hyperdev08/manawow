@@ -71,6 +71,11 @@ A real 3.3.5a client can now log in, pick a character and **enter the world**:
 - Melee swings use a real hit table: miss, dodge, parry, glancing, block, crushing and crit, modified by the attacker's hit/crit/expertise ratings, the player's dodge/parry/block/resilience and level difference; dual wield adds the off-hand swing with its 15% extra miss chance and 50% damage
 - Armor penetration reduces creature armor; creature attack power (and AP auras) feeds creature damage
 - Ranged auto-attack (Auto Shot/Shoot/wand) uses the ranged slot's weapon damage, ranged attack power, ranged haste and the same hit/crit table, with a 41-yard maximum range
+- Melee, ranged and hostile spells check facing: weapon abilities require the victim in front, `FacingCasterFlags=1` spells require it too, and melee, ranged attacks and casts also check line of sight (`SMSG_ATTACKSWING_BADFACING` / `CANT_ATTACK` / `SPELL_FAILED_LINE_OF_SIGHT`)
+- Line of sight reads the extracted 3.3.5a `.map` terrain heightmap/holes and `.vmap` static model collision; the optional `sight_blockers` table remains as a hand-authored AABB supplement, and an empty client-data directory falls back to the old "clear world" behaviour
+- Item on-hit procs use the real `item_template` chance-on-hit trigger and `spellppmRate_*`: PPM is normalized against the weapon's base speed, with per-item cooldowns/charges
+- Temporary weapon enchants and poisons are read from bundled `SpellItemEnchantment.dbc` data: poison/stone application stores the enchant per weapon slot, persists it in `character_items.enchantment_2`, and procs on auto-attacks and weapon abilities; `CMSG_CANCEL_TEMP_ENCHANTMENT` clears it
+- Poison rates match 3.3.5: Instant Poison 8.57 PPM, Wound Poison 21.4 PPM, Deadly Poison 30%, Crippling/Mind-numbing 50%, with half chance from the off-hand
 - Spell casts use the 3.3.5 hit/miss and partial-resistance rules: 4% base miss at equal level modified by spell hit rating and level difference, spell crit rating, per-school resistances reduced by spell penetration, absorb shields, school/mechanic/effect immunities and spell reflection
 - Direct damage/heals scale with spell power/healing power using the DBC bonus coefficient; heals crit for 1.5x and damage for 2x
 - Damage taken while casting pushes the cast back (up to two 0.25-0.5 s delays) and shortens an active channel; moving out of range cancels the cast/channel
@@ -123,12 +128,27 @@ A real 3.3.5a client can now log in, pick a character and **enter the world**:
 - A threat table records damage threat per player guid; nearby same-faction creatures are called for help when a fight starts
 - Low-health humanoid creatures flee for six seconds instead of fighting to the death
 - `SPELL_EFFECT_ACTIVATE_RUNE` (146) not implemented
-- There is no terrain/LOS data in the repository, so chase and flee moves are still straight-line splines (no pathfinding around obstacles); creature summons/totems and ranged creature auto-attacks are not modelled yet
+- Creature casts and melee respect the same facing/LOS rules; chase, flee, wander and waypoint movement use the extracted navigation mesh when a straight line is obstructed
+- Creature summons/totems and ranged creature auto-attacks are not modelled yet
 
 ### Idle creature movement
-- Wander: random destination within `spawndist` radius, pause 3-10 s, walk speed, max 3 consecutive moves
+- Wander: random navmesh destination within `spawndist` radius, pause 3-10 s, walk speed, max 3 consecutive moves
 - Waypoints: follow `creature_movement`/`creature_movement_template` node by node
+- Obstacles: direct movement is used while the straight segment is clear; otherwise the waypoints are routed through the navigation mesh
 - Runtime selection: spawn `movement_type` >=0 overrides template; 0=idle, 1=wander, 2=waypoint; -1 uses path if present, NPC units idle, wild creatures wander
+
+### Terrain, line of sight and wayfinding
+- Client collision data lives under `worldserver.client_data` (default `./data/client`) and is **not** committed because the full 3.3.5a extract is several gigabytes. Populate it with:
+  - `python tools/fetch_client_data.py --preset starter` for Northshire/Elwynn (map 0, tile 48,32 +/- 2)
+  - `--map N --tile X,Y`, `--map N --around X,Y --radius N`, or `--map N --all-map`
+  - `--source` selects another mirror with the same layout; the default is the public `Torrer/TrinityCore-3.3.5-data` 3.3.5a extract
+- The server never downloads data at runtime. If the directory is empty or a tile is missing, LOS returns clear and pathfinding falls back to the previous straight-line movement.
+- Terrain (`src/world/terrain.py`) reads `maps/MMMXXYY.map`: float/int16/int8 heightmaps, current and legacy (CMaNGOS 512-byte) holes, and exposes ground height plus sampled segment occlusion. This catches hills, cliffs and cave holes even when both ray endpoints are in the air.
+- Static world models (`src/world/vmap.py`) read `vmaps/MMM_YY_XX.vmtile` placements, global WMOs from non-tiled `MMM.vmtree` maps, and `vmaps/<model>.vmo` collision groups. WMOs test their real collision triangles through a lazily built BVH, which preserves doorways and interior walls; if a `.vmo` is missing they fall back to the transformed per-group AABB. M2 placements use their transformed model bound. The extractor's reflected placement space (`17066.666 - x/y`) is converted back to world coordinates.
+- Wayfinding (`src/world/navmesh.py`) reads the Detour `mmaps/MMMXXYY.mmtile` polygon mesh, converts Detour's Y-up vertices back to WoW coordinates, links internal `neis` and cross-tile shared portal edges, and runs A* over polygon centres. The resulting corridor is replaced by shared-edge portal midpoints, so the client receives a smooth multi-point `SMSG_MONSTER_MOVE` spline instead of walking through polygon centres.
+- Chase and flee only pay for an A* query when the straight line is obstructed. Summons, waypoint movement, wander and the evade walk-home path use the same helper; a multi-point spline carries all waypoints in one packet.
+- Tile caches are bounded (32 navmesh tiles, 64 VMap tiles, 48 WMO models) so exploring the world does not grow memory without limit.
+- Limitations: only static VMap geometry blocks sight (dynamic doors/gameobjects are not included); Detour off-mesh links (jumps, transports) are skipped; there is no creature jump/climb animation selection; terrain LOS is sampled at 0.5 yards; and player movement remains client-authoritative (no server-side collision correction).
 
 ### Loot
 - `creature_loot_template` (218,066 rows) and `reference_loot_template` (44,244 rows / 896 pools) imported from CMaNGOS
@@ -176,6 +196,21 @@ python tools/init_db.py
 ```
 
 The worldserver also creates and migrates the character, creature and spell tables when it starts, so a checkout made before a schema addition still works without re-running `init_db.py`.
+
+### Downloading terrain, VMaps and MMaps
+
+Real line of sight and wayfinding need the client extracts, which are too large to keep in the repository.  They are cached under `data/client` (gitignored):
+
+```bash
+# Northshire/Elwynn starter area (map 0, tile 48,32 +/- 2 tiles)
+python tools/fetch_client_data.py --preset starter
+
+# Custom area or an entire map (the whole map is several hundred MB)
+python tools/fetch_client_data.py --map 0 --around -8955,-132 --radius 4
+python tools/fetch_client_data.py --map 0 --all-map
+```
+
+The default mirror is a public 3.3.5a extract; `--source` accepts another mirror with the same `maps/`, `vmaps/`, `mmaps/` layout.  Stop and restart the worldserver after populating a new area so tile caches start clean.  Missing tiles are safe: the server logs nothing and falls back to clear LOS/straight-line movement for that tile.
 
 ### Importing the CMaNGOS 3.3.5a world database
 

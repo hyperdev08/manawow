@@ -120,30 +120,35 @@ CREATE TABLE IF NOT EXISTS item_templates(
   spell_cooldown1 INTEGER NOT NULL DEFAULT 0,
   spell_category1 INTEGER NOT NULL DEFAULT 0,
   spell_category_cooldown1 INTEGER NOT NULL DEFAULT 0,
+  spell_ppm_rate1 REAL NOT NULL DEFAULT 0.0,
   spell_id2 INTEGER NOT NULL DEFAULT 0,
   spell_trigger2 INTEGER NOT NULL DEFAULT 0,
   spell_charges2 INTEGER NOT NULL DEFAULT 0,
   spell_cooldown2 INTEGER NOT NULL DEFAULT 0,
   spell_category2 INTEGER NOT NULL DEFAULT 0,
   spell_category_cooldown2 INTEGER NOT NULL DEFAULT 0,
+  spell_ppm_rate2 REAL NOT NULL DEFAULT 0.0,
   spell_id3 INTEGER NOT NULL DEFAULT 0,
   spell_trigger3 INTEGER NOT NULL DEFAULT 0,
   spell_charges3 INTEGER NOT NULL DEFAULT 0,
   spell_cooldown3 INTEGER NOT NULL DEFAULT 0,
   spell_category3 INTEGER NOT NULL DEFAULT 0,
   spell_category_cooldown3 INTEGER NOT NULL DEFAULT 0,
+  spell_ppm_rate3 REAL NOT NULL DEFAULT 0.0,
   spell_id4 INTEGER NOT NULL DEFAULT 0,
   spell_trigger4 INTEGER NOT NULL DEFAULT 0,
   spell_charges4 INTEGER NOT NULL DEFAULT 0,
   spell_cooldown4 INTEGER NOT NULL DEFAULT 0,
   spell_category4 INTEGER NOT NULL DEFAULT 0,
   spell_category_cooldown4 INTEGER NOT NULL DEFAULT 0,
+  spell_ppm_rate4 REAL NOT NULL DEFAULT 0.0,
   spell_id5 INTEGER NOT NULL DEFAULT 0,
   spell_trigger5 INTEGER NOT NULL DEFAULT 0,
   spell_charges5 INTEGER NOT NULL DEFAULT 0,
   spell_cooldown5 INTEGER NOT NULL DEFAULT 0,
   spell_category5 INTEGER NOT NULL DEFAULT 0,
   spell_category_cooldown5 INTEGER NOT NULL DEFAULT 0,
+  spell_ppm_rate5 REAL NOT NULL DEFAULT 0.0,
   bonding INTEGER NOT NULL DEFAULT 0,
   description TEXT NOT NULL DEFAULT '',
   page_text INTEGER NOT NULL DEFAULT 0,
@@ -397,6 +402,17 @@ def init_character_db(path: str) -> None:
             con.execute("ALTER TABLE characters ADD COLUMN xp INTEGER NOT NULL DEFAULT 0")
         if "money" not in columns:
             con.execute("ALTER TABLE characters ADD COLUMN money INTEGER NOT NULL DEFAULT 0")
+        # Item proc rates are imported from item_template.spellppmRate_*.  Older
+        # databases only have the spell ids/triggers.
+        item_columns = {
+            row[1] for row in con.execute("PRAGMA table_info(item_templates)")
+        }
+        for index in range(1, 6):
+            column = f"spell_ppm_rate{index}"
+            if column not in item_columns:
+                con.execute(
+                    f"ALTER TABLE item_templates ADD COLUMN {column}"
+                    " REAL NOT NULL DEFAULT 0.0")
         _migrate_start_positions(con)
         _seed_starter_items(con)
         _backfill_starter_spells(con)

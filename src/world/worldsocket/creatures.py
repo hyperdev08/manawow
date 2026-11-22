@@ -411,6 +411,12 @@ class CreaturesMixin:
             # player circles around it.
             await self._face_creature_at_player(int(low_guid), state, spawn,
                                                 here, player, now)
+            if hasattr(self, "_has_line_of_sight") and not self._has_line_of_sight(
+                    self._unit_eye_position(
+                        self._creature_object_guid(
+                            int(low_guid), int(spawn["entry"]))),
+                    self._unit_eye_position(self.player_guid)):
+                return
             # In melee range: swing on the creature's own timer.
             if not pacified and now - state["last_swing"] >= melee_interval:
                 state["last_swing"] = now
@@ -502,20 +508,43 @@ class CreaturesMixin:
         travel = min(distance - 1.0, speed * duration_ms / 1000.0)
         if travel <= 0.1:
             return
-        scale = travel / distance
-        dest = (here[0] + (player[0] - here[0]) * scale,
-                here[1] + (player[1] - here[1]) * scale,
-                here[2] + (player[2] - here[2]) * scale)
+
+        # Open-field chases stay straight; a wall, hill or WMO sends the
+        # creature through the extracted navigation mesh instead so it walks
+        # around the obstacle rather than into it.
+        path = None
+        if hasattr(self, "_find_world_path"):
+            eye_a = (here[0], here[1], here[2] + 0.9)
+            eye_b = (player[0], player[1], player[2] + 0.9)
+            if not self._has_line_of_sight(eye_a, eye_b):
+                path = self._find_world_path(here, player)
+        points = None
+        if path and len(path) > 1:
+            points = self._path_prefix(here, path, travel,
+                                       stop_distance=reach * 0.5)
+            if not points:
+                return
+            dest = points[-1]
+            moved = sum(self._distance(a, b) for a, b in
+                        zip([here] + points[:-1], points))
+            if moved <= 0.1:
+                return
+            duration_ms = max(250, min(1500, int(moved / speed * 1000.0)))
+        else:
+            scale = travel / distance
+            dest = (here[0] + (player[0] - here[0]) * scale,
+                    here[1] + (player[1] - here[1]) * scale,
+                    here[2] + (player[2] - here[2]) * scale)
         state["pos"] = dest
         state["chase_until"] = now + duration_ms / 1000.0
-        facing = math.atan2(player[1] - here[1], player[0] - here[0])
+        facing = math.atan2(dest[1] - here[1], dest[0] - here[0])
         state["facing"] = facing
         await self.send_packet(
             Opcodes.SMSG_MONSTER_MOVE,
-            object_update.build_monster_move(
+            object_update.build_monster_move_path(
                 self._creature_object_guid(int(low_guid), int(spawn["entry"])),
                 here[0], here[1], here[2], facing,
-                dest[0], dest[1], dest[2],
+                points if points else [dest],
                 duration_ms=duration_ms,
                 move_id=self._next_move_id(),
             ),
@@ -534,6 +563,24 @@ class CreaturesMixin:
         distance = 8.0
         dest = (here[0] + dx / length * distance,
                 here[1] + dy / length * distance, here[2])
+        # Snap the run-away point onto walkable ground; otherwise a flee can
+        # pick the far side of a wall and the client receives an invalid spline.
+        snapped = (self._navmesh_point((dest[0], dest[1], here[2]),
+                                       max_distance=6.0)
+                   if hasattr(self, "_navmesh_point") else None)
+        if snapped is not None:
+            dest = snapped
+        path = None
+        if hasattr(self, "_find_world_path"):
+            if not self._has_line_of_sight(
+                    (here[0], here[1], here[2] + 0.9),
+                    (dest[0], dest[1], dest[2] + 0.9)):
+                path = self._find_world_path(here, dest)
+        points = None
+        if path and len(path) > 1:
+            points = self._path_prefix(here, path, 12.0)
+            if points:
+                dest = points[-1]
         duration_ms = 1000
         state["pos"] = dest
         state["chase_until"] = now + duration_ms / 1000.0
@@ -541,10 +588,10 @@ class CreaturesMixin:
         state["facing"] = facing
         await self.send_packet(
             Opcodes.SMSG_MONSTER_MOVE,
-            object_update.build_monster_move(
+            object_update.build_monster_move_path(
                 self._creature_object_guid(int(low_guid), int(spawn["entry"])),
                 here[0], here[1], here[2], facing,
-                dest[0], dest[1], dest[2],
+                points if points else [dest],
                 duration_ms=duration_ms,
                 move_id=self._next_move_id(),
             ),
@@ -589,16 +636,30 @@ class CreaturesMixin:
         distance = self._distance(home, here)
         settle_until = time.monotonic()
         if distance > 1.0:
+            path = None
+            if hasattr(self, "_find_world_path"):
+                if not self._has_line_of_sight(
+                        (here[0], here[1], here[2] + 0.9),
+                        (home[0], home[1], home[2] + 0.9)):
+                    path = self._find_world_path(here, home)
+            points = None
+            if path and len(path) > 1:
+                points = self._path_prefix(here, path, 7.0 * 6.0)
+                if points:
+                    home = points[-1]
+                    distance = sum(self._distance(a, b) for a, b in
+                                   zip([here] + points[:-1], points))
             duration_ms = max(250, int(distance / 7.0 * 1000))
-            settle_until = time.monotonic() + min(duration_ms, 6000) / 1000.0
+            duration_ms = min(duration_ms, 6000)
+            settle_until = time.monotonic() + duration_ms / 1000.0
             await self.send_packet(
                 Opcodes.SMSG_MONSTER_MOVE,
-                object_update.build_monster_move(
+                object_update.build_monster_move_path(
                     self._creature_object_guid(int(low_guid), int(spawn["entry"])),
                     here[0], here[1], here[2],
                     math.atan2(home[1] - here[1], home[0] - here[0]),
-                    home[0], home[1], home[2],
-                    duration_ms=min(duration_ms, 6000),
+                    points if points else [home],
+                    duration_ms=duration_ms,
                     move_id=self._next_move_id(),
                 ),
             )

@@ -461,6 +461,9 @@ def _item_template_column(dump_col: str) -> str:
             "categorycooldown": "spell_category_cooldown",
         }
         return words[match.group(1)] + match.group(2)
+    match = re.fullmatch(r"spellppmRate_(\d)", dump_col)
+    if match:
+        return f"spell_ppm_rate{match.group(1)}"
     return _snake_case(dump_col)
 
 

@@ -2,11 +2,15 @@
 from __future__ import annotations
 
 import asyncio
+import math
 import os
+import sqlite3
 import struct
 import sys
+import tempfile
 import time
 import types
+from pathlib import Path
 from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -14,6 +18,7 @@ sys.path.insert(0, ROOT)
 
 from src.protocol.opcodes import Opcodes
 from src.world import creature, spells
+from src.world import los
 from src.world.realmsocket import WorldSocket
 from src.world.worldsocket.auras import AurasMixin
 from src.world.worldsocket.combat import CombatMixin
@@ -137,6 +142,18 @@ class FakeUnit(AurasMixin, SpellsMixin, StatsMixin, CombatMixin,
 
     def _server_tick_ms(self):
         return int(time.monotonic() * 1000) & 0xFFFFFFFF
+
+    def _in_front(self, observer, facing, target, arc=math.pi):
+        return WorldSocket._in_front(self, observer, facing, target, arc)
+
+    def _target_in_front(self, target_guid, arc=math.pi):
+        return WorldSocket._target_in_front(self, target_guid, arc)
+
+    def _has_line_of_sight(self, start, end, map_id=None):
+        return WorldSocket._has_line_of_sight(self, start, end, map_id)
+
+    def _unit_eye_position(self, guid):
+        return WorldSocket._unit_eye_position(self, guid)
 
     # ---- health / damage ---------------------------------------------------
     def _creature_health(self, guid):
@@ -444,7 +461,184 @@ async def test_self_targeted_cast_does_not_confuse_peer_detection():
 
 
 @_async_test
-async def test_direct_energize_restores_power_and_logs():
+async def test_line_of_sight_geometry_and_optional_db_blockers():
+    box = los.SightBlocker(0, 5.0, 7.0, -1.0, 1.0, 0.0, 3.0)
+    assert not los.has_line_of_sight(
+        (0.0, 0.0, 1.0), (10.0, 0.0, 1.0), [box])
+    assert los.has_line_of_sight(
+        (0.0, 5.0, 1.0), (10.0, 5.0, 1.0), [box])
+    # A unit standing inside a doorway is not blinded by its own box.
+    assert los.has_line_of_sight(
+        (6.0, 0.0, 1.0), (10.0, 0.0, 1.0), [box])
+
+    with tempfile.TemporaryDirectory() as td:
+        path = os.path.join(td, "los.db")
+        con = sqlite3.connect(path)
+        con.execute(
+            "CREATE TABLE sight_blockers(map INTEGER, min_x REAL, max_x REAL,"
+            " min_y REAL, max_y REAL, min_z REAL, max_z REAL)")
+        con.execute("INSERT INTO sight_blockers VALUES(0, 5, 7, -1, 1, 0, 3)")
+        con.execute("INSERT INTO sight_blockers VALUES(1, 5, 7, -1, 1, 0, 3)")
+        con.commit()
+        con.close()
+        los.clear_cache()
+        assert not los.has_los(
+            path, 0, (0.0, 0.0, 1.0), (10.0, 0.0, 1.0))
+        assert los.has_los(
+            path, 2, (0.0, 0.0, 1.0), (10.0, 0.0, 1.0))
+        session = FakeUnit()
+        session.config.database.world_path = path
+        session.character["map"] = 0
+        assert not session._has_line_of_sight(
+            (0.0, 0.0, 1.0), (10.0, 0.0, 1.0))
+        session.character["map"] = 2
+        assert session._has_line_of_sight(
+            (0.0, 0.0, 1.0), (10.0, 0.0, 1.0))
+
+
+@_async_test
+async def test_melee_and_spell_facing_checks():
+    session = FakeUnit()
+    target = session.add_creature(20, -5.0)
+    session.character["o"] = 0.0
+    await session.handle_attack_swing(struct.pack("<Q", target))
+    assert any(op == int(Opcodes.SMSG_ATTACKSWING_BADFACING)
+               for op, _ in session.sent)
+    session.sent.clear()
+    front = session.add_creature(21, 5.0)
+    await session.handle_attack_swing(struct.pack("<Q", front))
+    assert any(op == int(Opcodes.SMSG_ATTACKSTART)
+               for op, _ in session.sent)
+
+    # A spell with FacingCasterFlags=1 refuses a target behind the caster.
+    session.known_spell_ids = {133}
+    fireball = spells.get_spell_template(WORLD_DB, 133)
+    fireball.facing_caster_flags = 1
+    original_get = spells.get_spell_template
+    with mock.patch("src.world.spells.get_spell_template",
+                    side_effect=lambda path, sid: fireball
+                    if int(sid) == 133 else original_get(path, sid)):
+        payload = (struct.pack("<BiBI", 1, 133, 0, 0x02)
+                   + spells.pack_guid(target))
+        await session.handle_cast_spell(payload)
+    failed = [p for op, p in session.sent
+              if op == int(Opcodes.SMSG_CAST_FAILED)]
+    assert failed and failed[-1][5] == 61      # SPELL_FAILED_NOT_INFRONT
+
+
+@_async_test
+async def test_item_ppm_proc_rolls_on_hit():
+    with tempfile.TemporaryDirectory() as td:
+        path = os.path.join(td, "proc.db")
+        con = sqlite3.connect(path)
+        con.execute(
+            "CREATE TABLE item_templates(entry INTEGER PRIMARY KEY,"
+            " spell_id1 INTEGER DEFAULT 0, spell_trigger1 INTEGER DEFAULT 0,"
+            " spell_ppm_rate1 REAL DEFAULT 0, spell_cooldown1 INTEGER DEFAULT 0,"
+            " spell_charges1 INTEGER DEFAULT 0,"
+            " spell_id2 INTEGER DEFAULT 0, spell_trigger2 INTEGER DEFAULT 0,"
+            " spell_ppm_rate2 REAL DEFAULT 0, spell_cooldown2 INTEGER DEFAULT 0,"
+            " spell_charges2 INTEGER DEFAULT 0,"
+            " spell_id3 INTEGER DEFAULT 0, spell_trigger3 INTEGER DEFAULT 0,"
+            " spell_ppm_rate3 REAL DEFAULT 0, spell_cooldown3 INTEGER DEFAULT 0,"
+            " spell_charges3 INTEGER DEFAULT 0,"
+            " spell_id4 INTEGER DEFAULT 0, spell_trigger4 INTEGER DEFAULT 0,"
+            " spell_ppm_rate4 REAL DEFAULT 0, spell_cooldown4 INTEGER DEFAULT 0,"
+            " spell_charges4 INTEGER DEFAULT 0,"
+            " spell_id5 INTEGER DEFAULT 0, spell_trigger5 INTEGER DEFAULT 0,"
+            " spell_ppm_rate5 REAL DEFAULT 0, spell_cooldown5 INTEGER DEFAULT 0,"
+            " spell_charges5 INTEGER DEFAULT 0)")
+        con.execute(
+            "CREATE TABLE character_items(id INTEGER PRIMARY KEY,"
+            " character_guid INTEGER, item_entry INTEGER, slot INTEGER)")
+        con.execute(
+            "INSERT INTO item_templates(entry, spell_id1, spell_trigger1,"
+            " spell_ppm_rate1) VALUES(647, 17152, 2, 1.0)")
+        con.execute(
+            "INSERT INTO character_items VALUES(1, 66, 647, 15)")
+        con.commit()
+        con.close()
+
+        session = FakeUnit()
+        session.config.database.world_path = path
+        target = session.add_creature(22, 5.0)
+        called = []
+
+        async def fake_cast(spell_id, target_guid, source_key=0):
+            called.append((spell_id, target_guid, source_key))
+
+        session._cast_weapon_proc = fake_cast
+        with mock.patch("random.random", return_value=0.0):
+            await session._roll_weapon_procs(15, 2.0, target)
+        assert called and called[0][0] == 17152
+
+
+@_async_test
+async def test_poison_enchant_and_proc_storage():
+    with tempfile.TemporaryDirectory() as td:
+        path = os.path.join(td, "poison.db")
+        con = sqlite3.connect(path)
+        con.execute(
+            "CREATE TABLE character_items(id INTEGER PRIMARY KEY,"
+            " character_guid INTEGER, item_entry INTEGER, slot INTEGER,"
+            " enchantment_2 INTEGER DEFAULT 0)")
+        con.execute(
+            "CREATE TABLE spell_item_enchantment(id INTEGER PRIMARY KEY,"
+            " charges INTEGER DEFAULT 0, effect1 INTEGER DEFAULT 0,"
+            " effect2 INTEGER DEFAULT 0, effect3 INTEGER DEFAULT 0,"
+            " effect_points_min1 INTEGER DEFAULT 0,"
+            " effect_points_min2 INTEGER DEFAULT 0,"
+            " effect_points_min3 INTEGER DEFAULT 0,"
+            " effect_arg1 INTEGER DEFAULT 0, effect_arg2 INTEGER DEFAULT 0,"
+            " effect_arg3 INTEGER DEFAULT 0, name TEXT DEFAULT '')")
+        con.execute(
+            "CREATE TABLE spell_templates(id INTEGER PRIMARY KEY,"
+            " name TEXT DEFAULT '', school INTEGER DEFAULT 0,"
+            " duration_index INTEGER DEFAULT 0, base_level INTEGER DEFAULT 0,"
+            " max_level INTEGER DEFAULT 0, range_index INTEGER DEFAULT 0,"
+            " effect1 INTEGER DEFAULT 0, effect2 INTEGER DEFAULT 0,"
+            " effect3 INTEGER DEFAULT 0, effect_base_points1 INTEGER DEFAULT 0,"
+            " effect_base_points2 INTEGER DEFAULT 0,"
+            " effect_base_points3 INTEGER DEFAULT 0,"
+            " effect_die_sides1 INTEGER DEFAULT 0,"
+            " effect_die_sides2 INTEGER DEFAULT 0,"
+            " effect_die_sides3 INTEGER DEFAULT 0,"
+            " effect_implicit_target_a1 INTEGER DEFAULT 0,"
+            " effect_implicit_target_a2 INTEGER DEFAULT 0,"
+            " effect_implicit_target_a3 INTEGER DEFAULT 0,"
+            " effect_implicit_target_b1 INTEGER DEFAULT 0,"
+            " effect_implicit_target_b2 INTEGER DEFAULT 0,"
+            " effect_implicit_target_b3 INTEGER DEFAULT 0,"
+            " effect_apply_aura_name1 INTEGER DEFAULT 0,"
+            " effect_apply_aura_name2 INTEGER DEFAULT 0,"
+            " effect_apply_aura_name3 INTEGER DEFAULT 0)")
+        con.execute(
+            "INSERT INTO spell_templates(id, name, effect1) VALUES(8680,"
+            " 'Instant Poison', 2)")
+        con.execute("INSERT INTO character_items VALUES(1, 66, 25, 15, 0)")
+        con.execute(
+            "INSERT INTO spell_item_enchantment VALUES("
+            "323, 0, 1, 0, 0, 30, 0, 0, 8680, 0, 0, 'Instant Poison')")
+        con.commit()
+        con.close()
+
+        session = FakeUnit()
+        session.config.database.world_path = path
+        template = spells.get_spell_template(WORLD_DB, 133)
+        cast = spells.SpellCast(session.player_guid, 8679, 0)
+        cast.item_guid = 1
+        effect = {"misc_value": 323}
+        await session._apply_weapon_enchant(cast, template, effect)
+        entry = session._get_combat_state()["weapon_enchants"][15]
+        assert entry["name"] == "Instant Poison"
+        assert entry["procs"][0]["spell_id"] == 8680
+        assert abs(entry["procs"][0]["ppm"] - 8.57) < 0.01
+        # The temporary enchant id is persisted for the next login.
+        con = sqlite3.connect(path)
+        assert con.execute(
+            "SELECT enchantment_2 FROM character_items WHERE id=1").fetchone()[0] == 323
+        con.close()
+
     session = FakeUnit(char_class=8)
     session.character["power"] = 0
     restore = spells.get_spell_template(WORLD_DB, 436)
@@ -468,6 +662,18 @@ async def test_damage_breaks_polymorph():
     await session._deal_spell_damage(
         target, 100, spells.SCHOOL_FIRE, fireball, session.player_guid)
     assert not session._creature_aura_mods(9)["polymorphed"]
+
+
+@_async_test
+async def test_direct_energize_restores_power_and_logs():
+    session = FakeUnit(char_class=8)
+    session.character["power"] = 0
+    restore = spells.get_spell_template(WORLD_DB, 436)
+    cast = _cast(session, restore, session.player_guid)
+    await session._apply_spell_effects(cast, restore, session.player_guid)
+    assert session.character["power"] > 0
+    assert any(op == int(Opcodes.SMSG_SPELLENERGIZELOG)
+               for op, _ in session.sent)
 
 
 @_async_test

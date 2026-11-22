@@ -23,7 +23,8 @@ class CombatMixin:
     # ------------------------------------------------------------------
     # A level 1 character without a weapon still swings; these are the numbers
     # used for bare hands (the client animates the attack either way).
-    _BARE_HAND = {"min": 1.0, "max": 3.0, "delay": 2.0}
+    _BARE_HAND = {"min": 1.0, "max": 3.0, "delay": 2.0,
+                  "base_delay": 2.0}
 
     def start_combat_loop(self) -> None:
         """Start this session's combat/AI task (idempotent)."""
@@ -154,6 +155,15 @@ class CombatMixin:
         if int(spawn["dead_since"] or 0) > 0:
             await self.send_packet(Opcodes.SMSG_ATTACKSWING_DEADTARGET, b"")
             return
+        if hasattr(self, "_target_in_front") \
+                and not self._target_in_front(target_guid):
+            await self.send_packet(Opcodes.SMSG_ATTACKSWING_BADFACING, b"")
+            return
+        if hasattr(self, "_has_line_of_sight") and not self._has_line_of_sight(
+                self._unit_eye_position(self.player_guid),
+                self._unit_eye_position(target_guid)):
+            await self.send_packet(Opcodes.SMSG_ATTACKSWING_CANT_ATTACK, b"")
+            return
         # A hunter/wand user clicking a distant target starts Auto Shot/Shoot
         # instead of walking into melee range.
         if (self._player_ranged_weapon_stats() is not None
@@ -226,15 +236,23 @@ class CombatMixin:
             # Out of reach: the client draws the "out of range" message itself
             # once we simply hold the swing, so do nothing but stay in combat.
             return
+        if hasattr(self, "_target_in_front") \
+                and not self._target_in_front(target_guid):
+            await self.send_packet(Opcodes.SMSG_ATTACKSWING_BADFACING, b"")
+            return
+        if hasattr(self, "_has_line_of_sight") and not self._has_line_of_sight(
+                self._unit_eye_position(self.player_guid),
+                self._unit_eye_position(target_guid)):
+            return
 
-        await self._player_melee_attack(weapon, target_guid, spawn)
+        await self._player_melee_attack(weapon, target_guid, spawn, slot=15)
         # Dual wield: a second, weaker swing from the off-hand weapon on the
         # same timer.  Retail gives the off-hand a higher miss chance.
         if int(spawn["dead_since"] or 0) == 0 and self._can_dual_wield():
             offhand = self._player_offhand_weapon_stats()
             if offhand is not None:
                 await self._player_melee_attack(
-                    offhand, target_guid, spawn, offhand_swing=True)
+                    offhand, target_guid, spawn, offhand_swing=True, slot=16)
 
     def _clamp_chance(self, value: float, high: float = 100.0) -> float:
         return max(0.0, min(float(high), float(value)))
@@ -295,7 +313,8 @@ class CombatMixin:
         return 674 in getattr(self, "known_spell_ids", ())
 
     async def _player_melee_attack(self, weapon: dict, target_guid: int,
-                                   spawn, offhand_swing: bool = False) -> bool:
+                                   spawn, offhand_swing: bool = False,
+                                   slot: int = 15) -> bool:
         """Resolve one main-hand/off-hand swing.  Returns True if it killed."""
         target_level = max(1, int(spawn["min_level"] or 1))
         if hasattr(self, "_creature_aura_mods"):
@@ -357,6 +376,11 @@ class CombatMixin:
                         crit=(outcome == "crit"))
         result = await self._deal_damage_to_creature(
             target_guid, damage, self.player_guid)
+        if not result and hasattr(self, "_roll_weapon_procs"):
+            await self._roll_weapon_procs(
+                int(slot), float(weapon.get("base_delay",
+                                            weapon.get("delay", 2.0)) or 2.0),
+                target_guid)
         if hasattr(self, "_break_cc_on_damage"):
             await self._break_cc_on_damage("creature", target_guid, 0)
         return result
@@ -383,11 +407,17 @@ class CombatMixin:
         if low <= 0.0:
             low = max(1.0, high * 0.5)
         delay = max(800, delay) / 1000.0
+        base_delay = delay
         if hasattr(self, "_player_aura_mods"):
             haste = float(self._player_aura_mods()["melee_haste"])
             haste += float(self.character.get("melee_haste", 0.0) or 0.0)
             delay /= max(0.1, 1.0 + haste / 100.0)
-        return {"min": low, "max": high, "delay": delay}
+        if hasattr(self, "_weapon_enchant_bonus_damage"):
+            bonus = self._weapon_enchant_bonus_damage(int(slot))
+            low += bonus
+            high += bonus
+        return {"min": low, "max": high, "delay": delay,
+                "base_delay": base_delay}
 
     def _player_weapon_stats(self) -> dict:
         """Return ``{min, max, delay}`` for the equipped main-hand weapon.
@@ -412,8 +442,217 @@ class CombatMixin:
         if hasattr(self, "_player_aura_mods"):
             haste += float(self._player_aura_mods().get("ranged_haste", 0.0))
         stats = dict(stats)
+        base_delay = delay
         stats["delay"] = max(0.4, delay / max(0.1, 1.0 + haste / 100.0))
+        stats["base_delay"] = base_delay
         return stats
+
+    # ------------------------------------------------------------------
+    # Weapon procs / temporary weapon enchants
+    # ------------------------------------------------------------------
+    def _equipped_item_proc_entries(self, slot: int) -> list[dict]:
+        """Return on-hit item procs for the weapon in ``slot``.
+
+        ``item_template.spelltrigger_N == 2`` is chance-on-hit; the actual rate
+        is stored in ``spellppmRate_N`` (procs per minute).  A ppm of zero is
+        treated as "not configured" and skipped.
+        """
+        con = sqlite3.connect(self.config.database.world_path)
+        con.row_factory = sqlite3.Row
+        try:
+            row = con.execute(
+                "SELECT it.entry, it.spell_id1, it.spell_trigger1,"
+                " it.spell_ppm_rate1, it.spell_cooldown1, it.spell_charges1,"
+                " it.spell_id2, it.spell_trigger2, it.spell_ppm_rate2,"
+                " it.spell_cooldown2, it.spell_charges2,"
+                " it.spell_id3, it.spell_trigger3, it.spell_ppm_rate3,"
+                " it.spell_cooldown3, it.spell_charges3,"
+                " it.spell_id4, it.spell_trigger4, it.spell_ppm_rate4,"
+                " it.spell_cooldown4, it.spell_charges4,"
+                " it.spell_id5, it.spell_trigger5, it.spell_ppm_rate5,"
+                " it.spell_cooldown5, it.spell_charges5"
+                " FROM character_items ci"
+                " JOIN item_templates it ON it.entry = ci.item_entry"
+                " WHERE ci.character_guid = ? AND ci.slot = ?",
+                (int(self.player_guid or 0), int(slot)),
+            ).fetchone()
+        finally:
+            con.close()
+        if row is None:
+            return []
+        result = []
+        for index in range(1, 6):
+            if int(row[f"spell_trigger{index}"] or 0) != 2:
+                continue
+            spell_id = int(row[f"spell_id{index}"] or 0)
+            ppm = float(row[f"spell_ppm_rate{index}"] or 0.0)
+            if not spell_id or ppm <= 0.0:
+                continue
+            result.append({
+                "item_entry": int(row["entry"]),
+                "spell_id": spell_id,
+                "ppm": ppm,
+                "cooldown": int(row[f"spell_cooldown{index}"] or 0),
+                "charges": int(row[f"spell_charges{index}"] or 0),
+            })
+        return result
+
+    def _weapon_enchant_procs(self, slot: int) -> dict | None:
+        combat = self._get_combat_state()
+        entry = combat.setdefault("weapon_enchants", {}).get(int(slot))
+        if entry is None:
+            return None
+        if float(entry.get("expires") or 0.0) <= time.monotonic():
+            combat["weapon_enchants"].pop(int(slot), None)
+            return None
+        return entry
+
+    def _weapon_enchant_bonus_damage(self, slot: int) -> int:
+        entry = self._weapon_enchant_procs(slot)
+        return int(entry.get("bonus_damage", 0) or 0) if entry else 0
+
+    def _proc_spell_target(self, spell_id: int, target_guid: int) -> int:
+        template = spells.get_spell_template(
+            self.config.database.world_path, int(spell_id))
+        if template is None or template.is_self_targeted():
+            return int(self.player_guid)
+        return int(target_guid or self.player_guid)
+
+    async def _cast_weapon_proc(self, spell_id: int, target_guid: int,
+                                source_key: int = 0) -> None:
+        now = time.monotonic()
+        combat = self._get_combat_state()
+        cooldowns = combat.setdefault("weapon_proc_cooldowns", {})
+        if float(cooldowns.get(int(source_key or spell_id), 0.0)) > now:
+            return
+        template = spells.get_spell_template(
+            self.config.database.world_path, int(spell_id))
+        cooldown_ms = int(getattr(template, "recovery_time", 0) or 0) \
+            if template is not None else 0
+        if cooldown_ms > 0:
+            cooldowns[int(source_key or spell_id)] = (
+                now + cooldown_ms / 1000.0)
+        await self._cast_triggered(
+            int(spell_id), self._proc_spell_target(spell_id, target_guid))
+
+    async def _roll_weapon_procs(self, slot: int, delay: float,
+                                 target_guid: int) -> None:
+        """Roll item PPM procs plus a temporary poison/enchant for one hit."""
+        if not target_guid or not self.character:
+            return
+        if not self._is_player_guid(target_guid):
+            low = creature.creature_low_guid(int(target_guid))
+            spawn = self._get_creature_spawn(low)
+            if spawn is None or int(spawn["dead_since"] or 0) > 0:
+                return
+        # Item procs: chance per swing = ppm * weapon_speed / 60.
+        for proc in self._equipped_item_proc_entries(slot):
+            key = int(proc["item_entry"])
+            charges = int(proc.get("charges") or 0)
+            if charges > 0:
+                remaining = int(self._get_combat_state().setdefault(
+                    "weapon_proc_charges", {}).get(key, charges))
+                if remaining <= 0:
+                    continue
+            chance = max(0.0, min(100.0,
+                                float(proc["ppm"]) * float(delay) / 60.0 * 100.0))
+            if chance and random.random() * 100.0 < chance:
+                await self._cast_weapon_proc(
+                    int(proc["spell_id"]), target_guid, source_key=key)
+                if charges > 0:
+                    remaining = int(self._get_combat_state().setdefault(
+                        "weapon_proc_charges", {}).get(key, charges)) - 1
+                    self._get_combat_state()["weapon_proc_charges"][key] = remaining
+        # Temporary poison / weapon enchant.
+        enchant = self._weapon_enchant_procs(slot)
+        if enchant is None:
+            return
+        penalty = 0.5 if int(slot) == 16 else 1.0
+        for proc in enchant.get("procs", ()):
+            if proc.get("ppm"):
+                chance = (float(proc["ppm"]) * float(delay) / 60.0
+                          * 100.0 * penalty)
+            else:
+                chance = float(proc.get("chance") or 0.0) * penalty
+            if chance <= 0.0 or random.random() * 100.0 >= chance:
+                continue
+            await self._cast_weapon_proc(
+                int(proc["spell_id"]), target_guid,
+                source_key=int(enchant.get("enchant_id") or 0))
+            if int(enchant.get("charges") or 0) > 0:
+                enchant["charges"] = int(enchant["charges"]) - 1
+                if enchant["charges"] <= 0:
+                    self._get_combat_state()["weapon_enchants"].pop(
+                        int(slot), None)
+                    break
+
+    def _restore_weapon_enchants(self) -> None:
+        """Reload ``enchantment_2`` temporary weapon enchants after login."""
+        if not self.player_guid:
+            return
+        con = sqlite3.connect(self.config.database.world_path)
+        con.row_factory = sqlite3.Row
+        try:
+            rows = con.execute(
+                "SELECT ci.slot, ci.enchantment_2, it.name1"
+                " FROM character_items ci"
+                " JOIN item_templates it ON it.entry = ci.item_entry"
+                " WHERE ci.character_guid = ? AND ci.slot IN (15,16)"
+                " AND ci.enchantment_2 <> 0",
+                (int(self.player_guid),),
+            ).fetchall()
+        except sqlite3.Error:
+            rows = []
+        finally:
+            con.close()
+        for row in rows:
+            enchant_id = int(row["enchantment_2"] or 0)
+            if not enchant_id:
+                continue
+            con = sqlite3.connect(self.config.database.world_path)
+            con.row_factory = sqlite3.Row
+            try:
+                enchant = con.execute(
+                    "SELECT * FROM spell_item_enchantment WHERE id = ?",
+                    (enchant_id,),
+                ).fetchone()
+            except sqlite3.Error:
+                enchant = None
+            finally:
+                con.close()
+            if enchant is None:
+                continue
+            procs = []
+            bonus_damage = 0
+            display_name = str(row["name1"] or enchant["name"] or "")
+            for index in (1, 2, 3):
+                etype = int(enchant[f"effect{index}"] or 0)
+                points = int(enchant[f"effect_points_min{index}"] or 0)
+                arg = int(enchant[f"effect_arg{index}"] or 0)
+                if etype == spells.ITEM_ENCHANTMENT_COMBAT_SPELL and arg:
+                    proc_template = spells.get_spell_template(
+                        self.config.database.world_path, arg)
+                    proc_name = str(getattr(proc_template, "name", "") or "")
+                    if proc_name:
+                        display_name = proc_name
+                    procs.append(spells.item_enchant_proc(
+                        proc_name or display_name, points, arg))
+                elif etype == spells.ITEM_ENCHANTMENT_DAMAGE:
+                    bonus_damage += points
+            if not procs and not bonus_damage:
+                continue
+            self._get_combat_state().setdefault("weapon_enchants", {})[
+                int(row["slot"])] = {
+                    "enchant_id": enchant_id,
+                    "spell_id": 0,
+                    "name": display_name,
+                    "slot": int(row["slot"]),
+                    "procs": procs,
+                    "bonus_damage": bonus_damage,
+                    "charges": int(enchant["charges"] or 0),
+                    "expires": time.monotonic() + 3600.0,
+                    "max_duration": 3600.0,
+                }
 
     async def _start_ranged_attack(self, target_guid: int,
                                    spell_id: int = 75) -> None:
@@ -421,6 +660,15 @@ class CombatMixin:
         target_guid = int(target_guid or combat.get("target_guid")
                           or combat.get("selected_guid") or 0)
         if not target_guid:
+            return
+        if hasattr(self, "_target_in_front") \
+                and not self._target_in_front(target_guid):
+            await self.send_packet(Opcodes.SMSG_ATTACKSWING_BADFACING, b"")
+            return
+        if hasattr(self, "_has_line_of_sight") and not self._has_line_of_sight(
+                self._unit_eye_position(self.player_guid),
+                self._unit_eye_position(target_guid)):
+            await self.send_packet(Opcodes.SMSG_ATTACKSWING_CANT_ATTACK, b"")
             return
         combat["target_guid"] = int(target_guid)
         combat["auto_attacking"] = False
@@ -457,6 +705,14 @@ class CombatMixin:
         distance = self._distance(self._player_position(),
                                  self._creature_position(low))
         if distance > 41.0:
+            return
+        if hasattr(self, "_target_in_front") \
+                and not self._target_in_front(target_guid):
+            await self.send_packet(Opcodes.SMSG_ATTACKSWING_BADFACING, b"")
+            return
+        if hasattr(self, "_has_line_of_sight") and not self._has_line_of_sight(
+                self._unit_eye_position(self.player_guid),
+                self._unit_eye_position(target_guid)):
             return
         interval = float(combat.get("ranged_interval") or stats["delay"])
         if now - float(combat.get("last_ranged_swing") or 0.0) < interval:
@@ -495,7 +751,10 @@ class CombatMixin:
             is_crit=(outcome == "crit"))
         await self._deal_damage_to_creature(
             target_guid, damage, self.player_guid)
-
+        if hasattr(self, "_roll_weapon_procs") \
+                and self._creature_health(target_guid) > 0:
+            await self._roll_weapon_procs(
+                17, float(stats.get("base_delay", stats["delay"])), target_guid)
 
     def _victim_health(self, victim_guid: int) -> int:
         """Health the victim has *before* the hit we are about to report.

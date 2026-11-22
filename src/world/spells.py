@@ -72,6 +72,8 @@ SPELL_EFFECT_ENERGIZE = 30
 SPELL_EFFECT_WEAPON_PERCENT_DAMAGE = 31
 SPELL_EFFECT_DISPEL = 38
 SPELL_EFFECT_TELEPORT_UNITS = 44
+SPELL_EFFECT_ENCHANT_ITEM = 53
+SPELL_EFFECT_ENCHANT_ITEM_TEMPORARY = 54
 SPELL_EFFECT_SUMMON_PET = 56
 SPELL_EFFECT_WEAPON_DAMAGE = 58
 SPELL_EFFECT_TRIGGER_SPELL = 64
@@ -276,6 +278,27 @@ def spell_radius(radius_index: int) -> float:
     """Yards for a ``SpellRadius.dbc`` index (0 when unknown)."""
     return float(SPELL_RADII.get(int(radius_index or 0), 0.0))
 
+
+def item_enchant_proc(name: str, points: int, spell_id: int) -> dict:
+    """Build a weapon-enchant proc entry from a SpellItemEnchantment row.
+
+    Instant/Wound Poison are PPM effects; Deadly/Crippling/Mind-numbing use a
+    flat chance.  The DBC's EffectPointsMin is a flat chance for the latter but
+    not for the PPM poisons, so use the known 3.3.5 poison rates.
+    """
+    label = str(name or "").lower()
+    if "instant poison" in label:
+        return {"spell_id": int(spell_id), "ppm": 8.57}
+    if "wound poison" in label:
+        return {"spell_id": int(spell_id), "ppm": 21.4}
+    if "deadly poison" in label:
+        return {"spell_id": int(spell_id), "chance": 30.0}
+    if "crippling poison" in label or "mind-numbing" in label \
+            or "anesthetic poison" in label:
+        return {"spell_id": int(spell_id), "chance": 50.0}
+    chance = float(points) if 0 < points <= 100 else 30.0
+    return {"spell_id": int(spell_id), "chance": chance}
+
 # Aliases kept for callers written against the old names.
 SPELL_EFFECT_DMG = SPELL_EFFECT_SCHOOL_DAMAGE
 SPELL_EFFECT_SCHOOL_DMG = SPELL_EFFECT_SCHOOL_DAMAGE
@@ -335,6 +358,15 @@ SPELL_ATTR_EX_FINISHING_MOVE_DURATION = 0x00400000
 # ``SPELL_ATTR_EX3_CANT_MISS``: a few internal/triggered spells skip the roll.
 SPELL_ATTR_EX3_CANT_MISS = 0x00000010
 SPELL_ATTR_EX3_NO_THREAT = 0x00000400
+
+# ``Spell.dbc`` ``FacingCasterFlags``.
+SPELL_FACING_FLAG_INFRONT = 0x00000001
+
+# ``ItemEnchantmentType`` values used by temporary weapon enchants/poisons.
+ITEM_ENCHANTMENT_COMBAT_SPELL = 1
+ITEM_ENCHANTMENT_DAMAGE = 2
+ITEM_ENCHANTMENT_EQUIP_SPELL = 3
+ITEM_ENCHANTMENT_USE_SPELL = 7
 
 # ``SpellAttributesEx2`` bits.
 SPELL_ATTR_EX2_DONT_BLOCK_MANA_REGEN = 0x02000000
@@ -565,6 +597,44 @@ class SpellTemplate:
         finishing = (SPELL_ATTR_EX_FINISHING_MOVE_DAMAGE
                      | SPELL_ATTR_EX_FINISHING_MOVE_DURATION)
         return bool(self.attributes_ex & finishing)
+
+    def has_weapon_effect(self) -> bool:
+        """True for weapon-damage abilities (Heroic Strike, Sinister Strike...)."""
+        return any(int(effect.get("effect") or 0) in (
+            SPELL_EFFECT_WEAPON_DAMAGE,
+            SPELL_EFFECT_WEAPON_DAMAGE_NOSCHOOL,
+            SPELL_EFFECT_NORMALIZED_WEAPON_DMG,
+            SPELL_EFFECT_WEAPON_PERCENT_DAMAGE,
+            SPELL_EFFECT_ATTACK,
+        ) for effect in self.effects)
+
+    def is_self_targeted(self) -> bool:
+        """Whether the spell's primary target is the caster.
+
+        Item procs and poisons use both self buffs (Destiny) and enemy damage
+        spells (Fiery War Axe), so the proc code needs this distinction.
+        """
+        if int(self.range_index) == 1:
+            return True
+        has_self = False
+        for effect in self.effects:
+            a = int(effect.get("target_a") or 0)
+            b = int(effect.get("target_b") or 0)
+            if a in (TARGET_UNIT_TARGET_ENEMY, TARGET_UNIT_SRC_AREA_ENEMY,
+                     TARGET_UNIT_DEST_AREA_ENEMY, TARGET_UNIT_CONE_ENEMY_24,
+                     TARGET_UNIT_CONE_ENEMY_54, TARGET_UNIT_CONE_ENEMY_104) \
+                    or b in (TARGET_UNIT_TARGET_ENEMY,
+                             TARGET_UNIT_SRC_AREA_ENEMY,
+                             TARGET_UNIT_DEST_AREA_ENEMY,
+                             TARGET_UNIT_CONE_ENEMY_24,
+                             TARGET_UNIT_CONE_ENEMY_54,
+                             TARGET_UNIT_CONE_ENEMY_104):
+                return False
+            if a in (TARGET_UNIT_CASTER, TARGET_SRC_CASTER, TARGET_DEST_CASTER) \
+                    or b in (TARGET_UNIT_CASTER, TARGET_SRC_CASTER,
+                             TARGET_DEST_CASTER):
+                has_self = True
+        return has_self
 
     def is_channeled(self) -> bool:
         """``SPELL_ATTR_EX_IS_CHANNELED``: cast a channel instead of a one-shot."""
@@ -831,6 +901,8 @@ class SpellCast:
         self.x = x
         self.y = y
         self.z = z
+        # Item guid carried by TARGET_FLAG_ITEM (temporary weapon enchants).
+        self.item_guid = 0
         # True when the client sent a destination location (ground-targeted
         # spells such as Blizzard, Flamestrike or Death and Decay).
         self.has_dest = False

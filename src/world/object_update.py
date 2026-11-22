@@ -908,6 +908,36 @@ def build_monster_move(guid: int, x: float, y: float, z: float, o: float,
     return bytes(out)
 
 
+def build_monster_move_path(guid: int, x: float, y: float, z: float,
+                            o: float, points: list[tuple[float, float, float]],
+                            duration_ms: int = 1000, move_id: int = 0) -> bytes:
+    """Build a multi-point linear ``SMSG_MONSTER_MOVE`` spline.
+
+    ``build_monster_move`` is the one-point special case.  Navigation paths
+    carry the funnel/string-pulled waypoints as intermediate points so the
+    client can animate the whole detour without a packet per segment.
+    """
+    cleaned: list[tuple[float, float, float]] = []
+    for point in points:
+        destination = (float(point[0]), float(point[1]), float(point[2]))
+        if cleaned and math.dist(cleaned[-1], destination) < 0.05:
+            continue
+        cleaned.append(destination)
+    if not cleaned:
+        cleaned = [(float(x), float(y), float(z))]
+    if len(cleaned) == 1:
+        return build_monster_move(
+            guid, x, y, z, o, cleaned[0][0], cleaned[0][1], cleaned[0][2],
+            duration_ms=duration_ms, move_id=move_id)
+    out = _monster_move_header(guid, x, y, z, move_id, MONSTER_MOVE_NORMAL)
+    out += struct.pack("<I", 0)                       # spline flags
+    out += struct.pack("<I", max(1, int(duration_ms)))
+    out += struct.pack("<I", len(cleaned))            # point count
+    for point in cleaned:
+        out += struct.pack("<fff", point[0], point[1], point[2])
+    return bytes(out)
+
+
 def build_monster_face(guid: int, x: float, y: float, z: float, o: float,
                        angle: float, move_id: int = 0) -> bytes:
     """Build a ``SMSG_MONSTER_MOVE`` that only turns a creature in place.

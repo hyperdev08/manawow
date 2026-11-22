@@ -311,6 +311,9 @@ class CreatureAIMixin:
                 entry, low_guid, spawn, ai, player_guid)
             if not ok:
                 continue
+            if target_guid and not self._creature_has_line_of_sight(
+                    low_guid, target_guid):
+                continue
             if target_guid and not self._creature_spell_in_range(
                     template, spawn, low_guid, target_guid, distance):
                 continue
@@ -362,6 +365,16 @@ class CreatureAIMixin:
                 if int(getattr(other["template"], "category", 0)) == category:
                     other["next_ready"] = max(float(other["next_ready"]), until)
         ai["gcd_until"] = now + CREATURE_SPELL_GCD
+
+        # A casting creature turns towards its victim before the cast starts.
+        if target_guid and hasattr(self, "_face_creature_at_player"):
+            state = self._get_combat_state().get("aggro", {}).get(
+                int(low_guid))
+            if state is not None:
+                await self._face_creature_at_player(
+                    int(low_guid), state, spawn,
+                    self._creature_position(int(low_guid)),
+                    self._player_position(), now)
 
         cast_id = int(ai["cast_id"])
         ai["cast_id"] = (cast_id + 1) & 0xFF
@@ -470,7 +483,7 @@ class CreatureAIMixin:
     async def _creature_spell_lands(self, template, target_guid: int,
                                     effect: dict | None = None,
                                     caster_guid: int = 0) -> bool:
-        """Check immunities/reflect for a creature spell.
+        """Check immunities, reflect and line of sight for a creature spell.
 
         Creatures always land their spells against an equal-level player in
         this simulator; what matters for 3.3.5 feel is the immunity/reflect
@@ -496,6 +509,18 @@ class CreatureAIMixin:
             return False
         return True
 
+
+    def _creature_has_line_of_sight(self, low_guid: int,
+                                    target_guid: int) -> bool:
+        if not hasattr(self, "_has_line_of_sight"):
+            return True
+        caster = self._creature_object_guid(int(low_guid))
+        try:
+            return self._has_line_of_sight(
+                self._unit_eye_position(caster),
+                self._unit_eye_position(int(target_guid)))
+        except Exception:
+            return True
 
     async def _apply_creature_spell_effects(self, low_guid: int, spawn,
                                             ai: dict, template,

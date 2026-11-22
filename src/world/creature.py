@@ -272,6 +272,7 @@ CREATE TABLE IF NOT EXISTS spell_templates(
   targets INTEGER NOT NULL DEFAULT 0,
   target_creature_type INTEGER NOT NULL DEFAULT 0,
   requires_spell_focus INTEGER NOT NULL DEFAULT 0,
+  facing_caster_flags INTEGER NOT NULL DEFAULT 0,
   caster_aura_state INTEGER NOT NULL DEFAULT 0,
   target_aura_state INTEGER NOT NULL DEFAULT 0,
   caster_aura_state_not INTEGER NOT NULL DEFAULT 0,
@@ -612,6 +613,37 @@ CREATE TABLE IF NOT EXISTS spell_duration(
   max_duration INTEGER NOT NULL DEFAULT 0
 );
 
+-- Optional static line-of-sight blockers (VMAP AABBs).  The table is empty in a
+-- fresh install because the client map files are not bundled; adding rows turns
+-- on real terrain/object LOS without code changes.
+CREATE TABLE IF NOT EXISTS sight_blockers(
+  map INTEGER NOT NULL DEFAULT 0,
+  min_x REAL NOT NULL DEFAULT 0.0,
+  max_x REAL NOT NULL DEFAULT 0.0,
+  min_y REAL NOT NULL DEFAULT 0.0,
+  max_y REAL NOT NULL DEFAULT 0.0,
+  min_z REAL NOT NULL DEFAULT 0.0,
+  max_z REAL NOT NULL DEFAULT 0.0
+);
+CREATE INDEX IF NOT EXISTS idx_sight_blockers_map ON sight_blockers(map);
+
+-- SpellItemEnchantment.dbc subset used for temporary weapon enchants/poisons.
+-- Effect 1 is "combat spell" and EffectArg is the proc spell id.
+CREATE TABLE IF NOT EXISTS spell_item_enchantment(
+  id INTEGER PRIMARY KEY,
+  charges INTEGER NOT NULL DEFAULT 0,
+  effect1 INTEGER NOT NULL DEFAULT 0,
+  effect2 INTEGER NOT NULL DEFAULT 0,
+  effect3 INTEGER NOT NULL DEFAULT 0,
+  effect_points_min1 INTEGER NOT NULL DEFAULT 0,
+  effect_points_min2 INTEGER NOT NULL DEFAULT 0,
+  effect_points_min3 INTEGER NOT NULL DEFAULT 0,
+  effect_arg1 INTEGER NOT NULL DEFAULT 0,
+  effect_arg2 INTEGER NOT NULL DEFAULT 0,
+  effect_arg3 INTEGER NOT NULL DEFAULT 0,
+  name TEXT NOT NULL DEFAULT ''
+);
+
 -- CMaNGOS ``playercreateinfo_spell``: the exact spells every race/class
 -- combination knows at creation, including racials, languages, armor and
 -- weapon proficiencies.  Seeded from playercreateinfo.sql on first open.
@@ -756,6 +788,26 @@ _SPAWN_COLUMNS = _schema_columns(CREATE_CREATURE_SQL, "creature_spawns")
 
 _PLAYERCREATEINFO_SQL = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "playercreateinfo.sql")
+_SPELL_ENCHANT_SQL = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "spell_item_enchantment.sql")
+
+
+def _seed_spell_item_enchantment(con: sqlite3.Connection) -> None:
+    """Load the bundled SpellItemEnchantment subset once.
+
+    It drives temporary weapon enchants and poisons (combat-spell effect arg is
+    the proc spell id) without requiring a client DBC import.
+    """
+    count = con.execute(
+        "SELECT COUNT(*) FROM spell_item_enchantment").fetchone()[0]
+    if count:
+        return
+    if not os.path.exists(_SPELL_ENCHANT_SQL):
+        return
+    with open(_SPELL_ENCHANT_SQL, encoding="utf-8") as handle:
+        con.executescript(handle.read())
+    con.commit()
+
 
 
 def _seed_playercreateinfo(con: sqlite3.Connection) -> None:
@@ -793,6 +845,16 @@ def init_creature_db(path: str) -> None:
                 con.execute(
                     f"ALTER TABLE creature_templates ADD COLUMN {column} {declaration}"
                 )
+        # Migrate spell_templates (same schema lives in spell_tables.sql).
+        spell_columns = {
+            row[1] for row in con.execute("PRAGMA table_info(spell_templates)")
+        }
+        for column, declaration in _schema_columns(
+                CREATE_CREATURE_SQL, "spell_templates"):
+            if column not in spell_columns:
+                con.execute(
+                    f"ALTER TABLE spell_templates ADD COLUMN {column} {declaration}"
+                )
         # Migrate creature_spawns
         spawn_columns = {row[1] for row in con.execute("PRAGMA table_info(creature_spawns)")}
         for column, declaration in _SPAWN_COLUMNS:
@@ -803,6 +865,7 @@ def init_creature_db(path: str) -> None:
         # Level-1 spells and action buttons have no connection to the spawn
         # table, so seed them before the demo-population early return.
         _seed_playercreateinfo(con)
+        _seed_spell_item_enchantment(con)
         if con.execute("SELECT COUNT(*) FROM creature_spawns").fetchone()[0]:
             con.commit()
             return

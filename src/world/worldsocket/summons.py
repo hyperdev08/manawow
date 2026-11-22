@@ -398,23 +398,45 @@ class SummonsMixin:
         speed = max(0.5, float(speed))
         duration_ms = int(travel / speed * 1000.0)
         duration_ms = max(200, min(duration_ms, SUMMON_MOVE_MAX_MS))
-        travel = min(travel, speed * duration_ms / 1000.0)
-        scale = travel / distance
-        target = (here[0] + (dest[0] - here[0]) * scale,
-                  here[1] + (dest[1] - here[1]) * scale,
-                  here[2] + (dest[2] - here[2]) * scale)
+
+        path = None
+        if hasattr(self, "_find_world_path") and distance > 2.0:
+            if not self._has_line_of_sight(
+                    (here[0], here[1], here[2] + 0.9),
+                    (dest[0], dest[1], dest[2] + 0.9)):
+                path = self._find_world_path(here, dest)
+        points = None
+        if path and len(path) > 1:
+            points = self._path_prefix(here, path,
+                                       travel + max(0.0, stop_distance),
+                                       stop_distance=stop_distance)
+            if points:
+                target = points[-1]
+                traveled = sum(self._distance(a, b) for a, b in
+                               zip([here] + points[:-1], points))
+                duration_ms = max(200, min(
+                    int(traveled / speed * 1000.0), SUMMON_MOVE_MAX_MS))
+            else:
+                points = None
+        if points is None:
+            travel = min(travel, speed * duration_ms / 1000.0)
+            scale = travel / distance
+            target = (here[0] + (dest[0] - here[0]) * scale,
+                      here[1] + (dest[1] - here[1]) * scale,
+                      here[2] + (dest[2] - here[2]) * scale)
         await self._send_summon_move(low_guid, spawn, state, here, target, now,
-                                     duration_ms / 1000.0)
+                                     duration_ms / 1000.0, points=points)
 
     async def _send_summon_move(self, low_guid: int, spawn: dict, state: dict,
                                 here, target, now: float,
-                                duration_s: float) -> None:
+                                duration_s: float, points=None) -> None:
         facing = math.atan2(target[1] - here[1], target[0] - here[0])
         duration_ms = max(1, int(duration_s * 1000.0))
-        payload = object_update.build_monster_move(
+        payload = object_update.build_monster_move_path(
             self._creature_object_guid(low_guid, int(spawn["entry"])),
             float(here[0]), float(here[1]), float(here[2]), facing,
-            float(target[0]), float(target[1]), float(target[2]),
+            points if points else [(float(target[0]), float(target[1]),
+                                    float(target[2]))],
             duration_ms=duration_ms,
             move_id=self._next_move_id(),
         )

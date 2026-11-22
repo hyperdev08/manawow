@@ -78,6 +78,8 @@ class WorldEntryMixin:
             del self._combat_state
         self._get_combat_state()
         self._apply_combat_stats()
+        if hasattr(self, "_restore_weapon_enchants"):
+            self._restore_weapon_enchants()
         # ``Player::InitRunes`` runs for death knights before the create block;
         # the authoritative cooldowns follow the login burst as
         # ``SMSG_RESYNC_RUNES``.

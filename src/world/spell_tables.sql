@@ -22,6 +22,7 @@ CREATE TABLE IF NOT EXISTS spell_templates(
   targets INTEGER NOT NULL DEFAULT 0,
   target_creature_type INTEGER NOT NULL DEFAULT 0,
   requires_spell_focus INTEGER NOT NULL DEFAULT 0,
+  facing_caster_flags INTEGER NOT NULL DEFAULT 0,
   caster_aura_state INTEGER NOT NULL DEFAULT 0,
   target_aura_state INTEGER NOT NULL DEFAULT 0,
   caster_aura_state_not INTEGER NOT NULL DEFAULT 0,

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import math
 import random
+import sqlite3
 import struct
 import time
 
@@ -16,6 +17,9 @@ from .constants import (
     SPELL_FAILED_CASTER_AURASTATE,
     SPELL_FAILED_CASTER_DEAD,
     SPELL_FAILED_INTERRUPTED,
+    SPELL_FAILED_LINE_OF_SIGHT,
+    SPELL_FAILED_NOT_BEHIND,
+    SPELL_FAILED_NOT_INFRONT,
     SPELL_FAILED_NOT_KNOWN,
     SPELL_FAILED_NOT_READY,
     SPELL_FAILED_NO_COMBO_POINTS,
@@ -91,6 +95,7 @@ class SpellsMixin:
         send_cast_flags = data[pos] if len(data) > pos else 0
         pos += 1
         target_guid = 0
+        item_guid = 0
         dest = None
         if len(data) >= pos + 4:
             target_flags = struct.unpack_from("<I", data, pos)[0]
@@ -98,7 +103,7 @@ class SpellsMixin:
             if target_flags & OBJECT_TARGET_FLAGS:
                 target_guid, pos = self._read_packed_guid(data, pos)
             if target_flags & ITEM_TARGET_FLAGS and pos < len(data):
-                _item_guid, pos = self._read_packed_guid(data, pos)
+                item_guid, pos = self._read_packed_guid(data, pos)
             if target_flags & TARGET_FLAG_SOURCE_LOCATION:
                 _transport, pos = self._read_packed_guid(data, pos)
                 if len(data) >= pos + 12:
@@ -128,8 +133,9 @@ class SpellsMixin:
                                         SPELL_FAILED_CASTER_AURASTATE)
                 return
         if spell_id not in self.known_spell_ids:
-            await self._cast_failed(cast_id, spell_id, SPELL_FAILED_NOT_KNOWN)
-            return
+            if not self._item_has_spell(item_guid, spell_id):
+                await self._cast_failed(cast_id, spell_id, SPELL_FAILED_NOT_KNOWN)
+                return
         template = spells.get_spell_template(self.config.database.world_path, spell_id)
         if template is None:
             await self._cast_failed(cast_id, spell_id, SPELL_FAILED_SPELL_UNAVAILABLE)
@@ -206,6 +212,40 @@ class SpellsMixin:
                     await self._cast_failed(cast_id, spell_id,
                                             SPELL_FAILED_OUT_OF_RANGE)
                     return
+            if hasattr(self, "_has_line_of_sight") and \
+                    not self._has_line_of_sight(
+                        self._unit_eye_position(self.player_guid), dest):
+                await self._cast_failed(cast_id, spell_id,
+                                        SPELL_FAILED_LINE_OF_SIGHT)
+                return
+
+        # Facing and line-of-sight checks.  Self-casts and caster-centred AoE
+        # are exempt.  Weapon abilities always require the victim in front.
+        if target_guid and not self._is_player_guid(target_guid):
+            needs_front = bool(
+                template.facing_caster_flags & spells.SPELL_FACING_FLAG_INFRONT
+                or template.has_weapon_effect())
+            if needs_front and hasattr(self, "_target_in_front") \
+                    and not self._target_in_front(target_guid):
+                await self._cast_failed(cast_id, spell_id,
+                                        SPELL_FAILED_NOT_INFRONT)
+                return
+            if target_peer is not None and target_peer.character:
+                target_eye = (
+                    float(target_peer.character.get("x", 0.0)),
+                    float(target_peer.character.get("y", 0.0)),
+                    float(target_peer.character.get("z", 0.0)) + 1.6)
+            elif spawn is not None:
+                pos = self._creature_position(target_low)
+                target_eye = (pos[0], pos[1], pos[2] + 1.0)
+            else:
+                target_eye = None
+            if target_eye is not None and hasattr(self, "_has_line_of_sight") \
+                    and not self._has_line_of_sight(
+                        self._unit_eye_position(self.player_guid), target_eye):
+                await self._cast_failed(cast_id, spell_id,
+                                        SPELL_FAILED_LINE_OF_SIGHT)
+                return
 
         # Finishing moves (Eviscerate, Slice and Dice, Kidney Shot, ...) need
         # the target to be the unit the rogue already has combo points on.
@@ -253,6 +293,7 @@ class SpellsMixin:
 
         cast = spells.SpellCast(self.player_guid, spell_id, target_guid)
         cast.template = template
+        cast.item_guid = int(item_guid or 0)
         if dest is not None:
             cast.x, cast.y, cast.z = (float(dest[0]), float(dest[1]),
                                       float(dest[2]))
@@ -283,6 +324,7 @@ class SpellsMixin:
                 "target_guid": target_guid,
                 "template": template,
                 "dest": dest,
+                "item_guid": int(item_guid or 0),
                 "finish_at": now + cast_time_ms / 1000.0,
             }
             return
@@ -313,6 +355,43 @@ class SpellsMixin:
         self.log.info(
             f"'{self.character['name']}' casts {template.name} ({spell_id})"
         )
+
+    def _item_has_spell(self, item_guid: int, spell_id: int) -> bool:
+        """True when an inventory item's on-use spell is ``spell_id``.
+
+        ``item_guid`` may be zero when the client used an item without setting
+        TARGET_FLAG_ITEM; in that case any matching item in the character's
+        inventory is accepted.
+        """
+        import sqlite3
+        if not self.player_guid:
+            return False
+        con = sqlite3.connect(self.config.database.world_path)
+        try:
+            if item_guid:
+                row = con.execute(
+                    "SELECT 1 FROM character_items ci"
+                    " JOIN item_templates it ON it.entry = ci.item_entry"
+                    " WHERE ci.id = ? AND ci.character_guid = ? AND ("
+                    " it.spell_id1 = ? OR it.spell_id2 = ? OR it.spell_id3 = ?"
+                    " OR it.spell_id4 = ? OR it.spell_id5 = ?)",
+                    (int(item_guid), int(self.player_guid), int(spell_id),
+                     int(spell_id), int(spell_id), int(spell_id),
+                     int(spell_id)),
+                ).fetchone()
+            else:
+                row = con.execute(
+                    "SELECT 1 FROM character_items ci"
+                    " JOIN item_templates it ON it.entry = ci.item_entry"
+                    " WHERE ci.character_guid = ? AND ("
+                    " it.spell_id1 = ? OR it.spell_id2 = ? OR it.spell_id3 = ?"
+                    " OR it.spell_id4 = ? OR it.spell_id5 = ?)",
+                    (int(self.player_guid), int(spell_id), int(spell_id),
+                     int(spell_id), int(spell_id), int(spell_id)),
+                ).fetchone()
+        finally:
+            con.close()
+        return row is not None
 
     def _spell_cast_time_ms(self, template) -> int:
         """Cast time after spell haste, preserving instant casts."""
@@ -857,6 +936,108 @@ class SpellsMixin:
             await self._sync_creature_flags(
                 creature.creature_low_guid(target_guid))
 
+    async def _apply_weapon_enchant(self, cast, template, effect: dict) -> None:
+        """Apply a temporary/permanent weapon enchant (poisons, stones, oils).
+
+        The item enchant row points at a combat spell id; poisons use that spell
+        as their proc.  The enchant is stored per weapon slot and persists in
+        ``character_items.enchantment_2`` so it survives a relog.
+        """
+        import sqlite3
+        enchant_id = int(effect.get("misc_value") or 0)
+        if not enchant_id:
+            return
+        path = self.config.database.world_path
+        item_guid = int(getattr(cast, "item_guid", 0) or 0)
+        temporary = int(effect.get("effect") or 0) == \
+            spells.SPELL_EFFECT_ENCHANT_ITEM_TEMPORARY
+        slot = 15
+        item_slot = None
+        if item_guid:
+            con = sqlite3.connect(path)
+            try:
+                row = con.execute(
+                    "SELECT slot FROM character_items"
+                    " WHERE id = ? AND character_guid = ?",
+                    (item_guid, int(self.player_guid or 0)),
+                ).fetchone()
+                if row is not None:
+                    item_slot = int(row[0])
+                    if item_slot in (15, 16):
+                        slot = item_slot
+            finally:
+                con.close()
+        if not temporary and item_slot not in (15, 16):
+            return
+        con = sqlite3.connect(path)
+        con.row_factory = sqlite3.Row
+        try:
+            enchant = con.execute(
+                "SELECT * FROM spell_item_enchantment WHERE id = ?",
+                (enchant_id,),
+            ).fetchone()
+        except sqlite3.Error:
+            enchant = None
+        finally:
+            con.close()
+        if enchant is None:
+            return
+        procs = []
+        bonus_damage = 0
+        display_name = str(getattr(template, "name", "") or "")
+        for index in (1, 2, 3):
+            etype = int(enchant[f"effect{index}"] or 0)
+            points = int(enchant[f"effect_points_min{index}"] or 0)
+            arg = int(enchant[f"effect_arg{index}"] or 0)
+            if etype == spells.ITEM_ENCHANTMENT_COMBAT_SPELL and arg:
+                proc_template = spells.get_spell_template(path, arg)
+                proc_name = str(getattr(proc_template, "name", "") or "")
+                if proc_name:
+                    display_name = proc_name
+                procs.append(spells.item_enchant_proc(
+                    proc_name or display_name, points, arg))
+            elif etype == spells.ITEM_ENCHANTMENT_DAMAGE:
+                bonus_damage += points
+        if not procs and not bonus_damage:
+            return
+        duration_ms = spells.spell_duration_ms(
+            path, template.duration_index,
+            int(self.character.get("level", 1)))
+        if duration_ms <= 0:
+            duration_ms = 3600 * 1000
+        now = time.monotonic()
+        combat = self._get_combat_state()
+        combat.setdefault("weapon_enchants", {})[slot] = {
+            "enchant_id": enchant_id,
+            "spell_id": int(template.id),
+            "name": display_name,
+            "slot": slot,
+            "procs": procs,
+            "bonus_damage": int(bonus_damage),
+            "charges": int(enchant["charges"] or 0),
+            "expires": now + duration_ms / 1000.0,
+            "max_duration": duration_ms / 1000.0,
+        }
+        con = sqlite3.connect(path)
+        try:
+            con.execute(
+                "UPDATE character_items SET enchantment_2 = ?"
+                " WHERE character_guid = ? AND slot = ? AND slot IN (15,16)",
+                (enchant_id, int(self.player_guid or 0), slot),
+            )
+            con.commit()
+        finally:
+            con.close()
+        inventory = getattr(self, "character", {}).get("inventory") or {}
+        item = inventory.get(int(slot))
+        if item is not None:
+            item["enchantment_2"] = enchant_id
+        if hasattr(self, "broadcast_equipment_update"):
+            await self.broadcast_equipment_update()
+        if hasattr(self, "_send_system_message"):
+            await self._send_system_message(
+                f"Your weapon is coated with {display_name}.")
+
     async def _deal_spell_damage(self, target_guid: int, amount: int,
                                  school: int, template, caster_guid: int,
                                  critical: bool = False,
@@ -1173,6 +1354,8 @@ class SpellsMixin:
         ground_started = False
         aura_patterns: set = set()
         rolls: dict = {}
+        weapon_proc_slot = None
+        weapon_proc_delay = 2.0
         for index, effect in enumerate(template.effects):
             etype = int(effect["effect"])
             if not etype:
@@ -1246,6 +1429,14 @@ class SpellsMixin:
                 await self._deal_spell_damage(
                     target_guid, amount, 1, template, player_guid,
                     critical=critical)
+                weapon_proc_slot = 17 if template.uses_ranged_slot() else 15
+                if weapon_proc_slot == 17:
+                    ranged_stats = self._player_ranged_weapon_stats()
+                    weapon_proc_delay = ranged_stats.get(
+                        "base_delay", 2.0) if ranged_stats else 2.0
+                else:
+                    weapon_proc_delay = self._player_weapon_stats().get(
+                        "base_delay", 2.0)
             elif etype == spells.SPELL_EFFECT_ATTACK:
                 if not target_guid:
                     continue
@@ -1331,6 +1522,9 @@ class SpellsMixin:
             elif etype == spells.SPELL_EFFECT_STEAL_BENEFICIAL:
                 if target_guid:
                     await self._steal_beneficial(target_guid)
+            elif etype in (spells.SPELL_EFFECT_ENCHANT_ITEM,
+                           spells.SPELL_EFFECT_ENCHANT_ITEM_TEMPORARY):
+                await self._apply_weapon_enchant(cast, template, effect)
             elif etype == spells.SPELL_EFFECT_ENERGIZE:
                 amount = template.effect_value(index, caster_level, combo_points)
                 if amount <= 0:
@@ -1402,6 +1596,12 @@ class SpellsMixin:
                         await self._apply_aura_from_effect(
                             template, effect, index, player_guid, aura_target,
                             caster_level, combo_points, target_kind=target_kind)
+        # Poison/item procs are checked once per weapon ability, not once per
+        # effect (a finisher with damage + combo points should only roll once).
+        if (weapon_proc_slot and target_guid
+                and hasattr(self, "_roll_weapon_procs")):
+            await self._roll_weapon_procs(
+                weapon_proc_slot, weapon_proc_delay, target_guid)
 
     # ------------------------------------------------------------------
     # Area of effect (AoE)
@@ -1938,6 +2138,7 @@ class SpellsMixin:
         target_guid = pending["target_guid"]
         cast = spells.SpellCast(self.player_guid, pending["spell_id"], target_guid)
         cast.template = template
+        cast.item_guid = int(pending.get("item_guid") or 0)
         dest = pending.get("dest")
         if dest is not None:
             cast.x, cast.y, cast.z = (float(dest[0]), float(dest[1]),
@@ -2101,6 +2302,36 @@ class SpellsMixin:
                 await self._refresh_player_auras()
                 self.log.debug(f"Cancelled aura {spell_id}")
                 return
+
+    async def handle_cancel_temp_enchantment(self, data: bytes):
+        """``CMSG_CANCEL_TEMP_ENCHANTMENT``: clear a poison/stone."""
+        slot = 15
+        if len(data) >= 4:
+            requested = struct.unpack_from("<I", data, 0)[0]
+            if int(requested) in (15, 16):
+                slot = int(requested)
+        combat = self._get_combat_state()
+        entry = combat.setdefault("weapon_enchants", {}).pop(slot, None)
+        if entry is None:
+            return
+        con = sqlite3.connect(self.config.database.world_path)
+        try:
+            con.execute(
+                "UPDATE character_items SET enchantment_2 = 0"
+                " WHERE character_guid = ? AND slot = ?",
+                (int(self.player_guid or 0), int(slot)),
+            )
+            con.commit()
+        finally:
+            con.close()
+        inventory = getattr(self, "character", {}).get("inventory") or {}
+        item = inventory.get(int(slot))
+        if item is not None:
+            item["enchantment_2"] = 0
+        if hasattr(self, "broadcast_equipment_update"):
+            await self.broadcast_equipment_update()
+        if hasattr(self, "_send_system_message"):
+            await self._send_system_message("Temporary weapon enchant removed.")
 
     async def handle_set_selection(self, data: bytes):
         """``CMSG_SET_SELECTION``: the client selected a target."""

@@ -10,6 +10,7 @@ from src.common.logger import setup_logger
 from src.world.realmsocket import WorldSocket
 from src.world import character_db
 from src.world import creature
+from src.world import geometry
 from src.network.packet_log import get_packet_log
 
 
@@ -27,6 +28,19 @@ class WorldServer:
         # Ensure the character schema exists and is up to date (adds the
         # orientation column to databases created before world entry existed).
         character_db.init_character_db(config.database.world_path)
+        world_geometry = geometry.get_geometry(config,
+                                               config.database.world_path)
+        if world_geometry is None:
+            self.log.info(
+                "Client collision data not configured; LOS is clear and "
+                "creatures use straight-line movement. Run "
+                "tools/fetch_client_data.py to enable terrain/VMaps/MMaps.")
+        else:
+            self.log.info(
+                f"Client collision data: terrain={world_geometry.terrain_ready}"
+                f" vmaps={world_geometry.vmaps_ready}"
+                f" mmaps={world_geometry.navmesh_ready}"
+                f" ({world_geometry.data.root})")
 
     async def handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
         peer = writer.get_extra_info("peername")
