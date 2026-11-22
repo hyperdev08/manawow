@@ -28,6 +28,16 @@ python run_servers.py
 
 Log in with username `TEST` and password `TEST`.
 
+## Running the tests
+
+```bash
+pip install -r requirements-dev.txt
+pytest                 # unit tests + end-to-end protocol self-test
+pytest -m "not slow"   # unit tests only
+```
+
+CI runs the same suite on GitHub Actions (Python 3.11 and 3.13) for every push to `main` and every pull request.
+
 Read [DOCUMENTATION.md](DOCUMENTATION.md) for:
 - Full feature list
 - Importing the CMaNGOS 3.3.5a world database
