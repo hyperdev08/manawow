@@ -9,6 +9,7 @@ from src.common.config import Config
 from src.common.logger import setup_logger
 from src.world.realmsocket import WorldSocket
 from src.world import character_db
+from src.world import creature
 from src.network.packet_log import get_packet_log
 
 
@@ -23,6 +24,10 @@ class WorldServer:
         # Ensure the character schema exists and is up to date (adds the
         # orientation column to databases created before world entry existed).
         character_db.init_character_db(config.database.world_path)
+        # Creature/spell tables are created and migrated here as well, so a
+        # checkout that predates a schema addition (spell_duration, movement
+        # columns, ...) works without a manual re-import.
+        creature.init_creature_db(config.database.world_path)
 
     async def handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
         peer = writer.get_extra_info("peername")
