@@ -138,6 +138,9 @@ class WorldEntryMixin:
     async def handle_logout_request(self, data: bytes):
         if self.in_world:
             self.persist_position(force=True)
+            # Remove pets/guardians while the session still has its map/guid so
+            # peers receive the destroy packet.
+            await self.dismiss_all_summons()
             # Remove the character from other clients before local state is
             # cleared; despawn_for_peers() needs this session's map/guid.
             await self.despawn_for_peers()
@@ -232,6 +235,10 @@ class WorldEntryMixin:
         self._repop_pending = False
         if not self.in_world or not self.character:
             return
+
+        # Pets do not survive a death release/map transfer; remove them before
+        # the world is rebuilt so the stale coordinates are not re-sent.
+        await self.dismiss_all_summons()
 
         # Leaving the death state before re-sending the world keeps the combat
         # tick from immediately killing the player again.
@@ -356,6 +363,9 @@ class WorldEntryMixin:
             CREATURE_VISIBILITY_RADIUS,
         )
         current = {int(row["guid"]): row for row in spawns}
+        # Summons are session-local and never appear in the spatial query, so
+        # carry them across rescans instead of destroying them as "left range".
+        current.update(getattr(self, "_summoned_creatures", {}))
         previous = self._visible_creatures
 
         newly_visible = [row for guid, row in current.items() if guid not in previous]

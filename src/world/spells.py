@@ -66,10 +66,14 @@ SPELL_EFFECT_APPLY_AURA = 6
 SPELL_EFFECT_HEALTH_LEECH = 9
 SPELL_EFFECT_HEAL = 10
 SPELL_EFFECT_WEAPON_DAMAGE_NOSCHOOL = 17
+SPELL_EFFECT_SUMMON = 28
 SPELL_EFFECT_WEAPON_DAMAGE = 58
+SPELL_EFFECT_SUMMON_PET = 56
 SPELL_EFFECT_TRIGGER_SPELL = 64
+SPELL_EFFECT_SUMMON_OBJECT_WILD = 76
 SPELL_EFFECT_ATTACK = 78
 SPELL_EFFECT_ADD_COMBO_POINTS = 80
+SPELL_EFFECT_SUMMON_OBJECT_SLOT1 = 104
 SPELL_EFFECT_HEAL_MAX_HEALTH = 120
 SPELL_EFFECT_NORMALIZED_WEAPON_DMG = 121
 
@@ -118,6 +122,8 @@ SPELL_ATTR_NO_TARGETS = 0x00000001
 SPELL_ATTR_NO_COOLDOWN = 0x00000004
 SPELL_ATTR_NO_MANA = 0x00000008
 SPELL_ATTR_NO_REAGENTS = 0x00000010
+# ``SPELL_ATTR_TOTEM``: the spell drops a stationary totem (shaman totems).
+SPELL_ATTR_TOTEM = 0x00010000
 SPELL_ATTR_NO_INTERRUPT = 0x00000020
 
 # ``SpellAttributesEx`` bits (3.3.5a SpellDefines.h).  A spell that carries one
@@ -238,6 +244,9 @@ class SpellTemplate:
         self.category_recovery = int(_row_get(row, "category_recovery_time", 0))
         self.start_recovery_time = int(_row_get(row, "start_recovery_time", 0))
         self.range_index = int(_row_get(row, "range_index", 0))
+        # ``DurationIndex`` points into ``SpellDuration.dbc``.  Summoning reads
+        # it to decide whether a summon is permanent (index 21 = -1) or expires.
+        self.duration_index = int(_row_get(row, "duration_index", 0))
         self.category = int(_row_get(row, "category", 0))
         self.speed = float(_row_get(row, "speed", 0.0))
         self.power_type = int(_row_get(row, "power_type", 0))
@@ -291,6 +300,28 @@ class SpellTemplate:
 
     def has_effect(self, effect_type: int) -> bool:
         return any(e["effect"] == effect_type for e in self.effects)
+
+    def summon_entries(self) -> List[Tuple[int, bool]]:
+        """Return ``(creature_entry, is_pet)`` for every summon effect.
+
+        ``is_pet`` is true for ``SPELL_EFFECT_SUMMON_PET`` (warlock demons,
+        Call Pet, ...) and false for the generic ``SPELL_EFFECT_SUMMON`` used by
+        guardians such as Mirror Image or a quest summon.  A zero entry means
+        "summon the caster's stored pet" (Call Pet), which this server has no
+        storage for.
+        """
+        found = []
+        for effect in self.effects:
+            etype = int(effect["effect"])
+            if etype == SPELL_EFFECT_SUMMON_PET:
+                found.append((int(effect.get("misc_value") or 0), True))
+            elif etype == SPELL_EFFECT_SUMMON:
+                found.append((int(effect.get("misc_value") or 0), False))
+        return found
+
+    def is_totem(self) -> bool:
+        """``SPELL_ATTR_TOTEM``: summon a stationary totem, not a pet."""
+        return bool(self.attributes & SPELL_ATTR_TOTEM)
 
     def needs_combo_points(self) -> bool:
         """``NeedsComboPoints``: a finishing move consumes combo points.
@@ -484,6 +515,63 @@ def get_spell_template(path: str, spell_id: int) -> Optional[SpellTemplate]:
     if row is None:
         return None
     return SpellTemplate(row)
+
+
+# ``SpellDuration.dbc`` values that matter for summoning.  The DBC itself is
+# not part of the world dump; ``spell_duration`` is filled from
+# ``--spell-duration-dbc`` when the client files are available.  Until then the
+# common summon durations are encoded here so a timed guardian still expires.
+SUMMON_DURATION_FALLBACK_MS = {
+    0: -1,          # no duration field: permanent/script-controlled
+    18: 18000,      # 18 s (Mirror Image)
+    21: -1,         # until cancelled (warlock pets, most guardians)
+    22: 30000,      # 30 s (Force of Nature, elementals)
+}
+
+
+def get_spell_duration(path: str, duration_index: int) -> Optional[Tuple[int, int, int]]:
+    """Return ``(duration, duration_per_level, max_duration)`` for an index.
+
+    ``None`` means the index is unknown (the table is missing or has no row).
+    """
+    if not duration_index:
+        return None
+    import sqlite3
+    con = sqlite3.connect(path)
+    con.row_factory = sqlite3.Row
+    try:
+        row = con.execute(
+            "SELECT duration, duration_per_level, max_duration"
+            " FROM spell_duration WHERE id = ?", (int(duration_index),),
+        ).fetchone()
+    except sqlite3.Error:
+        row = None
+    finally:
+        con.close()
+    if row is None:
+        return None
+    return (int(row["duration"] or 0), int(row["duration_per_level"] or 0),
+            int(row["max_duration"] or 0))
+
+
+def summon_duration_ms(path: str, duration_index: int, level: int = 1) -> int:
+    """How long a summoned creature lives, in milliseconds (``-1`` permanent).
+
+    Mirrors ``Spell::CalculateDuration``: the base duration plus the
+    per-level part, capped by ``MaxDuration``.  A negative base duration means
+    "until cancelled", which is what warlock pets use.
+    """
+    index = int(duration_index or 0)
+    data = get_spell_duration(path, index)
+    if data is None:
+        return int(SUMMON_DURATION_FALLBACK_MS.get(index, -1))
+    duration, per_level, max_duration = data
+    if duration < 0:
+        return -1
+    total = duration + per_level * max(0, int(level) - 1)
+    if max_duration > 0:
+        total = min(total, max_duration)
+    return total if total > 0 else -1
 
 
 def get_creature_spells(path: str, entry: int) -> List[int]:

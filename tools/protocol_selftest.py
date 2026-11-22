@@ -861,8 +861,9 @@ async def rune_and_creature_ai_checks(temp_dir: str, world_db: str) -> None:
             )
 
         copy_rows("spell_templates",
-                  "id IN (133, 2120, 12544, 19816, 20296, 20792, 45477, 47541)")
+                  "id IN (133, 688, 2120, 12544, 19816, 20296, 20792, 45477, 47541)")
         copy_rows("spell_rune_cost", "id IN (222, 241, 301, 422)")
+        copy_rows("creature_templates", "entry = 416")
         copy_rows("creature_template_spells", "entry = 1009")
         copy_rows("creature_template_classlevelstats",
                   "level = 22 AND class = 8")
@@ -1190,9 +1191,119 @@ async def rune_and_creature_ai_checks(temp_dir: str, world_db: str) -> None:
                   "a waypoint path is selected")
 
     await idle_movement_check()
+
+    async def summon_check():
+        """Summon Imp creates an owned creature, fights, and expires."""
+        sent: list[tuple[int, bytes]] = []
+        peer_sent: list[tuple[int, bytes]] = []
+        attacks: list[tuple[int, int, int]] = []
+        damage: list[tuple[int, int, int]] = []
+
+        async def send_packet(opcode, payload):
+            sent.append((int(opcode), bytes(payload)))
+
+        async def relay(opcode, payload):
+            peer_sent.append((int(opcode), bytes(payload)))
+
+        async def noop(*args, **kwargs):
+            return None
+
+        pet = object.__new__(realmsocket.WorldSocket)
+        pet.config = sock.config
+        pet.log = sock.log
+        pet.character = {"name": "Demo", "class": 9, "race": 1, "level": 3,
+                         "map": 0, "zone": 12, "x": 0.0, "y": 0.0, "z": 0.0,
+                         "o": 0.0}
+        pet.player_guid = 0x42
+        pet.in_world = True
+        pet.send_packet = send_packet
+        pet.send_packet_to_peers = relay
+        pet._visible_creatures = {}
+        pet._creature_spawn_cache = {}
+        pet._summoned_creatures = {}
+        pet._summon_states = {}
+        pet._summon_serial = 0
+        pet._combat_state = {
+            "dead": False, "in_combat": False, "auto_attacking": False,
+            "target_guid": 0, "selected_guid": 0, "aggro": {},
+            "idle": {}, "idle_settle": {},
+        }
+        enemy = {
+            "guid": 7, "entry": 1009, "name": "Mosshide Mistweaver",
+            "x": 0.5, "y": 0.0, "z": 0.0, "o": 0.0, "dead_since": 0,
+            "combat_reach": 1.5, "min_level": 22, "max_level": 22,
+            "base_health": 1000, "hp_multiplier": 1.0,
+        }
+
+        def get_spawn(low_guid):
+            if int(low_guid) in pet._summoned_creatures:
+                return pet._summoned_creatures[int(low_guid)]
+            return enemy if int(low_guid) == 7 else None
+
+        async def attacker_update(attacker, victim, amount, **kwargs):
+            attacks.append((int(attacker), int(victim), int(amount)))
+
+        async def deal_damage(guid, amount, attacker_guid=0):
+            damage.append((int(guid), int(amount), int(attacker_guid)))
+            return False
+
+        pet._get_creature_spawn = get_spawn
+        pet._send_creature_fields = noop
+        pet._send_attacker_state_update = attacker_update
+        pet._deal_damage_to_creature = deal_damage
+
+        summon_spell = spells.get_spell_template(world_db, 688)
+        assert_eq(summon_spell.summon_entries(), [(416, True)],
+                  "Summon Imp references the imp pet")
+        assert_eq(spells.summon_duration_ms(world_db, 21, 1), -1,
+                  "warlock pets last until dismissed")
+
+        low_guid = await pet._summon_creature(416, -1, is_pet=True)
+        assert low_guid is not None and low_guid >= realmsocket.SUMMON_GUID_BASE, \
+            "summon allocates a runtime creature guid"
+        spawn = pet._summoned_creatures[low_guid]
+        values = object_update.build_creature_values(spawn)
+        assert_eq(values[F.UNIT_FIELD_SUMMONEDBY], 0x42,
+                  "summon stores its owner in UNIT_FIELD_SUMMONEDBY")
+        assert_eq(values[F.UNIT_FIELD_FLAGS], 0x00000008,
+                  "summon is player-controlled")
+        assert sent and sent[-1][0] in (
+            int(Opcodes.SMSG_UPDATE_OBJECT),
+            int(Opcodes.SMSG_COMPRESSED_UPDATE_OBJECT)), \
+            "summon sends a create object"
+        assert peer_sent and peer_sent[-1][0] == sent[-1][0], \
+            "summon create block is relayed to peers"
+
+        # Assist: the pet attacks the owner's current target.
+        pet._combat_state.update({
+            "in_combat": True, "auto_attacking": True,
+            "target_guid": creature.creature_guid(7, 1009),
+        })
+        spawn["x"], spawn["y"], spawn["z"] = 0.5, 0.0, 0.0
+        pet._summon_state(low_guid)["last_swing"] = 0.0
+        await pet._summon_tick_all(100.0)
+        assert attacks and attacks[-1][0] == creature.creature_guid(
+            low_guid, 416), "pet is the attacker in the combat log"
+        assert damage and damage[-1][0] == creature.creature_guid(7, 1009), \
+            "pet damage reaches the owner's target"
+
+        # Timed summons expire and send a destroy packet.
+        pet._summon_state(low_guid)["expires"] = 0.0
+        sent.clear()
+        await pet._summon_tick_all(101.0)
+        assert_eq(low_guid in pet._summoned_creatures, False,
+                  "expired summon is removed")
+        assert sent and sent[-1][0] == int(Opcodes.SMSG_DESTROY_OBJECT), \
+            "expiry sends SMSG_DESTROY_OBJECT"
+
+        await pet._summon_creature(416, -1)
+        await pet.dismiss_all_summons()
+        assert_eq(pet._summoned_creatures, {}, "summons can be dismissed")
+
+    await summon_check()
     print("  runes/creature AI: rune spend + death rune + resync, spell-list"
           " selection, Frostbolt cast and mana spend, DK GO rune prediction,"
-          " idle wander spline OK")
+          " idle wander spline, summon create/assist/expiry OK")
 
 
 # ----------------------------------------------------------------------

@@ -103,6 +103,22 @@ class SpellsMixin:
                 await self._cast_failed(cast_id, spell_id, reason)
                 return
 
+        # Summon spells need a real creature entry.  Call Pet (and the tame
+        # helpers) store ``0`` because the unit lives in the player's stables,
+        # which this server does not model yet.
+        for summon_entry, _is_pet in template.summon_entries():
+            if not summon_entry:
+                await self._cast_failed(cast_id, spell_id, SPELL_FAILED_BAD_TARGETS)
+                return
+            if creature.get_creature_template(
+                    self.config.database.world_path, summon_entry) is None:
+                self.log.debug(
+                    f"Summon spell {spell_id} references unknown creature "
+                    f"{summon_entry}")
+                await self._cast_failed(cast_id, spell_id,
+                                        SPELL_FAILED_SPELL_UNAVAILABLE)
+                return
+
         cost = self._spell_power_cost(template)
         if cost > int(self.character.get("power", self._max_power())):
             await self._cast_failed(cast_id, spell_id, SPELL_FAILED_NO_POWER)
@@ -441,6 +457,28 @@ class SpellsMixin:
                 triggered = int(effect["trigger_spell"])
                 if triggered:
                     await self._cast_triggered(triggered, target_guid)
+            elif etype in (spells.SPELL_EFFECT_SUMMON,
+                           spells.SPELL_EFFECT_SUMMON_PET):
+                entry = int(effect.get("misc_value") or 0)
+                if entry:
+                    duration = spells.summon_duration_ms(
+                        self.config.database.world_path,
+                        template.duration_index,
+                        caster_level,
+                    )
+                    await self._summon_creature(
+                        entry, duration,
+                        is_pet=etype == spells.SPELL_EFFECT_SUMMON_PET,
+                        stationary=template.is_totem(),
+                    )
+            elif etype in (spells.SPELL_EFFECT_SUMMON_OBJECT_WILD,
+                           spells.SPELL_EFFECT_SUMMON_OBJECT_SLOT1):
+                # Gameobjects (traps, ritual circles, chests) are not part of
+                # this server's object model.
+                self.log.debug(
+                    f"Spell {template.id} summons gameobject "
+                    f"{int(effect.get('misc_value') or 0)}; ignored"
+                )
             elif etype == spells.SPELL_EFFECT_ADD_COMBO_POINTS:
                 # ``Spell::EffectAddComboPoints``: the effect's own rolled value
                 # is the number of points added (Sinister Strike adds 1).

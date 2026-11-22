@@ -74,6 +74,12 @@ class SocketBase:
         # does not hit SQLite for every creature every 250 ms.
         self._creature_spawn_cache: dict[int, object] = {}
 
+        # Summoned pets/guardians are session-local creature rows.  They share
+        # the spawn cache so movement/health code can find them by low guid.
+        self._summoned_creatures: dict[int, dict] = {}
+        self._summon_states: dict[int, dict] = {}
+        self._summon_serial = 0
+
         # True between SMSG_NEW_WORLD (release spirit / teleport) and the
         # client's MSG_MOVE_WORLDPORT_ACK.  The world contents must not be
         # re-sent until that acknowledgement arrives.
@@ -168,6 +174,10 @@ class SocketBase:
             # Tell the other clients to remove this character before the
             # socket goes away; without it a crashed/timed-out client would
             # leave a frozen copy standing in the world.
+            try:
+                await self.dismiss_all_summons()
+            except Exception:
+                pass
             try:
                 await self.despawn_for_peers()
             except Exception:

@@ -189,6 +189,8 @@ class CreatureMovementMixin:
 
     async def _creature_idle_tick(self, low_guid: int, spawn, now: float) -> None:
         """One movement tick for a creature that is not fighting this player."""
+        if "summoned_by" in spawn.keys() and int(spawn["summoned_by"] or 0):
+            return                       # pets follow their owner in _summon_tick
         combat = self._get_combat_state()
         if int(low_guid) in combat["aggro"]:
             return

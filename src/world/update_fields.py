@@ -13,6 +13,18 @@ OBJECT_FIELD_ENTRY = 0x0003         # uint32
 OBJECT_FIELD_SCALE_X = 0x0004       # float
 
 # --- Unit ---------------------------------------------------------------
+# Relationship fields (3.3.5a ``UpdateFields.h``).  GUID fields occupy two
+# uint32 slots, which is why ``UNIT_FIELD_BYTES_0`` lands at 23:
+#   CHARM 6-7, SUMMON 8-9, CRITTER 10-11, CHARMEDBY 12-13,
+#   SUMMONEDBY 14-15, CREATEDBY 16-17, TARGET 18-19, CHANNEL_OBJECT 20-21,
+#   CHANNEL_SPELL 22, BYTES_0 23.
+UNIT_FIELD_CHARM = 6                # uint64, charmer guid
+UNIT_FIELD_SUMMON = 8               # uint64, summoned unit guid
+UNIT_FIELD_CRITTER = 10             # uint64, minipet guid
+UNIT_FIELD_CHARMEDBY = 12           # uint64, charmer of this unit
+UNIT_FIELD_SUMMONEDBY = 14          # uint64, owner of a summon/pet
+UNIT_FIELD_CREATEDBY = 16           # uint64, creator of a summon
+UNIT_FIELD_TARGET = 18              # uint64, current attack target
 UNIT_FIELD_BYTES_0 = 23             # race | class<<8 | gender<<16 | power<<24
 UNIT_FIELD_HEALTH = 24
 UNIT_FIELD_POWER1 = 25

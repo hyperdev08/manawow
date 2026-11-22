@@ -85,6 +85,9 @@ class CombatMixin:
         # 5. idle creatures wander or follow their waypoint path
         await self._creature_idle_tick_all(now)
 
+        # 5b. summoned pets/guardians follow the owner and assist in combat
+        await self._summon_tick_all(now)
+
         # 6. out-of-combat regeneration
         await self._regenerate(now)
 
@@ -113,6 +116,10 @@ class CombatMixin:
         low_guid = creature.creature_low_guid(target_guid)
         spawn = self._get_creature_spawn(low_guid)
         if spawn is None:
+            return
+        if int(low_guid) in getattr(self, "_summoned_creatures", {}):
+            # A player cannot attack their own pet; the client should never
+            # send this, but a stale selection must not kill the summon.
             return
         if int(spawn["dead_since"] or 0) > 0:
             await self.send_packet(Opcodes.SMSG_ATTACKSWING_DEADTARGET, b"")

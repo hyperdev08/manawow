@@ -77,6 +77,9 @@ class PeersMixin:
             # Also send name query response so we know the peer's name
             name_payload = login_packets.build_name_query_response(peer.character)
             await self.send_packet(Opcodes.SMSG_NAME_QUERY_RESPONSE, name_payload)
+            # Pets/guardians that already exist are session-local to their
+            # owner, so the newcomer needs their create blocks separately.
+            await peer.send_summons_to(self)
         if peers:
             self.log.info(
                 f"Sent {len(peers)} existing player(s) to '{self.character['name']}'"

@@ -373,6 +373,30 @@ def read_rune_cost_dbc(path: str) -> list[tuple[int, int, int, int, int]]:
         rows.append(tuple(int(value) for value in fields))
     return rows
 
+
+def read_spell_duration_dbc(path: str) -> list[tuple[int, int, int, int]]:
+    """Read ``SpellDuration.dbc`` (WDBC) into ``(id, duration, per_level, max)``.
+
+    The 3.3.5a file has four ``int32`` fields per record: ``Id``, the base
+    duration in milliseconds, the per-level part and the maximum duration.  A
+    negative base (usually ``-1``) means "until cancelled".
+    """
+    import struct
+
+    with open(path, "rb") as handle:
+        data = handle.read()
+    magic, count, field_count, record_size, _string_size = struct.unpack(
+        "<4sIIII", data[:20]
+    )
+    if magic != b"WDBC" or field_count != 4:
+        raise ValueError(f"{path} is not a 3.3.5a SpellDuration.dbc")
+    rows = []
+    for index in range(count):
+        offset = 20 + index * record_size
+        fields = struct.unpack("<4i", data[offset:offset + record_size])
+        rows.append(tuple(int(value) for value in fields))
+    return rows
+
 # ``item_template`` -> ``item_templates``.  Loot and equipment are useless
 # without real names, icons and weapon damage, so the whole table is imported;
 # the hand-written starter rows in character_db are re-seeded afterwards.
@@ -447,7 +471,7 @@ SPELL_TABLES = (
     "creature_model_info", "creature_template_classlevelstats",
     "creature_loot_template", "creature_equip_template",
     "creature_immunities", "creature_cooldowns", "spell_cone",
-    "spell_target_position", "spell_rune_cost",
+    "spell_target_position", "spell_rune_cost", "spell_duration",
 )
 
 
@@ -456,6 +480,16 @@ def _insert_rune_costs(con, rows) -> int:
     con.executemany(
         "INSERT OR REPLACE INTO spell_rune_cost("
         "id, blood, unholy, frost, runic_power) VALUES(?,?,?,?,?)",
+        rows,
+    )
+    return len(rows)
+
+
+def _insert_spell_durations(con, rows) -> int:
+    """Fill ``spell_duration`` from ``SpellDuration.dbc`` records."""
+    con.executemany(
+        "INSERT OR REPLACE INTO spell_duration("
+        "id, duration, duration_per_level, max_duration) VALUES(?,?,?,?)",
         rows,
     )
     return len(rows)
@@ -632,7 +666,8 @@ def _template_row(template: dict) -> tuple:
 
 def import_world(dump_path: str, db_path: str, clear: bool = True,
                  include_instances: bool = True,
-                 rune_cost_dbc: str | None = None) -> dict[str, int]:
+                 rune_cost_dbc: str | None = None,
+                 spell_duration_dbc: str | None = None) -> dict[str, int]:
     started = time.time()
     text = wotlk_dump.read_dump(dump_path)
     print(f"loaded {len(text):,} bytes from {dump_path}")
@@ -668,6 +703,8 @@ def import_world(dump_path: str, db_path: str, clear: bool = True,
     del text
 
     rune_cost_rows = read_rune_cost_dbc(rune_cost_dbc) if rune_cost_dbc else []
+    duration_rows = (read_spell_duration_dbc(spell_duration_dbc)
+                     if spell_duration_dbc else [])
 
     template_rows = [_template_row(row) for row in raw_templates]
     known_entries = {row[0] for row in template_rows}
@@ -933,6 +970,7 @@ def import_world(dump_path: str, db_path: str, clear: bool = True,
                 raw_spell_target_position,
             ),
             "spell_rune_cost": _insert_rune_costs(con, rune_cost_rows),
+            "spell_duration": _insert_spell_durations(con, duration_rows),
             "item_templates": _insert_mapped(
                 con, "item_templates", item_map, raw_item_template,
                 float_columns=ITEM_TEMPLATE_FLOATS,
@@ -979,6 +1017,7 @@ def import_world(dump_path: str, db_path: str, clear: bool = True,
         "skipped_spawn_mask": skipped_mask,
         "spells": counts["spells"],
         "rune_costs": counts["spell_rune_cost"],
+        "spell_durations": counts["spell_duration"],
         "loot_rows": counts["creature_loot_template"],
         "reference_loot_rows": counts["reference_loot_template"],
         "items": counts["item_templates"],
@@ -990,6 +1029,7 @@ def import_world(dump_path: str, db_path: str, clear: bool = True,
         f"{stats['menus']:,} gossip menus, {stats['options']:,} options, "
         f"{stats['npc_text']:,} NPC texts, {stats['spells']:,} spells, "
         f"{stats['rune_costs']:,} rune costs, "
+        f"{stats['spell_durations']:,} spell durations, "
         f"{stats['loot_rows']:,} loot rows, {stats['items']:,} item templates "
         f"in {time.time() - started:.1f}s"
     )
@@ -1034,6 +1074,8 @@ def main() -> None:
     parser.add_argument("--dump", required=True, help="CMaNGOS/TrinityCore world .sql dump")
     parser.add_argument("--db", help="target SQLite world database (default: config/config.yaml)")
     parser.add_argument("--rune-cost-dbc", help="path to the client's SpellRuneCost.dbc")
+    parser.add_argument("--spell-duration-dbc",
+                        help="path to the client's SpellDuration.dbc")
     parser.add_argument("--keep-existing", action="store_true",
                         help="do not clear the NPC tables before importing")
     args = parser.parse_args()
@@ -1048,7 +1090,8 @@ def main() -> None:
         db_path = Config.load(config_path).database.world_path
 
     import_world(args.dump, db_path, clear=not args.keep_existing,
-                 rune_cost_dbc=args.rune_cost_dbc)
+                 rune_cost_dbc=args.rune_cost_dbc,
+                 spell_duration_dbc=args.spell_duration_dbc)
     print(f"\nvisible spawns at each starting position ({os.path.abspath(db_path)}):")
     report_start_zones(db_path)
 

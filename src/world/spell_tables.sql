@@ -332,3 +332,12 @@ CREATE TABLE IF NOT EXISTS spell_rune_cost(
   frost INTEGER NOT NULL DEFAULT 0,
   runic_power INTEGER NOT NULL DEFAULT 0
 );
+
+-- SpellDuration.dbc: how long a spell's aura/summon lasts.  Duration values are
+-- milliseconds; a negative base means "until cancelled" (warlock pets use -1).
+CREATE TABLE IF NOT EXISTS spell_duration(
+  id INTEGER PRIMARY KEY,
+  duration INTEGER NOT NULL DEFAULT 0,
+  duration_per_level INTEGER NOT NULL DEFAULT 0,
+  max_duration INTEGER NOT NULL DEFAULT 0
+);

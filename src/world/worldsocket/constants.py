@@ -58,6 +58,13 @@ __all__ = [
     "IDLE_MOVE_MIN_DURATION_MS",
     "IDLE_MOVE_MAX_DURATION_MS",
     "UNIT_FLAG_DISABLE_MOVE",
+    "SUMMON_GUID_BASE",
+    "SUMMON_GUID_MAX",
+    "SUMMON_FOLLOW_DISTANCE",
+    "SUMMON_FOLLOW_STOP_DISTANCE",
+    "SUMMON_LEASH_DISTANCE",
+    "SUMMON_MOVE_MAX_MS",
+    "SUMMON_PET_SWING_INTERVAL",
     "MOVEMENT_OPCODES",
     "MOVEMENT_OPCODES_WITHOUT_GUID",
     "MOVEMENT_OPCODES_TIME_ONLY",
@@ -281,6 +288,26 @@ IDLE_MOVE_MAX_DURATION_MS = 12000
 
 # ``UNIT_FLAG_DISABLE_MOVE`` (3.3.5): rooted NPCs never wander.
 UNIT_FLAG_DISABLE_MOVE = 0x00000004
+
+
+# Summoned creatures (pets/guardians).  Runtime summons allocate spawn ids from
+# the top of the 24-bit creature guid counter; the imported world dump stops far
+# below 0xE00000, so a summon can never collide with a static spawn.
+SUMMON_GUID_BASE = 0xE00000
+SUMMON_GUID_MAX = 0xFFFFFF
+
+# A pet walks back to its owner once it is farther than this and stops at the
+# second distance.  ``SUMMON_LEASH_DISTANCE`` is also the maximum distance from
+# the owner at which the pet will still chase an enemy.
+SUMMON_FOLLOW_DISTANCE = 4.0
+SUMMON_FOLLOW_STOP_DISTANCE = 2.0
+SUMMON_LEASH_DISTANCE = 40.0
+
+# Pets swing on their own timer (``Creature::GetAttackDistance``/melee delay).
+SUMMON_PET_SWING_INTERVAL = 2.0
+
+# One spline per tick, like the creature chase AI.
+SUMMON_MOVE_MAX_MS = 1500
 
 
 # ``MSG_MOVE_*``/``CMSG_MOVE_*`` opcodes all speak MovementInfo, but with
