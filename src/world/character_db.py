@@ -406,25 +406,25 @@ def init_character_db(path: str) -> None:
 
 
 def _backfill_starter_spells(con: sqlite3.Connection) -> None:
-    """Grant starter spells to existing characters who don't have any."""
-    # Find characters with no spells
-    chars_without_spells = con.execute(
-        """SELECT c.guid, c.class FROM characters c
-           LEFT JOIN character_spells cs ON c.guid = cs.character_guid AND cs.active = 1
-           WHERE cs.character_guid IS NULL"""
-    ).fetchall()
-    for row in chars_without_spells:
-        guid = row[0]
-        char_class = row[1]
-        spells = _STARTER_SPELLS_BY_CLASS.get(int(char_class), [])
-        for spell_id in spells:
-            con.execute(
+    """Grant any missing starter spells to every character.
+
+    This used to run only for characters with an empty spellbook.  Starter
+    lists grow over time (for example Summon Imp for warlocks), and re-running
+    the insert for everyone lets an existing character pick those up without a
+    wipe.  ``INSERT OR IGNORE`` makes it a no-op for known spells.
+    """
+    rows = con.execute("SELECT guid, class FROM characters").fetchall()
+    added = 0
+    for guid, char_class in rows:
+        for spell_id in _STARTER_SPELLS_BY_CLASS.get(int(char_class), []):
+            cur = con.execute(
                 "INSERT OR IGNORE INTO character_spells(character_guid, spell, active) VALUES(?,?,1)",
-                (guid, int(spell_id)),
+                (int(guid), int(spell_id)),
             )
-    if chars_without_spells:
+            added += max(0, int(cur.rowcount or 0))
+    if added:
         con.commit()
-        print(f"Backfilled starter spells for {len(chars_without_spells)} character(s)")
+        print(f"Backfilled {added} missing starter spell(s)")
 
     _seed_starter_items(con)
     con.commit()
@@ -1381,6 +1381,7 @@ _STARTER_SPELLS_BY_CLASS = {
         6603,   # Attack
         686,    # Shadow Bolt
         687,    # Demon Skin
+        688,    # Summon Imp (level-1 warlock pet; no trainer exists here)
         81,     # Dodge
         1180,   # Daggers
         203,    # Unarmed

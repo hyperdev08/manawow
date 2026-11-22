@@ -68,6 +68,17 @@ A real 3.3.5a client can now log in, pick a character and **enter the world**:
 - Creature melee is mitigated by armor with `Unit::CalcArmorReducedDamage`
 - Death knight runes are real state: blood, blood, unholy, unholy, frost, frost, regenerated at 0.1 per second
 
+### Summoning (pets and guardians)
+- `SPELL_EFFECT_SUMMON_PET` (56, e.g. Summon Imp/Voidwalker/Succubus/Felhunter) and `SPELL_EFFECT_SUMMON` (28, guardians such as Mirror Image) create a session-local creature next to the caster
+- The summon is sent as a normal `TYPEID_UNIT` create block with `UNIT_FIELD_SUMMONEDBY`/`UNIT_FIELD_CREATEDBY` (owner guid, indices 14-17), `UNIT_FLAG_PLAYER_CONTROLLED` and the owner's faction template, so the client draws it as the player's pet
+- Create/move/destroy blocks are relayed to other players on the same map; a player who enters later receives the existing pet's create block as well
+- The pet follows its owner when farther than 4 yards, chases enemies the owner is fighting (leash 40 yards) and swings on a 2 s timer into the same `SMSG_ATTACKERSTATEUPDATE` / damage path as creature melee
+- A second summon replaces the first (warlock demons dismiss the old pet when the replacement finishes); logout and disconnect remove the pet for every client
+- Summon duration comes from `SpellDuration.dbc`: index 21 (`-1`, until dismissed) covers warlock pets, index 0 is treated as permanent, and the table has fallbacks for the common timed guardians until `--spell-duration-dbc` is imported
+- `Summon Imp` is part of the level-1 warlock starter kit, matching the real class; Call Pet (883) has no stored-pet state and is refused instead of summoning nothing
+- Summoned gameobjects (`SPELL_EFFECT_SUMMON_OBJECT_WILD` 76 / `SUMMON_OBJECT_SLOT1` 104, e.g. traps) are recognised but ignored because the server has no gameobject model
+- No pet action bar (`SMSG_PET_SPELLS`), pet commands or stables yet: the pet fights automatically and cannot be told to stay/attack a specific target
+
 ### Creature spell-list AI
 - Creatures use database spell lists during combat
 - 1200 ms tick with `Availability` rolled once when the list is assigned
@@ -134,9 +145,14 @@ The world dump can be downloaded from the [cmangos/wotlk-db](https://github.com/
 ```bash
 # Stop the worldserver first; the import replaces the demo NPC population.
 python tools/import_wotlk_db.py --dump C:\path\to\WoTLKDB.sql
+
+# Optional client DBCs that are not part of the SQL dump:
+python tools/import_wotlk_db.py --dump C:\path\to\WoTLKDB.sql \
+    --rune-cost-dbc "C:\path\to\client\DBFilesClient\SpellRuneCost.dbc" \
+    --spell-duration-dbc "C:\path\to\client\DBFilesClient\SpellDuration.dbc"
 ```
 
-The importer reads the MySQL dump dependency-free and prints how many rows it loaded plus the number of visible spawns at every race's starting point.
+The importer reads the MySQL dump dependency-free and prints how many rows it loaded plus the number of visible spawns at every race's starting point.  `SpellDuration.dbc` fills the `spell_duration` table used by summoning (warlock pets are permanent via index 21); without it the server falls back to a small built-in duration table.
 
 ### Client setup
 
@@ -191,9 +207,8 @@ Expected final line:
 Smoke tests:
 
 ```bash
-python tools/ai_tick_smoke.py      # creature AI tick
-python tools/rune_smoke.py         # death knight runes
-python tools/movement_smoke.py     # creature wander/waypoint
+python tools/protocol_selftest.py  # creature AI, runes, idle movement, summons
+python tools/summon_smoke.py       # pets/guardians against the real world DB
 ```
 
 ## Layout
@@ -214,6 +229,7 @@ wow335a-pyserver/
 │   ├── create_test_account.py
 │   ├── apply_client_settings.py  # realmlist + nameplate CVars for a client
 │   ├── protocol_selftest.py
+│   ├── summon_smoke.py
 │   └── stop_servers.py
 └── src/
     ├── auth/      # authserver + realm list
@@ -239,6 +255,7 @@ wow335a-pyserver/
         │   ├── creatures.py
         │   ├── creature_ai.py
         │   ├── creature_movement.py
+        │   ├── summons.py
         │   ├── loot.py
         │   └── inventory.py
         ├── server.py

@@ -82,7 +82,11 @@ class CreaturesMixin:
         return max(1, int(base * multiplier))
 
     def _set_creature_health(self, low_guid: int, health: int) -> None:
-        """Persist a creature's current health."""
+        """Persist a creature's current health (summons stay in memory)."""
+        summon = getattr(self, "_summoned_creatures", {}).get(int(low_guid))
+        if summon is not None:
+            summon["current_health"] = max(0, int(health))
+            return
         con = sqlite3.connect(self.config.database.world_path)
         try:
             con.execute(
@@ -94,13 +98,18 @@ class CreaturesMixin:
             con.close()
 
     def _get_creature_spawn(self, low_guid: int):
-        """Get a creature spawn row."""
+        """Get a creature spawn row (session summons first, then the DB)."""
+        summon = getattr(self, "_summoned_creatures", {}).get(int(low_guid))
+        if summon is not None:
+            return summon
         return creature.get_creature_spawn(self.config.database.world_path, low_guid)
 
     async def _deal_damage_to_creature(self, guid: int, damage: int,
                                        attacker_guid: int = 0) -> bool:
         """Apply damage to a creature. Returns True if it died."""
         low_guid = creature.creature_low_guid(guid)
+        if int(low_guid) in getattr(self, "_summoned_creatures", {}):
+            return await self._damage_summon(int(low_guid), damage, attacker_guid)
         spawn = self._get_creature_spawn(low_guid)
         if spawn is None:
             return False
@@ -127,7 +136,10 @@ class CreaturesMixin:
         return False
 
     def _aggro_creature(self, low_guid: int) -> None:
-        """Put a creature into combat with this player."""
+        """Put a creature into combat with this player (summons excluded)."""
+        if int(low_guid) in getattr(self, "_summoned_creatures", {}):
+            # A pet is driven by _summon_tick, not by the creature AI/DB state.
+            return
         combat = self._get_combat_state()
         now = time.monotonic()
         entry = combat["aggro"].get(int(low_guid))
@@ -211,6 +223,8 @@ class CreaturesMixin:
 
     async def _creature_combat_tick(self, low_guid: int, now: float) -> None:
         """One AI tick for a creature that is fighting this player."""
+        if int(low_guid) in getattr(self, "_summoned_creatures", {}):
+            return
         combat = self._get_combat_state()
         state = combat["aggro"].get(int(low_guid))
         if state is None:

@@ -14,6 +14,7 @@ CMSG_LOGOUT_REQUEST back to character selection.
 """
 from __future__ import annotations
 
+from src.protocol.opcodes import Opcodes
 from src.world.worldsocket.auth import AuthMixin
 from src.world.worldsocket.base import SocketBase
 from src.world.worldsocket.characters import CharactersMixin
@@ -31,9 +32,10 @@ from src.world.worldsocket.player_movement import PlayerMovementMixin
 from src.world.worldsocket.runes import RunesMixin
 from src.world.worldsocket.spells import SpellsMixin
 from src.world.worldsocket.stats import StatsMixin
+from src.world.worldsocket.summons import SummonsMixin
 from src.world.worldsocket.world_entry import WorldEntryMixin
 
-__all__ = ["WorldSocket", *_CONSTANT_NAMES]
+__all__ = ["WorldSocket", "Opcodes", *_CONSTANT_NAMES]
 
 
 class WorldSocket(
@@ -51,6 +53,7 @@ class WorldSocket(
     CreaturesMixin,
     CreatureAIMixin,
     CreatureMovementMixin,
+    SummonsMixin,
     LootMixin,
     InventoryMixin,
 ):

@@ -193,6 +193,15 @@ _FACTION_TEMPLATES = {
     11: 1629,   # Draenei
 }
 
+
+def faction_template_for_race(race: int) -> int:
+    """Return the ``FactionTemplate.dbc`` id the client uses for ``race``.
+
+    The 3.3.5 client dereferences the race's faction template while building a
+    player, and the same id makes a summoned unit friendly to its owner.
+    """
+    return int(_FACTION_TEMPLATES.get(int(race), 1))
+
 # Class -> power type (0 mana, 1 rage, 3 energy, 6 runic power)
 _POWER_TYPES = {1: 1, 4: 3, 6: 6}
 
@@ -387,7 +396,7 @@ def build_player_values(char: Mapping, peer: bool = False) -> Dict[int, int]:
 
     power_type = _POWER_TYPES.get(char_class, 0)
     display_id = player_display_id(char)
-    faction = _FACTION_TEMPLATES.get(race, 1)
+    faction = faction_template_for_race(race)
 
     next_xp = int(_char_get(char, "next_level_xp", 400)) or 400
 
@@ -662,7 +671,22 @@ def build_creature_values(creature: Mapping) -> Dict[int, int]:
     values[F.UNIT_FIELD_MAXPOWER1 + power_type] = max_power
     values[F.UNIT_FIELD_LEVEL] = level
     values[F.UNIT_FIELD_FACTIONTEMPLATE] = int(creature["faction"])
-    values[F.UNIT_FIELD_FLAGS] = int(creature["unit_flags"])
+    # A summon carries ``summoned_by`` (the owner's full guid).  The client
+    # draws such a unit as the player's pet/guardian, and the low bits tell
+    # every combat/pet UI who owns it.  Template flags such as the imp's
+    # 0x8000 PACIFIED bit describe the wild NPC of that entry, not the pet,
+    # so a summon uses the player-controlled flag instead.
+    summoned_by = 0
+    if "summoned_by" in creature.keys():
+        summoned_by = int(creature["summoned_by"] or 0)
+    if summoned_by:
+        values[F.UNIT_FIELD_SUMMONEDBY] = summoned_by & 0xFFFFFFFF
+        values[F.UNIT_FIELD_SUMMONEDBY + 1] = (summoned_by >> 32) & 0xFFFFFFFF
+        values[F.UNIT_FIELD_CREATEDBY] = summoned_by & 0xFFFFFFFF
+        values[F.UNIT_FIELD_CREATEDBY + 1] = (summoned_by >> 32) & 0xFFFFFFFF
+        values[F.UNIT_FIELD_FLAGS] = UNIT_FLAG_PLAYER_CONTROLLED
+    else:
+        values[F.UNIT_FIELD_FLAGS] = int(creature["unit_flags"])
     values[F.UNIT_FIELD_FLAGS_2] = int(creature["unit_flags2"])
     values[F.UNIT_FIELD_BOUNDINGRADIUS] = _float_bits(float(creature["bounding_radius"]))
     values[F.UNIT_FIELD_COMBATREACH] = _float_bits(float(creature["combat_reach"]))
