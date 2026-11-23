@@ -11,6 +11,7 @@ from src.world.realmsocket import WorldSocket
 from src.world import character_db
 from src.world import creature
 from src.world import geometry
+from src.world.world_combat import WorldCombatManager
 from src.network.packet_log import get_packet_log
 
 
@@ -20,6 +21,8 @@ class WorldServer:
         self.log = setup_logger("worldserver", config.logging.log_dir, config.logging.level, config.logging.console)
         self._server: Optional[asyncio.AbstractServer] = None
         self.sessions = []
+        # One shared aggro/threat/target/position state per engaged creature.
+        self.creature_combat = WorldCombatManager(self)
         self.packet_log = get_packet_log()
         self.packet_log.Initialize(config.logging.log_dir)
         # Creature/spell tables (including the bundled 3.3.5a starter spells)
@@ -52,6 +55,11 @@ class WorldServer:
         except Exception as e:
             self.log.exception(f"World client error: {e}")
         finally:
+            try:
+                self.creature_combat.detach_session(
+                    int(getattr(session, "player_guid", 0) or 0))
+            except Exception:
+                pass
             try:
                 if session in self.sessions:
                     self.sessions.remove(session)

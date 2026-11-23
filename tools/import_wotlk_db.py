@@ -132,6 +132,7 @@ TEMPLATE_COLUMNS = (
     "leader", "movement_info_id", "movement_type", "base_health", "flags", "visible",
     "kill_credit1", "kill_credit2", "quest_item1", "quest_item2", "quest_item3",
     "quest_item4", "quest_item5", "quest_item6", "loot_id",
+    "min_loot_gold", "max_loot_gold",
     # Combat / AI data the creature AI needs at runtime.
     "spell_list_id", "ai_name", "aggro_radius", "chase_distance",
     "speed_walk", "speed_run", "min_damage", "max_damage",
@@ -660,6 +661,8 @@ def _template_row(template: dict) -> tuple:
         int(template.get("QuestItem5") or 0),
         int(template.get("QuestItem6") or 0),
         int(template.get("LootId") or 0),
+        int(template.get("MinLootGold") or 0),
+        int(template.get("MaxLootGold") or 0),
         # Combat / AI data.
         int(template.get("SpellList") or 0),
         _text_or_empty(template.get("AIName")),

@@ -139,6 +139,9 @@ CREATE TABLE IF NOT EXISTS creature_templates(
   -- and a few event NPCs share a loot pool, so the loot template has to be
   -- looked up by this id when it is set.
   loot_id INTEGER NOT NULL DEFAULT 0,
+  -- CMaNGOS creature_template.MinLootGold / MaxLootGold.
+  min_loot_gold INTEGER NOT NULL DEFAULT 0,
+  max_loot_gold INTEGER NOT NULL DEFAULT 0,
   -- Display
   display_id INTEGER NOT NULL DEFAULT 0,
   -- Spell list
@@ -176,7 +179,9 @@ CREATE TABLE IF NOT EXISTS creature_spawns(
   -- Respawn
   dead_since INTEGER NOT NULL DEFAULT 0,
   -- Loot (JSON: {"items": [[item_entry, count], ...], "money": copper})
-  loot_json TEXT NOT NULL DEFAULT ''
+  loot_json TEXT NOT NULL DEFAULT '',
+  -- Player guid with loot rights (0 = legacy/free loot).
+  loot_owner INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_creature_spawns_map ON creature_spawns(map);
 -- Visibility queries bound a square around the player before doing the exact
@@ -915,7 +920,7 @@ _SPAWN_SELECT = """
 SELECT s.guid, s.entry, s.map, s.zone, s.x, s.y, s.z, s.o,
        s.display_id AS spawn_display_id,
        s.current_health, s.current_power, s.combat_state,
-       s.target_guid, s.dead_since, s.loot_json,
+       s.target_guid, s.dead_since, s.loot_json, s.loot_owner,
        s.movement_type AS spawn_movement_type, s.spawndist,
        t.name, t.subname, t.gossip_menu_id, t.min_level, t.max_level,
        t.faction, t.npc_flags, t.unit_flags, t.unit_flags2, t.unit_class,
@@ -925,6 +930,7 @@ SELECT s.guid, s.entry, s.map, s.zone, s.x, s.y, s.z, s.o,
        t.movement_info_id, t.bounding_radius, t.combat_reach, t.base_health,
        t.movement_type AS template_movement_type,
        t.respawn_time, t.aggro_radius, t.loot_id,
+       t.min_loot_gold, t.max_loot_gold,
        t.spell_list_id, t.ai_name, t.chase_distance,
        t.speed_walk, t.speed_run, t.min_damage, t.max_damage,
        t.attack_power, t.ranged_attack_power, t.armor,

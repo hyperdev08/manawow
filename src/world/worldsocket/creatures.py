@@ -18,13 +18,88 @@ from .constants import (
 )
 
 class CreaturesMixin:
+    # -- world-shared creature state ----------------------------------
+    def _creature_combat_manager(self):
+        server = getattr(self, "server", None)
+        return getattr(server, "creature_combat", None) if server else None
+
+    def _attach_shared_creature(self, state: dict) -> None:
+        """Attach the world state to this session's local maps."""
+        low_guid = int(state["guid"])
+        combat = self._get_combat_state()
+        combat["aggro"][low_guid] = state
+        combat.setdefault("creature_auras", {})[low_guid] = state.setdefault(
+            "auras", [])
+        combat.setdefault("creature_diminishing", {})[low_guid] = (
+            state.setdefault("diminishing", {}))
+
+    def _forget_shared_creature(self, low_guid: int) -> None:
+        combat = self._get_combat_state()
+        combat["aggro"].pop(int(low_guid), None)
+        combat.setdefault("creature_auras", {}).pop(int(low_guid), None)
+        combat.setdefault("creature_diminishing", {}).pop(
+            int(low_guid), None)
+        # Drop a stale wander destination; the next idle tick should start
+        # from the creature's authoritative spawn/home position.
+        combat.setdefault("idle", {}).pop(int(low_guid), None)
+        combat.setdefault("idle_settle", {})[int(low_guid)] = (
+            time.monotonic() + 0.5)
+
+    def _shared_creature_state(self, low_guid: int):
+        manager = self._creature_combat_manager()
+        if manager is None:
+            return None
+        return manager.get(int(low_guid))
+
+    def _creature_subscribers(self, low_guid: int) -> list:
+        """Sessions that should receive a packet about this creature."""
+        low_guid = int(low_guid)
+        if low_guid in getattr(self, "_summoned_creatures", {}):
+            return [self]
+        server = getattr(self, "server", None)
+        character = getattr(self, "character", None)
+        if server is None or character is None:
+            return [self]
+        my_map = int(character.get("map", 0))
+        result = []
+        for session in list(getattr(server, "sessions", ())):
+            if not getattr(session, "in_world", False):
+                continue
+            peer_character = getattr(session, "character", None)
+            if not peer_character or session.player_guid is None:
+                continue
+            if int(peer_character.get("map", 0)) != my_map:
+                continue
+            if session is not self and low_guid not in getattr(
+                    session, "_visible_creatures", {}):
+                continue
+            if session is self and low_guid not in getattr(
+                    self, "_visible_creatures", {}) and not getattr(
+                        self, "_summoned_creatures", {}):
+                # The acting session may still need the packet even if its
+                # visibility cache has not caught up yet.
+                result.append(session)
+                continue
+            result.append(session)
+        return result or [self]
+
+    async def _send_creature_packet(self, low_guid: int, opcode: int,
+                                    payload: bytes = b"") -> None:
+        for session in self._creature_subscribers(low_guid):
+            await session.send_packet(opcode, payload)
+
     def _creature_position(self, low_guid: int) -> tuple[float, float, float]:
         """Where a creature currently is: chase, wander or spawn position.
 
         A creature that is moving: the client animates it along the
         ``SMSG_MONSTER_MOVE`` splines we send, so the server has to remember the
-        destination it handed out or the range checks would keep failing.
+        destination it handed out or the range checks would keep failing.  An
+        engaged creature's position is world-shared, so every session sees the
+        same chase/evade position.
         """
+        shared = self._shared_creature_state(int(low_guid))
+        if shared and shared.get("pos"):
+            return tuple(shared["pos"])
         combat = self._get_combat_state()
         tracked = combat["aggro"].get(int(low_guid))
         if tracked and tracked.get("pos"):
@@ -51,12 +126,12 @@ class CreaturesMixin:
         return creature.creature_guid(int(low_guid), int(entry))
 
     async def _send_creature_fields(self, low_guid: int, fields: dict) -> None:
-        """Send one ``UPDATETYPE_VALUES`` update for a creature."""
+        """Send one ``UPDATETYPE_VALUES`` update to every viewer."""
         opcode, payload = object_update.build_values_update(
             self._creature_object_guid(int(low_guid)), F.UNIT_END, fields,
             force_uncompressed=True,
         )
-        await self.send_packet(opcode, payload)
+        await self._send_creature_packet(int(low_guid), opcode, payload)
 
     def _creature_health(self, guid: int) -> int:
         """Get the current health of a creature from the DB.
@@ -105,7 +180,8 @@ class CreaturesMixin:
         return creature.get_creature_spawn(self.config.database.world_path, low_guid)
 
     async def _deal_damage_to_creature(self, guid: int, damage: int,
-                                       attacker_guid: int = 0) -> bool:
+                                       attacker_guid: int = 0,
+                                       threat_kind: str = "melee") -> bool:
         """Apply damage to a creature. Returns True if it died."""
         low_guid = creature.creature_low_guid(guid)
         if int(low_guid) in getattr(self, "_summoned_creatures", {}):
@@ -126,7 +202,7 @@ class CreaturesMixin:
         combat["in_combat"] = True
         self._aggro_creature(low_guid)
         self._add_threat(low_guid, int(attacker_guid or self.player_guid or 0),
-                         max(1.0, float(damage)))
+                         max(1.0, float(damage)), kind=threat_kind)
         if new_health <= 0:
             await self._on_creature_killed(guid)
             return True
@@ -144,32 +220,49 @@ class CreaturesMixin:
             return
         combat = self._get_combat_state()
         now = time.monotonic()
+        spawn = self._get_creature_spawn(int(low_guid))
+        if spawn is None:
+            return
         entry = combat["aggro"].get(int(low_guid))
         if entry is None:
             # Start the fight from wherever the creature wandered to; otherwise
             # the first chase spline would teleport it back to its spawn point.
             idle = combat.setdefault("idle", {}).pop(int(low_guid), None)
             start_pos = idle.get("pos") if idle else None
-            combat["aggro"][int(low_guid)] = {
-                "last_swing": now - 1.0,
-                "chase_until": 0.0,
-                "pos": start_pos,
-                "facing": None,
-                "face_until": 0.0,
-                # Lazily built on the first AI tick: spell list, mana pool,
-                # cooldowns and the spell currently being cast.
-                "ai": None,
-                # 3.3.5-style threat bookkeeping.  There is one player per
-                # session, but the table is keyed by guid so taunt/target
-                # switching and future party support have a real state.
-                "threat": 0.0,
-                "threat_table": {int(self.player_guid or 0): 0.0},
-                "taunt_until": 0.0,
-                "fleeing": False,
-                "flee_until": 0.0,
-                "last_mana_regen": now,
-                "last_power_update": now,
-            }
+            manager = self._creature_combat_manager()
+            if manager is not None:
+                # World-shared aggro: every session gets the same dictionary,
+                # so threat, target and predicted position cannot diverge.
+                state = manager.engage(
+                    int(low_guid), spawn, int(self.player_guid or 0),
+                    start_pos=start_pos)
+                combat["aggro"][int(low_guid)] = state
+            else:
+                combat["aggro"][int(low_guid)] = {
+                    "guid": int(low_guid),
+                    "entry": int(spawn["entry"] or 0),
+                    "map": (int(spawn["map"] or 0)
+                            if "map" in spawn.keys()
+                            else int(self.character.get("map", 0) or 0)),
+                    "last_swing": now - 1.0,
+                    "chase_until": 0.0,
+                    "pos": start_pos,
+                    "facing": None,
+                    "face_until": 0.0,
+                    # Lazily built on the first AI tick: spell list, mana pool,
+                    # cooldowns and the spell currently being cast.
+                    "ai": None,
+                    # 3.3.5-style threat table, keyed by player guid.
+                    "threat": 0.0,
+                    "threat_table": {int(self.player_guid or 0): 0.0},
+                    "target_guid": int(self.player_guid or 0),
+                    "taunt_target": 0,
+                    "taunt_until": 0.0,
+                    "fleeing": False,
+                    "flee_until": 0.0,
+                    "last_mana_regen": now,
+                    "last_power_update": now,
+                }
             self._call_for_help(int(low_guid))
         con = sqlite3.connect(self.config.database.world_path)
         try:
@@ -182,9 +275,29 @@ class CreaturesMixin:
         finally:
             con.close()
 
+    def _threat_source_guid(self, source_guid: int) -> int:
+        """Attribute pet damage to the pet's owner, not the pet guid."""
+        source_guid = int(source_guid or 0)
+        if source_guid and self._is_player_guid(source_guid):
+            return int(self.player_guid or source_guid)
+        if source_guid and hasattr(self, "_is_peer_player_guid") \
+                and self._is_peer_player_guid(source_guid):
+            return source_guid
+        low = creature.creature_low_guid(source_guid) if source_guid else 0
+        summon = getattr(self, "_summoned_creatures", {}).get(low)
+        if summon is not None:
+            return int(summon.get("summoned_by")
+                       or self.player_guid or 0)
+        return int(self.player_guid or 0)
+
     def _add_threat(self, low_guid: int, source_guid: int,
-                    amount: float) -> None:
+                    amount: float, kind: str = "melee") -> None:
         """Add threat to a creature's table (``ThreatManager::AddThreat``)."""
+        source_guid = self._threat_source_guid(source_guid)
+        manager = self._creature_combat_manager()
+        if manager is not None and manager.is_engaged(int(low_guid)):
+            manager.add_threat(int(low_guid), source_guid, amount, kind=kind)
+            return
         state = self._get_combat_state().get("aggro", {}).get(int(low_guid))
         if state is None:
             return
@@ -193,6 +306,7 @@ class CreaturesMixin:
         table[key] = max(0.0, float(table.get(key, 0.0)) + float(amount))
         state["threat"] = max(float(state.get("threat", 0.0)),
                               float(table[key]))
+        state["target_guid"] = int(self.player_guid or 0)
 
     def _call_for_help(self, low_guid: int) -> None:
         """Nearby same-faction creatures join a fight (social aggro)."""
@@ -236,9 +350,21 @@ class CreaturesMixin:
         spawn = self._get_creature_spawn(low_guid)
         if spawn is None:
             return
+        manager = self._creature_combat_manager()
+        shared = manager.get(low_guid) if manager is not None else None
+        tagger_guid = int(
+            (shared or {}).get("tagger_guid")
+            or (shared or {}).get("target_guid")
+            or self.player_guid or 0)
+        tagger = (manager.session_for(tagger_guid)
+                  if manager is not None else None)
+        if tagger is None or not getattr(tagger, "in_world", False):
+            tagger = self
+            tagger_guid = int(self.player_guid or 0)
         entry = int(spawn["entry"])
         level = max(1, int(spawn["min_level"])) if "min_level" in spawn.keys() else 1
-        player_level = int(self.character.get("level", 1))
+        player_level = int(tagger.character.get("level", 1)) \
+            if tagger.character else int(self.character.get("level", 1))
         base_xp = level * 5 + 45
         if player_level >= level + 5:
             xp = 0
@@ -251,14 +377,15 @@ class CreaturesMixin:
         # and a few event NPCs) share another creature's loot table.
         loot_id = int(spawn["loot_id"] or 0) if "loot_id" in spawn.keys() else 0
         loot_items = self._generate_loot(entry, loot_id or entry)
-        loot_money = self._loot_money(entry, level)
+        loot_money = self._loot_money(spawn)
         loot_json = json.dumps({"items": loot_items, "money": loot_money})
         con = sqlite3.connect(self.config.database.world_path)
         try:
             con.execute(
                 "UPDATE creature_spawns SET current_health = 0, dead_since = ?, "
-                "combat_state = 3, target_guid = 0, loot_json = ? WHERE guid = ?",
-                (int(time.time()), loot_json, low_guid),
+                "combat_state = 3, target_guid = 0, loot_json = ?, "
+                "loot_owner = ? WHERE guid = ?",
+                (int(time.time()), loot_json, int(tagger_guid), low_guid),
             )
             con.commit()
         finally:
@@ -272,6 +399,9 @@ class CreaturesMixin:
         combat["aggro"].pop(low_guid, None)
         if hasattr(self, "_clear_creature_auras"):
             self._clear_creature_auras(low_guid)
+        if manager is not None:
+            manager.forget(low_guid)
+            manager.forget_idle(low_guid)
         if hasattr(self, "_sync_creature_flags"):
             await self._sync_creature_flags(int(low_guid))
         combat.setdefault("idle", {}).pop(low_guid, None)
@@ -282,8 +412,10 @@ class CreaturesMixin:
             F.UNIT_DYNAMIC_FLAGS: 1,      # UNIT_DYNFLAG_LOOTABLE
         })
         if xp > 0:
-            await self._award_xp(xp, guid)
-        self.log.info(f"Creature {entry} ({low_guid}) killed, awarded {xp} XP")
+            await tagger._award_xp(xp, guid)
+        self.log.info(
+            f"Creature {entry} ({low_guid}) killed by {tagger_guid}, "
+            f"awarded {xp} XP")
 
     async def _creature_combat_tick(self, low_guid: int, now: float) -> None:
         """One AI tick for a creature that is fighting this player."""
@@ -293,9 +425,20 @@ class CreaturesMixin:
         state = combat["aggro"].get(int(low_guid))
         if state is None:
             return
+        # The current threat target's session is the single AI driver.  Other
+        # sessions keep the shared aggro entry for the combat icon/visibility,
+        # but must not run a second copy of the creature's AI.
+        manager = self._creature_combat_manager()
+        if manager is not None and manager.is_engaged(int(low_guid)):
+            target_guid = int(state.get("target_guid") or 0)
+            if not target_guid or target_guid != int(self.player_guid or 0):
+                return
         spawn = self._get_creature_spawn(int(low_guid))
         if spawn is None or int(spawn["dead_since"] or 0) > 0:
-            combat["aggro"].pop(int(low_guid), None)
+            if manager is not None:
+                manager.forget(int(low_guid))
+            else:
+                combat["aggro"].pop(int(low_guid), None)
             return
 
         # Low-health humanoids flee instead of fighting to the death
@@ -489,7 +632,8 @@ class CreaturesMixin:
                         await self._deal_damage_to_creature(
                             self._creature_object_guid(
                                 int(low_guid), int(spawn["entry"])),
-                            thorns, self.player_guid)
+                            thorns, self.player_guid,
+                            threat_kind="spell")
                         await self._send_spell_damage_log(
                             self._creature_object_guid(
                                 int(low_guid), int(spawn["entry"])),
@@ -539,8 +683,8 @@ class CreaturesMixin:
         state["chase_until"] = now + duration_ms / 1000.0
         facing = math.atan2(dest[1] - here[1], dest[0] - here[0])
         state["facing"] = facing
-        await self.send_packet(
-            Opcodes.SMSG_MONSTER_MOVE,
+        await self._send_creature_packet(
+            int(low_guid), Opcodes.SMSG_MONSTER_MOVE,
             object_update.build_monster_move_path(
                 self._creature_object_guid(int(low_guid), int(spawn["entry"])),
                 here[0], here[1], here[2], facing,
@@ -586,8 +730,8 @@ class CreaturesMixin:
         state["chase_until"] = now + duration_ms / 1000.0
         facing = math.atan2(dest[1] - here[1], dest[0] - here[0])
         state["facing"] = facing
-        await self.send_packet(
-            Opcodes.SMSG_MONSTER_MOVE,
+        await self._send_creature_packet(
+            int(low_guid), Opcodes.SMSG_MONSTER_MOVE,
             object_update.build_monster_move_path(
                 self._creature_object_guid(int(low_guid), int(spawn["entry"])),
                 here[0], here[1], here[2], facing,
@@ -600,9 +744,14 @@ class CreaturesMixin:
     async def _reset_creature(self, low_guid: int) -> None:
         """Leave combat, walk the creature home and heal it back up."""
         combat = self._get_combat_state()
+        here = self._creature_position(int(low_guid))
         state = combat["aggro"].pop(int(low_guid), None)
+        manager = self._creature_combat_manager()
         if hasattr(self, "_clear_creature_auras"):
             self._clear_creature_auras(int(low_guid))
+        if manager is not None:
+            manager.forget(int(low_guid))
+            manager.forget_idle(int(low_guid))
         if hasattr(self, "_sync_creature_flags"):
             await self._sync_creature_flags(int(low_guid))
         spawn = self._get_creature_spawn(int(low_guid))
@@ -622,7 +771,6 @@ class CreaturesMixin:
             self._set_creature_power(int(low_guid), ai["mana"])
             await self._send_creature_power(int(low_guid), ai)
         home = (float(spawn["x"]), float(spawn["y"]), float(spawn["z"]))
-        here = self._creature_position(int(low_guid))
         con = sqlite3.connect(self.config.database.world_path)
         try:
             con.execute(
@@ -652,8 +800,8 @@ class CreaturesMixin:
             duration_ms = max(250, int(distance / 7.0 * 1000))
             duration_ms = min(duration_ms, 6000)
             settle_until = time.monotonic() + duration_ms / 1000.0
-            await self.send_packet(
-                Opcodes.SMSG_MONSTER_MOVE,
+            await self._send_creature_packet(
+                int(low_guid), Opcodes.SMSG_MONSTER_MOVE,
                 object_update.build_monster_move_path(
                     self._creature_object_guid(int(low_guid), int(spawn["entry"])),
                     here[0], here[1], here[2],
@@ -698,13 +846,17 @@ class CreaturesMixin:
                 con.execute(
                     "UPDATE creature_spawns SET dead_since = 0, combat_state = 0, "
                     "target_guid = 0, current_health = 0, current_power = 0, "
-                    "loot_json = '' "
+                    "loot_json = '', loot_owner = 0 "
                     "WHERE guid = ?",
                     (int(low_guid),),
                 )
                 con.commit()
             finally:
                 con.close()
+            manager = self._creature_combat_manager()
+            if manager is not None:
+                manager.forget(int(low_guid))
+                manager.forget_idle(int(low_guid))
             combat = self._get_combat_state()
             combat["aggro"].pop(int(low_guid), None)
             combat.setdefault("idle", {}).pop(int(low_guid), None)

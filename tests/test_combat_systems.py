@@ -169,7 +169,8 @@ class FakeUnit(AurasMixin, SpellsMixin, StatsMixin, CombatMixin,
     def _set_creature_health(self, low, health):
         self._spawns[int(low)]["current_health"] = max(0, int(health))
 
-    async def _deal_damage_to_creature(self, guid, damage, attacker_guid=0):
+    async def _deal_damage_to_creature(self, guid, damage, attacker_guid=0,
+                                       threat_kind="melee"):
         low = creature.creature_low_guid(guid)
         spawn = self._spawns.get(low)
         if spawn is None or int(spawn["dead_since"] or 0) > 0:
@@ -178,7 +179,7 @@ class FakeUnit(AurasMixin, SpellsMixin, StatsMixin, CombatMixin,
         spawn["current_health"] = new
         self._aggro_creature(low)
         self._add_threat(low, int(attacker_guid or self.player_guid),
-                         max(1.0, float(damage)))
+                         max(1.0, float(damage)), kind=threat_kind)
         if new <= 0:
             spawn["dead_since"] = int(time.time())
             return True
@@ -193,7 +194,7 @@ class FakeUnit(AurasMixin, SpellsMixin, StatsMixin, CombatMixin,
         amount = max(1, int(damage))
         self.character["health"] = max(0, int(self.character["health"]) - amount)
 
-    async def _heal_player(self, amount):
+    async def _heal_player(self, amount, healer_guid=None):
         current = int(self.character["health"])
         maximum = int(self.character["max_health"])
         healed = min(maximum - current, max(0, int(amount)))

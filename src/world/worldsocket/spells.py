@@ -1114,7 +1114,8 @@ class SpellsMixin:
                 if hasattr(self, "_victim_health") else 0))
             if remaining > 0:
                 died = await self._deal_damage_to_creature(
-                    target_guid, remaining, caster_guid)
+                    target_guid, remaining, caster_guid,
+                    threat_kind="spell")
         await self._send_spell_damage_log(
             target_guid, caster_guid, template.id, remaining, school or 1,
             periodic=1 if periodic else 0,
@@ -1129,7 +1130,8 @@ class SpellsMixin:
                 thorns = int(self._player_aura_mods().get("thorns", 0) or 0)
                 if thorns and not self._is_player_guid(caster_guid):
                     await self._deal_damage_to_creature(
-                        caster_guid, thorns, self.player_guid)
+                        caster_guid, thorns, self.player_guid,
+                        threat_kind="spell")
             elif kind == "creature" and hasattr(self, "_creature_aura_mods"):
                 thorns = int(self._creature_aura_mods(
                     creature.creature_low_guid(target_guid)).get("thorns", 0)
@@ -1471,7 +1473,8 @@ class SpellsMixin:
                         if target_guid and hasattr(self, "_peer_session_for_guid")
                         else None)
                 if peer is not None:
-                    healed, overheal = await peer._heal_player(amount)
+                    healed, overheal = await peer._heal_player(
+                        amount, healer_guid=player_guid)
                 else:
                     healed, overheal = await self._heal_player(amount)
                 await self._send_spell_heal_log(
@@ -1499,6 +1502,39 @@ class SpellsMixin:
                     await self._deal_spell_damage(
                         target_guid, 1 << 24, template.school or 1, template,
                         player_guid)
+            elif etype == spells.SPELL_EFFECT_THREAT:
+                if target_guid and not self._is_player_guid(target_guid):
+                    amount = template.effect_value(
+                        index, caster_level, combo_points)
+                    manager = (self._creature_combat_manager()
+                               if hasattr(self, "_creature_combat_manager")
+                               else None)
+                    if manager is not None:
+                        manager.modify_threat(
+                            creature.creature_low_guid(target_guid),
+                            player_guid, amount)
+            elif etype == spells.SPELL_EFFECT_MODIFY_THREAT_PERCENT:
+                if target_guid and not self._is_player_guid(target_guid):
+                    percent = template.effect_value(
+                        index, caster_level, combo_points)
+                    manager = (self._creature_combat_manager()
+                               if hasattr(self, "_creature_combat_manager")
+                               else None)
+                    if manager is not None:
+                        manager.modify_threat_percent(
+                            creature.creature_low_guid(target_guid),
+                            player_guid, percent)
+            elif etype == spells.SPELL_EFFECT_ATTACK_ME:
+                if target_guid and not self._is_player_guid(target_guid):
+                    manager = (self._creature_combat_manager()
+                               if hasattr(self, "_creature_combat_manager")
+                               else None)
+                    if manager is not None:
+                        self._aggro_creature(
+                            creature.creature_low_guid(target_guid))
+                        manager.taunt(
+                            creature.creature_low_guid(target_guid),
+                            player_guid, duration=3.0)
             elif etype == spells.SPELL_EFFECT_KNOCK_BACK:
                 if target_guid:
                     await self._apply_knockback(
@@ -1710,7 +1746,7 @@ class SpellsMixin:
                         if self._distance(center, peer_pos) > radius + 0.5:
                             continue
                         peer_healed, peer_overheal = await peer._heal_player(
-                            amount)
+                            amount, healer_guid=player_guid)
                         await self._send_spell_heal_log(
                             int(peer.player_guid), player_guid, template.id,
                             peer_healed, peer_overheal)
@@ -2125,7 +2161,8 @@ class SpellsMixin:
         if self._is_player_guid(target_guid):
             await self._damage_player(damage, f"spell {spell_id}")
             return False
-        died = await self._deal_damage_to_creature(target_guid, damage, caster_guid)
+        died = await self._deal_damage_to_creature(
+            target_guid, damage, caster_guid, threat_kind="spell")
         await self._send_spell_damage_log(
             target_guid, caster_guid, spell_id, damage, school or 1,
             periodic=1 if periodic else 0

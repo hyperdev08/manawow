@@ -148,6 +148,10 @@ class WorldEntryMixin:
             # Remove the character from other clients before local state is
             # cleared; despawn_for_peers() needs this session's map/guid.
             await self.despawn_for_peers()
+            if self.server is not None and getattr(
+                    self.server, "creature_combat", None) is not None:
+                self.server.creature_combat.detach_session(
+                    int(self.player_guid or 0))
             self.log.info(f"Returning '{self.account_name}' to character selection")
             self.in_world = False
             self.world_entry_complete = False

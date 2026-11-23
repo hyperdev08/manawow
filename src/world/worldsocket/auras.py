@@ -146,8 +146,15 @@ class AurasMixin:
         combat = self._get_combat_state()
         if target_kind == "player":
             return combat.setdefault("auras", [])
-        low = self._creature_low(target_guid)
-        return combat.setdefault("creature_auras", {}).setdefault(int(low), [])
+        low = int(self._creature_low(target_guid))
+        manager = (self._creature_combat_manager()
+                   if hasattr(self, "_creature_combat_manager") else None)
+        state = manager.get(low) if manager is not None else None
+        if state is not None:
+            entries = state.setdefault("auras", [])
+            combat.setdefault("creature_auras", {})[low] = entries
+            return entries
+        return combat.setdefault("creature_auras", {}).setdefault(low, [])
 
     @staticmethod
     def _creature_low(guid: int) -> int:
@@ -176,7 +183,14 @@ class AurasMixin:
         combat = self._get_combat_state()
         if target_kind == "player":
             return combat.setdefault("diminishing", {})
-        low = self._creature_low(target_guid)
+        low = int(self._creature_low(target_guid))
+        manager = (self._creature_combat_manager()
+                   if hasattr(self, "_creature_combat_manager") else None)
+        state = manager.get(low) if manager is not None else None
+        if state is not None:
+            table = state.setdefault("diminishing", {})
+            combat.setdefault("creature_diminishing", {})[low] = table
+            return table
         return combat.setdefault("creature_diminishing", {}).setdefault(low, {})
 
     def _diminishing_duration(self, target_kind: str, target_guid: int,
@@ -304,6 +318,12 @@ class AurasMixin:
                     int(peer.player_guid), caster_level, combo_points,
                     target_kind="player")
             return False
+
+        if target_kind == "creature" and template.is_harmful() \
+                and hasattr(self, "_aggro_creature"):
+            # A harmful aura is an attack even when the spell has no direct
+            # damage effect, so make sure the creature has world-shared aggro.
+            self._aggro_creature(int(self._creature_low(target_guid)))
 
         # Diminishing returns apply to every control effect, not only stuns.
         mechanic = template.cc_mechanic(effect)
@@ -450,16 +470,24 @@ class AurasMixin:
                         "player", self.player_guid, int(aura["spell_id"]))
                     await self._send_aura_update("player", self.player_guid,
                                                  aura, remove=True)
+        manager = (self._creature_combat_manager()
+                   if hasattr(self, "_creature_combat_manager") else None)
         for low, entries in list(combat.get("creature_auras", {}).items()):
+            if manager is not None and manager.is_engaged(low):
+                state = manager.get(low)
+                if state is not None and int(
+                        state.get("target_guid") or 0) != int(
+                            self.player_guid or 0):
+                    continue             # only the target session ticks
             alive = [aura for aura in entries if aura["expires"] > now]
             removed = [aura for aura in entries if aura["expires"] <= now]
             if alive:
-                combat["creature_auras"][low] = alive
-                self._normalise_aura_slots(alive)
+                entries[:] = alive       # shared list: mutate, do not replace
+                self._normalise_aura_slots(entries)
                 if removed:
                     await self._sync_creature_flags(low)
             elif entries:
-                del combat["creature_auras"][low]
+                entries.clear()
                 await self._sync_creature_flags(low)
             for aura in removed:
                 self._remove_dots_for_aura(
@@ -502,11 +530,13 @@ class AurasMixin:
 
     def _clear_creature_auras(self, low_guid: int) -> None:
         combat = self._get_combat_state()
-        entries = combat.setdefault("creature_auras", {}).pop(
-            int(low_guid), ())
+        store = combat.setdefault("creature_auras", {})
+        entries = store.pop(int(low_guid), ())
         for aura in entries or ():
             self._remove_dots_for_aura(
                 "creature", int(low_guid), int(aura["spell_id"]))
+        if entries:
+            entries.clear()              # shared list seen by all sessions
         combat.setdefault("creature_diminishing", {}).pop(int(low_guid), None)
 
     # ------------------------------------------------------------------
@@ -1010,15 +1040,22 @@ class AurasMixin:
         """Send one ``SMSG_AURA_UPDATE`` for a player or creature aura."""
         if not entry:
             return
+        low_guid = 0
         if target_kind == "player":
             target_guid = int(self.player_guid or target_guid)
         else:
-            target_guid = self._creature_low(target_guid)
+            low_guid = self._creature_low(target_guid)
+            target_guid = low_guid
             spawn = self._get_creature_spawn(target_guid)
             if spawn is not None:
                 target_guid = self._creature_object_guid(
                     target_guid, int(spawn["entry"]))
         payload = self._build_aura_packet(target_guid, entry, remove=remove)
+        if target_kind == "creature" and low_guid \
+                and hasattr(self, "_send_creature_packet"):
+            await self._send_creature_packet(
+                int(low_guid), Opcodes.SMSG_AURA_UPDATE, payload)
+            return
         await self.send_packet(Opcodes.SMSG_AURA_UPDATE, payload)
         if (target_kind == "player" and hasattr(self, "send_packet_to_peers")
                 and getattr(self, "server", None) is not None
@@ -1044,13 +1081,25 @@ class AurasMixin:
             state["move_until"] = 0.0
             state["chase_until"] = 0.0
             state["next_move"] = time.monotonic() + 3600.0
-        await self.send_packet(
-            Opcodes.SMSG_MONSTER_MOVE,
-            object_update.build_monster_move(
-                self._creature_object_guid(low, int(spawn["entry"])),
-                here[0], here[1], here[2],
-                float(spawn["o"] or 0.0),
-                here[0], here[1], here[2],
-                duration_ms=1, move_id=self._next_move_id(),
-            ),
-        )
+        if hasattr(self, "_send_creature_packet"):
+            await self._send_creature_packet(
+                low, Opcodes.SMSG_MONSTER_MOVE,
+                object_update.build_monster_move(
+                    self._creature_object_guid(low, int(spawn["entry"])),
+                    here[0], here[1], here[2],
+                    float(spawn["o"] or 0.0),
+                    here[0], here[1], here[2],
+                    duration_ms=1, move_id=self._next_move_id(),
+                ),
+            )
+        else:
+            await self.send_packet(
+                Opcodes.SMSG_MONSTER_MOVE,
+                object_update.build_monster_move(
+                    self._creature_object_guid(low, int(spawn["entry"])),
+                    here[0], here[1], here[2],
+                    float(spawn["o"] or 0.0),
+                    here[0], here[1], here[2],
+                    duration_ms=1, move_id=self._next_move_id(),
+                ),
+            )

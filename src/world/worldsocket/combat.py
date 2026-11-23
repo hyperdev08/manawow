@@ -750,7 +750,7 @@ class CombatMixin:
             self.player_guid, target_guid, damage,
             is_crit=(outcome == "crit"))
         await self._deal_damage_to_creature(
-            target_guid, damage, self.player_guid)
+            target_guid, damage, self.player_guid, threat_kind="ranged")
         if hasattr(self, "_roll_weapon_procs") \
                 and self._creature_health(target_guid) > 0:
             await self._roll_weapon_procs(

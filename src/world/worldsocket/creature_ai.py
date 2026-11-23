@@ -192,11 +192,15 @@ class CreatureAIMixin:
             F.UNIT_FIELD_POWER1 + power_type: power,
             F.UNIT_FIELD_MAXPOWER1 + power_type: max_power,
         })
-        await self.send_packet(
-            Opcodes.SMSG_POWER_UPDATE,
-            spells.pack_guid(self._creature_object_guid(int(low_guid), ai["entry"]))
-            + struct.pack("<BI", power_type, power & 0xFFFFFFFF),
-        )
+        payload = (spells.pack_guid(
+            self._creature_object_guid(int(low_guid), ai["entry"]))
+            + struct.pack("<BI", power_type, power & 0xFFFFFFFF))
+        if hasattr(self, "_send_creature_packet"):
+            await self._send_creature_packet(int(low_guid),
+                                             Opcodes.SMSG_POWER_UPDATE,
+                                             payload)
+        else:
+            await self.send_packet(Opcodes.SMSG_POWER_UPDATE, payload)
 
     @staticmethod
     def _creature_spell_cost(template, max_mana: int) -> int:
@@ -391,10 +395,14 @@ class CreatureAIMixin:
             "finish_at": now + cast_time_ms / 1000.0,
             "cost": cost,
         }
-        await self.send_packet(
-            Opcodes.SMSG_SPELL_START,
-            spells.build_spell_start(cast, caster_guid, target_guid, cast_id),
-        )
+        payload = spells.build_spell_start(
+            cast, caster_guid, target_guid, cast_id)
+        if hasattr(self, "_send_creature_packet"):
+            await self._send_creature_packet(int(low_guid),
+                                             Opcodes.SMSG_SPELL_START,
+                                             payload)
+        else:
+            await self.send_packet(Opcodes.SMSG_SPELL_START, payload)
         if cast_time_ms <= 0:
             await self._finish_creature_cast(low_guid, spawn, ai)
         return True
@@ -418,14 +426,16 @@ class CreatureAIMixin:
 
         cast_obj = spells.SpellCast(caster_guid, template.id, target_guid)
         cast_obj.template = template
-        await self.send_packet(
-            Opcodes.SMSG_SPELL_GO,
-            spells.build_spell_go(
-                cast_obj, caster_guid, target_guid, cast["cast_id"],
-                timestamp_ms=self._server_tick_ms(),
-                off_gcd=template.start_recovery_time == 0,
-            ),
+        payload = spells.build_spell_go(
+            cast_obj, caster_guid, target_guid, cast["cast_id"],
+            timestamp_ms=self._server_tick_ms(),
+            off_gcd=template.start_recovery_time == 0,
         )
+        if hasattr(self, "_send_creature_packet"):
+            await self._send_creature_packet(int(low_guid),
+                                             Opcodes.SMSG_SPELL_GO, payload)
+        else:
+            await self.send_packet(Opcodes.SMSG_SPELL_GO, payload)
         await self._apply_creature_spell_effects(
             low_guid, spawn, ai, template, target_guid)
         self.log.debug(
@@ -465,18 +475,21 @@ class CreatureAIMixin:
         caster_guid = self._creature_object_guid(int(low_guid), ai["entry"])
         cast = spells.SpellCast(caster_guid, spell_id, target_guid)
         cast.template = template
-        await self.send_packet(
-            Opcodes.SMSG_SPELL_START,
-            spells.build_spell_start(cast, caster_guid, target_guid, 0),
+        start_payload = spells.build_spell_start(
+            cast, caster_guid, target_guid, 0)
+        go_payload = spells.build_spell_go(
+            cast, caster_guid, target_guid, 0,
+            timestamp_ms=self._server_tick_ms(),
+            off_gcd=template.start_recovery_time == 0,
         )
-        await self.send_packet(
-            Opcodes.SMSG_SPELL_GO,
-            spells.build_spell_go(
-                cast, caster_guid, target_guid, 0,
-                timestamp_ms=self._server_tick_ms(),
-                off_gcd=template.start_recovery_time == 0,
-            ),
-        )
+        if hasattr(self, "_send_creature_packet"):
+            await self._send_creature_packet(
+                int(low_guid), Opcodes.SMSG_SPELL_START, start_payload)
+            await self._send_creature_packet(
+                int(low_guid), Opcodes.SMSG_SPELL_GO, go_payload)
+        else:
+            await self.send_packet(Opcodes.SMSG_SPELL_START, start_payload)
+            await self.send_packet(Opcodes.SMSG_SPELL_GO, go_payload)
         await self._apply_creature_spell_effects(
             low_guid, spawn, ai, template, target_guid)
 

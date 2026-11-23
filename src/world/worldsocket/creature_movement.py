@@ -45,8 +45,8 @@ class CreatureMovementMixin:
             return
         state["facing"] = angle
         state["face_until"] = now + 0.4
-        await self.send_packet(
-            Opcodes.SMSG_MONSTER_MOVE,
+        await self._send_creature_packet(
+            int(low_guid), Opcodes.SMSG_MONSTER_MOVE,
             object_update.build_monster_face(
                 self._creature_object_guid(int(low_guid), int(spawn["entry"])),
                 here[0], here[1], here[2], float(last), angle,
@@ -105,31 +105,39 @@ class CreatureMovementMixin:
         return "wander", []
 
     def _creature_idle_state(self, low_guid: int, spawn, now: float) -> dict:
-        """Return (and lazily build) the idle state for a visible creature."""
-        combat = self._get_combat_state()
-        idle = combat.setdefault("idle", {})
-        state = idle.get(int(low_guid))
-        if state is not None:
-            return state
-        kind, path = self._creature_movement_plan(spawn)
-        radius = float(spawn["spawndist"] or 0.0)
-        if radius <= 0.0:
-            radius = IDLE_WANDER_DEFAULT_RADIUS
-        state = {
-            "kind": kind,
-            "home": (float(spawn["x"]), float(spawn["y"]), float(spawn["z"])),
-            "pos": None,
-            "facing": float(spawn["o"] or 0.0),
-            "radius": max(0.5, radius),
-            "speed": max(0.5, float(spawn["speed_walk"] or 2.5)),
-            "next_move": now + random.uniform(0.0, 2.0),
-            "move_until": 0.0,
-            "moves_left": 1,
-            "path": path,
-            "path_index": 0,
-            "wait_until": 0.0,
-        }
-        idle[int(low_guid)] = state
+        """Return (and lazily build) the shared idle state for a creature."""
+        def build() -> dict:
+            kind, path = self._creature_movement_plan(spawn)
+            radius = float(spawn["spawndist"] or 0.0)
+            if radius <= 0.0:
+                radius = IDLE_WANDER_DEFAULT_RADIUS
+            return {
+                "kind": kind,
+                "home": (float(spawn["x"]), float(spawn["y"]),
+                         float(spawn["z"])),
+                "pos": None,
+                "facing": float(spawn["o"] or 0.0),
+                "radius": max(0.5, radius),
+                "speed": max(0.5, float(spawn["speed_walk"] or 2.5)),
+                "next_move": now + random.uniform(0.0, 2.0),
+                "move_until": 0.0,
+                "moves_left": 1,
+                "path": path,
+                "path_index": 0,
+                "wait_until": 0.0,
+            }
+
+        manager = (self._creature_combat_manager()
+                   if hasattr(self, "_creature_combat_manager") else None)
+        if manager is not None:
+            state = manager.idle_state(int(low_guid), build)
+        else:
+            idle = self._get_combat_state().setdefault("idle", {})
+            state = idle.get(int(low_guid))
+            if state is None:
+                state = build()
+                idle[int(low_guid)] = state
+        self._get_combat_state().setdefault("idle", {})[int(low_guid)] = state
         return state
 
     async def _send_creature_idle_move(self, low_guid: int, spawn, state: dict,
@@ -181,8 +189,8 @@ class CreatureMovementMixin:
         state["pos"] = (float(target[0]), float(target[1]), float(target[2]))
         state["facing"] = facing
         state["move_until"] = now + duration_ms / 1000.0
-        await self.send_packet(
-            Opcodes.SMSG_MONSTER_MOVE,
+        await self._send_creature_packet(
+            int(low_guid), Opcodes.SMSG_MONSTER_MOVE,
             object_update.build_monster_move_path(
                 self._creature_object_guid(int(low_guid), int(spawn["entry"])),
                 here[0], here[1], here[2], facing, points,
@@ -229,6 +237,13 @@ class CreatureMovementMixin:
                 return
         combat = self._get_combat_state()
         if int(low_guid) in combat["aggro"]:
+            return
+        manager = (self._creature_combat_manager()
+                   if hasattr(self, "_creature_combat_manager") else None)
+        if manager is not None and manager.is_engaged(int(low_guid)):
+            return
+        if manager is not None and not manager.claim_idle(
+                int(low_guid), int(self.player_guid or 0), now):
             return
         if int(spawn["dead_since"] or 0) > 0:
             combat["idle"].pop(int(low_guid), None)

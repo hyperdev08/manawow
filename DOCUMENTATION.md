@@ -125,7 +125,11 @@ A real 3.3.5a client can now log in, pick a character and **enter the world**:
 - `SPELL_ATTR_EX_NO_AUTOCAST_AI` (`0x00020000`) spells are skipped
 - Creature casts pay mana, observe cooldowns/categories and regenerate mana in combat; an interrupt effect cancels the cast and locks the spell school for four seconds
 - Creature spells use the same immunity/reflect/absorb/resistance path as player spells, and apply the same auras/DoTs to the player
-- A threat table records damage threat per player guid; nearby same-faction creatures are called for help when a fight starts
+- Creature aggro/threat/target/position/auras/idle state is world-shared: all sessions attach the same dictionaries, the highest-threat living player becomes the single AI driver, and damage from other players/pets is attributed to its owner
+- Threat switching uses the 110% melee / 130% ranged rules, healing generates half-effective-heal threat, threat modifiers and taunt effects (Taunt, Growl, Mocking Blow) update the shared table
+- Nearby same-faction creatures are called for help when a fight starts
+- Loot/XP goes to the first tagger (pet damage credits the owner); the corpse stores `loot_owner`, so other solo players cannot open it
+- Remaining threat gap: threat redirect (Misdirection/Tricks of the Trade) and group threat splitting
 - Low-health humanoid creatures flee for six seconds instead of fighting to the death
 - `SPELL_EFFECT_ACTIVATE_RUNE` (146) not implemented
 - Creature casts and melee respect the same facing/LOS rules; chase, flee, wander and waypoint movement use the extracted navigation mesh when a straight line is obstructed
@@ -152,7 +156,9 @@ A real 3.3.5a client can now log in, pick a character and **enter the world**:
 
 ### Loot
 - `creature_loot_template` (218,066 rows) and `reference_loot_template` (44,244 rows / 896 pools) imported from CMaNGOS
-- Loot is rolled exactly once when the creature dies, stored in `creature_spawns.loot_json`
+- Loot is rolled exactly once when the creature dies, stored in `creature_spawns.loot_json`; the first tagger is recorded in `creature_spawns.loot_owner`
+- Roll rules follow CMaNGOS: references use `mincountOrRef` multiplicities, groups shuffle explicit-chance rows and use equal-chance fallbacks, quest-only and conditional rows are skipped until quest/condition engines exist, and the window is capped at 16 slots
+- Corpse money uses the real `creature_template.MinLootGold` / `MaxLootGold` values imported from CMaNGOS (no synthetic level-based coins)
 - `CMSG_LOOT`, `CMSG_AUTOSTORE_LOOT_ITEM`, `CMSG_LOOT_MONEY`, `CMSG_LOOT_RELEASE`
 
 ### Chat + emotes

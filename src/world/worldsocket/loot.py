@@ -17,6 +17,7 @@ from src.world import update_fields as F
 
 class LootMixin:
     INVENTORY_FULL = 50
+    MAX_LOOT_ITEMS = 16
 
     async def handle_loot(self, data: bytes):
         """``CMSG_LOOT``: open a creature corpse's loot window."""
@@ -33,6 +34,13 @@ class LootMixin:
         if int(spawn["dead_since"] or 0) <= 0:
             # Not a corpse: the client still expects an (empty) answer, or its
             # loot button stays stuck in the "opening" state.
+            await self._send_loot_response(target_guid, [], 0)
+            return
+        loot_owner = (int(spawn["loot_owner"] or 0)
+                      if "loot_owner" in spawn.keys() else 0)
+        if loot_owner and loot_owner != int(self.player_guid or 0):
+            # Solo tagging rights: another player's corpse is not lootable by
+            # this session until group loot is implemented.
             await self._send_loot_response(target_guid, [], 0)
             return
         # Read the loot that was rolled once, at death.  There is deliberately
@@ -102,33 +110,46 @@ class LootMixin:
         entry when the template has no separate loot id.  References are stored
         in the CMaNGOS dump as a negative ``mincountOrRef``: the absolute value
         is the ``reference_loot_template.entry`` to process.  Group ids select
-        at most one row from a set, exactly like TrinityCore's ``LootGroup``.
+        at most one row from a set, with CMaNGOS' shuffled explicit/equal-chance
+        semantics.  Quest-only and conditional rows are skipped because this
+        server has no quest/condition engine.
         """
         con = sqlite3.connect(self.config.database.world_path)
         try:
             rows = con.execute(
                 "SELECT item, chance_or_quest_chance, group_id, "
-                "mincount_or_ref, maxcount "
+                "mincount_or_ref, maxcount, condition_id "
                 "FROM creature_loot_template WHERE entry = ?",
                 (int(loot_id or entry),),
             ).fetchall()
-            rolled: Dict[int, int] = {}
+            rolled: List[Tuple[int, int]] = []
             self._roll_loot_rows(con, rows, rolled, depth=0)
         finally:
             con.close()
-        items = self._filter_loot_items(list(rolled.items()))
-        # Merge the filter's ordering with the rolled counts.
-        counts = dict(items)
-        return [(item_entry, counts[item_entry])
-                for item_entry, _count in items[:12]]
+        return self._filter_loot_items(rolled)[:self.MAX_LOOT_ITEMS]
 
-    def _roll_loot_rows(self, con, rows, out: Dict[int, int],
+    @staticmethod
+    def _loot_row_chance(row) -> float:
+        return float(row[1] or 0.0)
+
+    @staticmethod
+    def _loot_row_condition(row) -> int:
+        return int(row[5] or 0) if len(row) > 5 else 0
+
+    def _loot_row_usable(self, row) -> bool:
+        """Skip quest-only and conditional rows (no quest/condition engine)."""
+        chance = self._loot_row_chance(row)
+        return chance >= 0.0 and self._loot_row_condition(row) == 0
+
+    def _roll_loot_rows(self, con, rows, out: List[Tuple[int, int]],
                         depth: int) -> None:
-        """Roll a list of loot rows into ``out`` (entry -> total count)."""
+        """Roll a list of loot rows into ``out`` as separate loot slots."""
         if depth > 8 or not rows:
             return
         groups: Dict[int, list] = {}
         for row in rows:
+            if not self._loot_row_usable(row):
+                continue
             group_id = int(row[2] or 0)
             if group_id == 0:
                 if self._loot_row_hits(row):
@@ -136,15 +157,9 @@ class LootMixin:
             else:
                 groups.setdefault(group_id, []).append(row)
         for group_rows in groups.values():
-            chosen = self._pick_group_row(group_rows)
+            chosen = self._pick_group_row(group_rows, out)
             if chosen is not None:
                 self._resolve_loot_row(con, chosen, out, depth)
-
-    @staticmethod
-    def _loot_row_chance(row) -> float:
-        # A negative chance marks a quest item; the magnitude is still the
-        # drop percentage and the quest flag is not simulated by this server.
-        return abs(float(row[1] or 0.0))
 
     def _loot_row_hits(self, row) -> bool:
         chance = self._loot_row_chance(row)
@@ -154,15 +169,11 @@ class LootMixin:
             return True
         return random.random() * 100.0 < chance
 
-    def _pick_group_row(self, rows):
-        """Pick at most one row from a loot group (TrinityCore semantics).
-
-        TrinityCore subtracts each entry's chance from a single 0..100 roll,
-        then falls back to a uniformly random equal-chanced entry when nothing
-        was hit.
-        """
+    def _pick_group_row(self, rows, out: List[Tuple[int, int]]):
+        """Pick at most one row from a loot group (CMaNGOS LootGroup::Roll)."""
         explicit = [row for row in rows if self._loot_row_chance(row) > 0.0]
         if explicit:
+            random.shuffle(explicit)
             roll = random.random() * 100.0
             for row in explicit:
                 chance = self._loot_row_chance(row)
@@ -171,12 +182,18 @@ class LootMixin:
                 roll -= chance
                 if roll < 0.0:
                     return row
-        equal = [row for row in rows if self._loot_row_chance(row) <= 0.0]
+        equal = [row for row in rows if self._loot_row_chance(row) == 0.0]
         if equal:
-            return random.choice(equal)
+            random.shuffle(equal)
+            existing = {int(item[0]) for item in out}
+            for row in equal:
+                item_entry = int(row[0] or 0)
+                if item_entry in existing and random.randint(0, 1):
+                    continue
+                return row
         return None
 
-    def _resolve_loot_row(self, con, row, out: Dict[int, int],
+    def _resolve_loot_row(self, con, row, out: List[Tuple[int, int]],
                           depth: int) -> None:
         item_entry = int(row[0] or 0)
         mincount_or_ref = int(row[3] or 0)
@@ -187,7 +204,7 @@ class LootMixin:
                 return
             ref_rows = con.execute(
                 "SELECT item, chance_or_quest_chance, group_id, "
-                "mincount_or_ref, maxcount "
+                "mincount_or_ref, maxcount, condition_id "
                 "FROM reference_loot_template WHERE entry = ?",
                 (reference_id,),
             ).fetchall()
@@ -200,7 +217,7 @@ class LootMixin:
             return
         mincount = max(1, mincount_or_ref)
         count = random.randint(mincount, max(mincount, maxcount))
-        out[item_entry] = out.get(item_entry, 0) + count
+        out.append((item_entry, count))
 
     def _set_loot_json(self, low_guid: int, payload: str) -> None:
         con = sqlite3.connect(self.config.database.world_path)
@@ -236,10 +253,17 @@ class LootMixin:
         self._set_loot_json(creature.creature_low_guid(target), payload)
 
     @staticmethod
-    def _loot_money(entry: int, level: int) -> int:
-        """Copper a corpse carries; ``creature_loot_template`` money rows are 0."""
-        level = max(1, int(level))
-        return int(level * level * random.uniform(0.5, 1.5))
+    def _loot_money(spawn) -> int:
+        """Copper from ``creature_template.MinLootGold``/``MaxLootGold``."""
+        min_gold = int(spawn["min_loot_gold"] or 0) \
+            if "min_loot_gold" in spawn.keys() else 0
+        max_gold = int(spawn["max_loot_gold"] or 0) \
+            if "max_loot_gold" in spawn.keys() else 0
+        if max_gold <= 0:
+            return 0
+        if max_gold <= min_gold:
+            return max_gold
+        return random.randint(min_gold, max_gold)
 
     async def _send_loot_response(self, guid: int, items: List[Tuple[int, int]],
                                   money: int) -> None:

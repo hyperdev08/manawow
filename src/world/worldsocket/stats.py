@@ -792,7 +792,8 @@ class StatsMixin:
         combat["combo_target"] = 0
         self.log.debug(f"combo points cleared (target {target_guid})")
 
-    async def _heal_player(self, amount: int) -> tuple[int, int]:
+    async def _heal_player(self, amount: int,
+                           healer_guid: int | None = None) -> tuple[int, int]:
         """Apply a heal; returns ``(effective, overheal)``."""
         current = int(self.character.get("health", self._max_health()))
         max_health = self._max_health()
@@ -800,7 +801,20 @@ class StatsMixin:
             return 0, max(0, int(amount))
         effective = min(max_health - current, max(0, int(amount)))
         await self._set_player_health(current + effective)
+        self._add_healing_threat(
+            effective, int(self.player_guid or 0),
+            int(healer_guid or self.player_guid or 0))
         return effective, int(amount) - effective
+
+    def _add_healing_threat(self, effective: int, target_guid: int,
+                            healer_guid: int) -> None:
+        """Credit half of effective healing to every mob fighting the target."""
+        manager = (self._creature_combat_manager()
+                   if hasattr(self, "_creature_combat_manager") else None)
+        if manager is None or effective <= 0:
+            return
+        manager.healing_threat(
+            int(healer_guid or 0), int(target_guid or 0), float(effective))
 
     async def _damage_player(self, damage: int, source: str,
                              physical: bool = False) -> None:
