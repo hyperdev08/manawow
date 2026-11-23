@@ -151,7 +151,6 @@ class QuestsMixin:
             quest_id, icon = menu[0]
             quest = Q.get_quest_template(path, quest_id)
             if icon == Q.QUEST_ICON_AVAILABLE:
-                await self._auto_accept_quest(quest)
                 await self._send_quest_details(guid, quest)
             else:
                 await self._send_request_items(guid, quest, close_on_cancel=True)
@@ -229,21 +228,7 @@ class QuestsMixin:
         if quest_id in self._quest_log_map() and self._giver_has_quest(spawn, quest_id, True):
             await self._send_request_items(guid, quest, close_on_cancel=True)
         elif self._giver_has_quest(spawn, quest_id, False):
-            await self._auto_accept_quest(quest)
             await self._send_quest_details(guid, quest)
-
-    async def _auto_accept_quest(self, quest) -> None:
-        """``Quest::IsAutoAccept``: add the quest before showing its details.
-
-        TrinityCore (``Player::SendPreparedQuest`` and
-        ``HandleQuestgiverQueryQuestOpcode``) adds auto-accept quests on
-        the server; the client's Accept button then only closes the window.
-        """
-        if quest is None or not Q.is_auto_accept(quest):
-            return
-        if int(quest["entry"]) in self._quest_log_map():
-            return
-        await self._accept_quest(quest)
 
     async def handle_quest_query(self, data: bytes):
         """``CMSG_QUEST_QUERY``: the client caches quest text and objectives."""
@@ -289,10 +274,7 @@ class QuestsMixin:
         if spawn is None or quest is None or not self._giver_has_quest(spawn, quest_id, False):
             await self.send_packet(Opcodes.SMSG_GOSSIP_COMPLETE, b"")
             return
-        if not (Q.is_auto_accept(quest) and quest_id in self._quest_log_map()):
-            # An auto-accept quest was already added when its details were
-            # shown; accepting it again is not an error.
-            await self._accept_quest(quest)
+        await self._accept_quest(quest)
         await self.send_packet(Opcodes.SMSG_GOSSIP_COMPLETE, b"")
         await self.send_packet(
             Opcodes.SMSG_QUESTGIVER_STATUS,

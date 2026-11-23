@@ -442,33 +442,27 @@ def _make_auto_accept(path, quest_id):
     Q.clear_cache()
 
 
-def test_auto_accept_quest_is_added_when_details_open(world_db):
-    """Northshire quests carry QUEST_FLAGS_AUTO_ACCEPT: the client's Accept
-    button only closes the window, so the server must add the quest itself."""
+def test_auto_accept_flag_is_stripped_and_quest_waits_for_accept(world_db):
+    """CMaNGOS marks starting-zone quests auto-accept, but no 3.3.5a quest
+    was; the flag must not reach the client and Accept must add the quest."""
     _make_auto_accept(world_db, 33)
     session = FakeSession(world_db)
     _run(session.handle_questgiver_query_quest(
         struct.pack("<QIB", session.giver_guid, 33, 0)))
+    assert 33 not in session._quest_log, "only Accept adds the quest"
+    details = session.last(Opcodes.SMSG_QUESTGIVER_QUEST_DETAILS)
+    pos = 20
+    for _ in range(3):                         # title, details, objectives
+        _text, pos = _cstr(details, pos)
+    flags = struct.unpack_from("<I", details, pos + 1)[0]
+    assert not flags & Q.QUEST_FLAGS_AUTO_ACCEPT
+
+    quest = Q.get_quest_template(world_db, 33)
+    assert not Q.client_quest_flags(quest) & Q.QUEST_FLAGS_AUTO_ACCEPT
+
+    _accept(session, 33)
     assert 33 in session._quest_log
     assert session.fields[Q.PLAYER_QUEST_LOG_1_1] == 33
-    ops = session.opcodes()
-    assert int(Opcodes.SMSG_QUESTGIVER_QUEST_DETAILS) in ops
-    assert 33 in Q.load_quest_log(world_db, 42), "persisted"
-
-    # A client that still sends ACCEPT_QUEST gets no "already on" error.
-    session.sent.clear()
-    _accept(session, 33)
-    assert int(Opcodes.SMSG_QUESTGIVER_QUEST_INVALID) not in session.opcodes()
-    assert int(Opcodes.SMSG_GOSSIP_COMPLETE) in session.opcodes()
-
-
-def test_auto_accept_single_quest_hello_adds_quest(world_db):
-    _make_auto_accept(world_db, 783)
-    session = FakeSession(world_db)
-    session._quest_rewarded.add(33)           # leave 783 as the only offer
-    _run(session.handle_questgiver_hello(struct.pack("<Q", session.giver_guid)))
-    assert 783 in session._quest_log
-    assert int(Opcodes.SMSG_QUESTGIVER_QUEST_DETAILS) in session.opcodes()
 
 
 def test_normal_quest_waits_for_accept(world_db):

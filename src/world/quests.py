@@ -73,8 +73,11 @@ QUEST_ICON_ACTIVE = 4
 # QuestFlags / SpecialFlags bits used here.
 QUEST_FLAGS_HIDDEN_REWARDS = 0x00000200
 QUEST_FLAGS_AUTO_COMPLETE = 0x00010000
-# Starting-zone quests: the server adds them when their details are shown and
-# the client's Accept button only closes the window (never sends ACCEPT_QUEST).
+# The CMaNGOS dump marks the 178 starting-zone quests with this flag, but no
+# 3.3.5a quest carried it on retail (TrinityCore QuestDef.h; auto-accept
+# arrived with Cataclysm).  The 3.3.5a client still honours it: its Accept
+# button would only close the window and never send ACCEPT_QUEST.  It is
+# therefore stripped from every packet (see ``client_quest_flags``).
 QUEST_FLAGS_AUTO_ACCEPT = 0x00080000
 QUEST_SPECIAL_FLAG_REPEATABLE = 0x01
 QUEST_SPECIAL_FLAG_EXPLORATION_OR_EVENT = 0x02
@@ -524,9 +527,9 @@ def is_repeatable(quest: Mapping) -> bool:
     return bool(_q(quest, "special_flags") & QUEST_SPECIAL_FLAG_REPEATABLE)
 
 
-def is_auto_accept(quest: Mapping) -> bool:
-    # ``Quest::IsAutoAccept``.
-    return bool(_q(quest, "quest_flags") & QUEST_FLAGS_AUTO_ACCEPT)
+def client_quest_flags(quest: Mapping) -> int:
+    """``QuestFlags`` as sent to the client: WotLK quests are never auto-accept."""
+    return _q(quest, "quest_flags") & ~QUEST_FLAGS_AUTO_ACCEPT & 0xFFFFFFFF
 
 
 def is_auto_complete(quest: Mapping) -> bool:
@@ -786,7 +789,7 @@ def _quest_list_entry(quest: Mapping, icon: int, player_level: int) -> bytes:
     return (
         struct.pack("<IIiIB", int(quest["entry"]), int(icon),
                     quest_level(quest, player_level),
-                    _q(quest, "quest_flags") & 0xFFFFFFFF, 0)
+                    client_quest_flags(quest), 0)
         + _cstring(quest.get("title"))
     )
 
@@ -802,7 +805,7 @@ def gossip_quest_items(path: str, menu: Sequence[Tuple[int, int]],
         out.append({
             "quest_id": int(quest_id), "icon": int(icon),
             "level": quest_level(quest, player_level),
-            "flags": _q(quest, "quest_flags"), "repeatable": 0,
+            "flags": client_quest_flags(quest), "repeatable": 0,
             "title": quest.get("title") or "",
         })
     return out
@@ -847,7 +850,7 @@ def build_quest_details(guid: int, quest: Mapping, player_level: int,
     out += _cstring(quest.get("details"))
     out += _cstring(quest.get("objectives"))
     out += struct.pack("<BIIB", 1 if activate_accept else 0,
-                       _q(quest, "quest_flags") & 0xFFFFFFFF,
+                       client_quest_flags(quest),
                        _q(quest, "suggested_players"), 0)
     if has_hidden_rewards(quest):
         out += struct.pack("<IIII", 0, 0, 0, 0)
@@ -887,7 +890,7 @@ def build_quest_query_response(quest: Mapping) -> bytes:
     out += struct.pack("<If", _q(quest, "rew_honor_addition"),
                        float(quest.get("rew_honor_multiplier") or 0.0))
     out += struct.pack("<IIIIIII", _q(quest, "src_item_id"),
-                       _q(quest, "quest_flags") & 0xFFFF, _q(quest, "char_title_id"),
+                       client_quest_flags(quest) & 0xFFFF, _q(quest, "char_title_id"),
                        _q(quest, "players_slain"), _q(quest, "bonus_talents"), 0, 0)
     for index in range(1, QUEST_REWARDS_COUNT + 1):
         item = 0 if hidden else _q(quest, f"rew_item_id{index}")
@@ -928,7 +931,7 @@ def build_request_items(guid: int, quest: Mapping, can_complete: bool,
     out += _cstring(quest.get("request_items_text"))
     emote = _q(quest, "complete_emote") if can_complete else _q(quest, "incomplete_emote")
     out += struct.pack("<IIIIII", 0, emote, 1 if close_on_cancel else 0,
-                       _q(quest, "quest_flags") & 0xFFFFFFFF,
+                       client_quest_flags(quest),
                        _q(quest, "suggested_players"), required_money(quest))
     out += _reward_item_block(item_objectives(quest), displays)
     out += struct.pack("<IIII", 0x03 if can_complete else 0x00, 0x04, 0x08, 0x10)
@@ -942,7 +945,7 @@ def build_offer_reward(guid: int, quest: Mapping, player_level: int,
     out += _cstring(quest.get("title"))
     out += _cstring(quest.get("offer_reward_text"))
     out += struct.pack("<BII", 1 if enable_next else 0,
-                       _q(quest, "quest_flags") & 0xFFFFFFFF,
+                       client_quest_flags(quest),
                        _q(quest, "suggested_players"))
     emotes = []
     for index in range(1, QUEST_EMOTE_COUNT + 1):
