@@ -549,7 +549,9 @@ def build_gossip_message(guid: int, gossip_id: int, text_id: int,
             return _cstring(value)
 
         out += struct.pack("<I", field("option_index"))
-        out += bytes([field("option_type") & 0xFF, field("coded") & 0xFF])
+        # The byte the client draws is the option *icon* (chat bubble, bag,
+        # book...); ``option_type`` is the server-side action.
+        out += bytes([field("icon") & 0xFF, field("coded") & 0xFF])
         out += struct.pack("<I", field("box_money") & 0xFFFFFFFF)
         out += text("text")
         out += text("box_text")

@@ -16,6 +16,7 @@ from src.world import character_db
 from src.world import creature
 from src.world import quests as Q
 from src.world import update_fields as F
+from src.world.worldsocket.inventory import InventoryMixin
 from src.world.worldsocket.quests import QuestsMixin
 
 GIVER_ENTRY = 197          # Marshal McBride
@@ -245,7 +246,7 @@ def test_status_multiple_and_add_kill_layouts():
 # Session flow
 # ---------------------------------------------------------------------------
 
-class FakeSession(QuestsMixin):
+class FakeSession(QuestsMixin, InventoryMixin):
     def __init__(self, path):
         self.config = types.SimpleNamespace(database=types.SimpleNamespace(world_path=path))
         self.player_guid = 42
@@ -296,6 +297,9 @@ class FakeSession(QuestsMixin):
 
     async def _award_xp(self, xp, victim_guid=0):
         self.xp.append(xp)
+
+    def _apply_combat_stats(self):
+        pass
 
 
 def _run(coro):

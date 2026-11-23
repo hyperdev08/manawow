@@ -68,6 +68,16 @@ def creature_entry_from_guid(guid: int) -> int:
     return (int(guid) >> CREATURE_GUID_ENTRY_SHIFT) & CREATURE_GUID_ENTRY_MASK
 
 CREATE_CREATURE_SQL = """
+CREATE TABLE IF NOT EXISTS npc_vendor(
+  entry INTEGER NOT NULL,
+  slot INTEGER NOT NULL DEFAULT 0,
+  item INTEGER NOT NULL,
+  maxcount INTEGER NOT NULL DEFAULT 0,
+  incrtime INTEGER NOT NULL DEFAULT 0,
+  extended_cost INTEGER NOT NULL DEFAULT 0,
+  condition_id INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY(entry, item, extended_cost)
+);
 CREATE TABLE IF NOT EXISTS creature_templates(
   entry INTEGER PRIMARY KEY,
   name TEXT NOT NULL DEFAULT '',

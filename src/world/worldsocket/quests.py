@@ -12,17 +12,13 @@ Hooks used by other mixins (all optional through ``hasattr``):
 """
 from __future__ import annotations
 
-import sqlite3
 import struct
 from typing import Dict, Iterable, List, Optional, Tuple
 
 from src.protocol.opcodes import Opcodes
 from src.world import character_db
 from src.world import creature
-from src.world import login_packets
-from src.world import object_update
 from src.world import quests as Q
-from src.world import update_fields as F
 
 MAX_PLAYER_LEVEL = 80
 EQUIP_ERR_INV_FULL = 50
@@ -423,7 +419,7 @@ class QuestsMixin:
         for item, count in Q.item_objectives(quest):
             await self._quest_take_items(item, count)
         if Q.required_money(quest):
-            await self._quest_modify_money(-Q.required_money(quest))
+            await self._modify_money(-Q.required_money(quest))
         for item, count in rewards:
             await self._quest_give_item(item, count)
 
@@ -439,7 +435,7 @@ class QuestsMixin:
         await self._send_quest_slot(quest_id, None, slot=int(entry["slot"]))
 
         if money:
-            await self._quest_modify_money(money)
+            await self._modify_money(money)
         await self.send_packet(
             Opcodes.SMSG_QUESTGIVER_QUEST_COMPLETE,
             Q.build_quest_complete(quest_id, xp, money,
@@ -584,44 +580,17 @@ class QuestsMixin:
         if not changes:
             await self._send_inventory_failure(EQUIP_ERR_INV_FULL)
             return False
-        inventory = self.character.setdefault("inventory", {})
-        for change in changes:
-            slot = int(change["slot"])
-            if change["created"]:
-                item = {
-                    "guid": F.ITEM_HIGH_GUID | (int(change["id"]) & 0xFFFFFFFF),
-                    "id": change["id"], "item_entry": int(item_entry),
-                    "stack_count": change["stack_count"],
-                    "durability": change["durability"],
-                    "max_durability": change["max_durability"],
-                    "slot": slot, "owner_guid": int(self.player_guid),
-                    "enchantment_1": 0,
-                }
-                inventory[slot] = item
-                await self._send_item_create_block(item)
-            else:
-                item = inventory.get(slot)
-                if item is not None:
-                    item["stack_count"] = change["stack_count"]
-                    opcode, payload = object_update.build_item_values_update(
-                        item, {F.ITEM_FIELD_STACK_COUNT: int(change["stack_count"])})
-                    await self.send_packet(opcode, payload)
-            await self.send_packet(
-                Opcodes.SMSG_ITEM_PUSH_RESULT,
-                login_packets.build_item_push_result(
-                    int(self.player_guid), int(item_entry), 255,
-                    self._internal_slot_to_client(slot),
-                    count=change["added"], total_count=change["stack_count"],
-                    received=1, created=0, send_chat_message=1,
-                ),
-            )
+        # Shows the items and re-evaluates collect objectives.
+        await self._deliver_item_changes(int(item_entry), changes)
         await self.broadcast_equipment_update()
-        await self._quest_items_changed([item_entry])
         return True
 
     async def _quest_take_items(self, item_entry: int, count: int) -> int:
-        """Remove up to ``count`` of an item from the bags; returns removed."""
-        path = self.config.database.world_path
+        """Remove up to ``count`` of an item from the bags; returns removed.
+
+        Used while handing a quest in or abandoning it, so the quest log is
+        not re-evaluated here (it would flag the quest incomplete mid turn-in).
+        """
         inventory = (self.character or {}).get("inventory", {})
         remaining = int(count)
         removed = 0
@@ -632,43 +601,8 @@ class QuestsMixin:
             if int(item["item_entry"]) != int(item_entry):
                 continue
             stack = max(1, int(item["stack_count"] or 1))
-            take = min(stack, remaining)
-            if take >= stack:
-                character_db.delete_character_item(path, int(self.player_guid), slot)
-                del inventory[slot]
-                await self.send_packet(
-                    Opcodes.SMSG_DESTROY_OBJECT,
-                    object_update.build_item_destroy_object(int(item["guid"])),
-                )
-            else:
-                con = sqlite3.connect(path)
-                try:
-                    con.execute(
-                        "UPDATE character_items SET stack_count = ? "
-                        "WHERE character_guid = ? AND slot = ?",
-                        (stack - take, int(self.player_guid), slot),
-                    )
-                    con.commit()
-                finally:
-                    con.close()
-                item["stack_count"] = stack - take
-                opcode, payload = object_update.build_item_values_update(
-                    item, {F.ITEM_FIELD_STACK_COUNT: stack - take})
-                await self.send_packet(opcode, payload)
+            take = await self._remove_item_from_slot(
+                slot, min(stack, remaining), notify_quests=False)
             remaining -= take
             removed += take
-        if removed:
-            await self.broadcast_equipment_update()
         return removed
-
-    async def _quest_modify_money(self, delta: int) -> None:
-        total = max(0, int(self.character.get("money", 0)) + int(delta))
-        self.character["money"] = total
-        con = sqlite3.connect(self.config.database.world_path)
-        try:
-            con.execute("UPDATE characters SET money = ? WHERE guid = ?",
-                        (total, int(self.player_guid)))
-            con.commit()
-        finally:
-            con.close()
-        await self._send_player_fields({F.PLAYER_FIELD_COINAGE: total & 0xFFFFFFFF})

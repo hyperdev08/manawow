@@ -6,6 +6,7 @@ import struct
 
 from src.protocol.opcodes import Opcodes
 from src.world import character_db
+from src.world import login_packets
 from src.world import object_update
 from src.world import update_fields as F
 
@@ -233,14 +234,29 @@ class InventoryMixin:
             self.log.debug(f"CMSG_DESTROYITEM: slot {slot} empty")
             await self._send_inventory_failure()
             return
+        await self._remove_item_from_slot(internal_slot, count)
+        self.log.info(f"Destroyed {count or 'all'} of item in slot {slot} for guid {self.player_guid}")
+
+    async def _remove_item_from_slot(self, internal_slot: int, count: int = 0,
+                                     notify_quests: bool = True) -> int:
+        """Remove ``count`` items (0 = the whole stack) from an inventory slot.
+
+        Persists the change and updates the client: a whole item is destroyed
+        (and every peer redraws the character, in case it was worn armour), a
+        partial stack only gets a new stack count.  Returns how many items were
+        removed (0 when the slot is empty).
+        """
+        inv = self.character.get("inventory", {})
+        item = inv.get(internal_slot)
+        if item is None:
+            return 0
         current = max(1, int(item.get("stack_count", 1)))
         if count == 0 or count >= current:
-            # Whole item (or whole stack).
             character_db.delete_character_item(
                 self.config.database.world_path, self.player_guid, internal_slot
             )
             del inv[internal_slot]
-            # Worn equipment may have been destroyed: recompute the derived
+            # Worn equipment may have been removed: recompute the derived
             # stats before the values update goes out.
             self._apply_combat_stats()
             await self.send_packet(
@@ -250,13 +266,10 @@ class InventoryMixin:
             # Clear the slot on this client and on every peer that can see the
             # character (destroying worn armour has to remove the model too).
             await self.broadcast_equipment_update()
-            if hasattr(self, "_quest_items_changed"):
+            if notify_quests and hasattr(self, "_quest_items_changed"):
                 await self._quest_items_changed([int(item["item_entry"])])
-            self.log.info(f"Destroyed item in slot {slot} for guid {self.player_guid}")
-            return
+            return current
 
-        # Partial destroy: decrement the stack and update the item object so
-        # the bag count changes immediately.
         new_count = current - int(count)
         con = sqlite3.connect(self.config.database.world_path)
         try:
@@ -273,9 +286,73 @@ class InventoryMixin:
             item, {F.ITEM_FIELD_STACK_COUNT: new_count}
         )
         await self.send_packet(opcode, payload)
-        if hasattr(self, "_quest_items_changed"):
+        if notify_quests and hasattr(self, "_quest_items_changed"):
             await self._quest_items_changed([int(item["item_entry"])])
-        self.log.info(f"Reduced stack in slot {slot} to {new_count}")
+        return int(count)
+
+    async def _deliver_item_changes(self, item_entry: int, changes) -> None:
+        """Show items stored by ``character_db.add_item_to_inventory``.
+
+        New stacks get an item create block before anything references them,
+        topped-up stacks a stack-count update, and every change the
+        "You receive item" chat line (``SMSG_ITEM_PUSH_RESULT``).
+        """
+        inventory = self.character.setdefault("inventory", {})
+        for change in changes:
+            slot = int(change["slot"])
+            if change["created"]:
+                item_guid = F.ITEM_HIGH_GUID | (int(change["id"]) & 0xFFFFFFFF)
+                item_dict = {
+                    "guid": item_guid,
+                    "id": change["id"],
+                    "item_entry": int(item_entry),
+                    "stack_count": change["stack_count"],
+                    "durability": change["durability"],
+                    "max_durability": change["max_durability"],
+                    "slot": slot,
+                    "owner_guid": int(self.player_guid),
+                    "enchantment_1": 0,
+                }
+                inventory[slot] = item_dict
+                # The client cannot show a bag item whose object does not
+                # exist, so the create block has to precede the field update
+                # that references it.
+                await self._send_item_create_block(item_dict)
+            else:
+                item_dict = inventory.get(slot)
+                if item_dict is not None:
+                    item_dict["stack_count"] = change["stack_count"]
+                    opcode, payload = object_update.build_item_values_update(
+                        item_dict,
+                        {F.ITEM_FIELD_STACK_COUNT: int(change["stack_count"])},
+                    )
+                    await self.send_packet(opcode, payload)
+            client_slot = self._internal_slot_to_client(slot)
+            await self.send_packet(
+                Opcodes.SMSG_ITEM_PUSH_RESULT,
+                login_packets.build_item_push_result(
+                    int(self.player_guid), int(item_entry), 255, client_slot,
+                    count=change["added"], total_count=change["stack_count"],
+                    received=change["added"], created=0, send_chat_message=1,
+                ),
+            )
+        # Looted, bought or rewarded items can finish a collect objective.
+        if changes and hasattr(self, "_quest_items_changed"):
+            await self._quest_items_changed([int(item_entry)])
+
+    async def _modify_money(self, delta: int) -> int:
+        """Add ``delta`` copper (negative to spend), persist it, update the client."""
+        total = max(0, min(int(self.character.get("money", 0)) + int(delta), 0x7FFFFFFF))
+        self.character["money"] = total
+        con = sqlite3.connect(self.config.database.world_path)
+        try:
+            con.execute("UPDATE characters SET money = ? WHERE guid = ?",
+                        (total, int(self.player_guid)))
+            con.commit()
+        finally:
+            con.close()
+        await self._send_player_fields({F.PLAYER_FIELD_COINAGE: total & 0xFFFFFFFF})
+        return total
 
     async def _send_item_create_block(self, item: dict) -> None:
         """Create an item object on this client only.

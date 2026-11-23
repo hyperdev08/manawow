@@ -9,6 +9,7 @@ options and NPC text.  This tool reads the canonical CMaNGOS ``WoTLKDB`` dump
 Usage::
 
     python tools/import_wotlk_db.py --dump C:\\path\\WoTLKDB.sql [--db data/world.db]
+    python tools/import_wotlk_db.py --dump WoTLKDB.sql --vendors-only
 
 ``--quests-only`` refreshes just the quest tables (``quest_template`` and the
 creature/area-trigger quest relations) of an existing database.
@@ -684,6 +685,109 @@ def _template_row(template: dict) -> tuple:
     )
 
 
+def build_vendor_rows(raw_vendor, raw_vendor_template, raw_templates) -> list[tuple]:
+    """Flatten CMaNGOS vendor data into ``npc_vendor`` rows.
+
+    A creature sells its own ``npc_vendor`` rows plus every row of the shared
+    ``npc_vendor_template`` named by ``creature_template.VendorTemplateId``
+    (CMaNGOS ``ObjectMgr::LoadVendors``).  Both are stored under the creature
+    entry so the server needs a single lookup.  Rows are
+    ``(entry, slot, item, maxcount, incrtime, extended_cost, condition_id)``.
+    """
+    by_template: dict[int, list[dict]] = {}
+    for row in raw_vendor_template:
+        by_template.setdefault(_sqlite_int(row.get("entry")), []).append(row)
+
+    out: dict[tuple[int, int, int], tuple] = {}
+
+    def add(entry: int, row: dict) -> None:
+        item = _sqlite_int(row.get("item"))
+        extended_cost = _sqlite_int(row.get("ExtendedCost"))
+        key = (entry, item, extended_cost)
+        if item <= 0 or key in out:
+            return
+        out[key] = (
+            entry,
+            _sqlite_int(row.get("slot")),
+            item,
+            _sqlite_int(row.get("maxcount")),
+            _sqlite_int(row.get("incrtime")),
+            extended_cost,
+            _sqlite_int(row.get("condition_id")),
+        )
+
+    for row in raw_vendor:
+        add(_sqlite_int(row.get("entry")), row)
+    for template in raw_templates:
+        template_id = _sqlite_int(template.get("VendorTemplateId"))
+        if template_id:
+            entry = _sqlite_int(template.get("Entry"))
+            for row in by_template.get(template_id, ()):
+                add(entry, row)
+    return sorted(out.values())
+
+
+def insert_vendor_rows(con, rows) -> int:
+    """Replace the whole ``npc_vendor`` table with ``rows``."""
+    con.execute("DELETE FROM npc_vendor")
+    con.executemany(
+        "INSERT INTO npc_vendor(entry, slot, item, maxcount, incrtime, "
+        "extended_cost, condition_id) VALUES(?,?,?,?,?,?,?)",
+        rows,
+    )
+    return len(rows)
+
+
+def import_vendors(dump_path: str, db_path: str) -> dict[str, int]:
+    """Refresh only the vendor data of an existing world database.
+
+    Fills ``npc_vendor`` and ``item_templates.buy_count`` without touching the
+    creature, spell or character tables, so a database that was imported
+    before vendors existed can be upgraded in one step.
+    """
+    import sqlite3
+
+    from src.world.character_db import init_character_db
+    from src.world.creature import init_creature_db
+
+    started = time.time()
+    text = wotlk_dump.read_dump(dump_path)
+    _, raw_templates = wotlk_dump.rows(text, "creature_template")
+    item_columns, raw_items = wotlk_dump.rows(text, "item_template")
+    _, raw_vendor = wotlk_dump.rows(text, "npc_vendor")
+    _, raw_vendor_template = wotlk_dump.rows(text, "npc_vendor_template")
+    del text
+
+    init_creature_db(db_path)
+    init_character_db(db_path)
+    rows = build_vendor_rows(raw_vendor, raw_vendor_template, raw_templates)
+    con = sqlite3.connect(db_path)
+    try:
+        vendor_items = insert_vendor_rows(con, rows)
+        # Older world databases were built from dumps that lack many 3.x items
+        # (inscription parchments, northrend goods...).  Add only the missing
+        # templates so existing, hand-seeded rows stay untouched.
+        known = {row[0] for row in con.execute("SELECT entry FROM item_templates")}
+        missing = [row for row in raw_items if _sqlite_int(row.get("entry")) not in known]
+        added_items = _insert_mapped(
+            con, "item_templates", _item_template_map(item_columns), missing,
+            float_columns=ITEM_TEMPLATE_FLOATS, text_columns=ITEM_TEMPLATE_TEXTS,
+        )
+        con.executemany(
+            "UPDATE item_templates SET buy_count = ? WHERE entry = ?",
+            [(max(1, _sqlite_int(row.get("BuyCount"))), _sqlite_int(row.get("entry")))
+             for row in raw_items],
+        )
+        con.commit()
+    finally:
+        con.close()
+    vendors = len({row[0] for row in rows})
+    print(f"imported {vendor_items:,} vendor items for {vendors:,} vendors "
+          f"and {added_items:,} missing item templates "
+          f"in {time.time() - started:.1f}s")
+    return {"vendor_items": vendor_items, "vendors": vendors, "items_added": added_items}
+
+
 def import_world(dump_path: str, db_path: str, clear: bool = True,
                  include_instances: bool = True,
                  rune_cost_dbc: str | None = None,
@@ -725,6 +829,8 @@ def import_world(dump_path: str, db_path: str, clear: bool = True,
     item_columns, raw_item_template = wotlk_dump.rows(text, "item_template")
     item_map = _item_template_map(item_columns)
     quest_tables = read_quest_tables(text)
+    _, raw_npc_vendor = wotlk_dump.rows(text, "npc_vendor")
+    _, raw_npc_vendor_template = wotlk_dump.rows(text, "npc_vendor_template")
     del text
 
     rune_cost_rows = read_rune_cost_dbc(rune_cost_dbc) if rune_cost_dbc else []
@@ -1010,6 +1116,11 @@ def import_world(dump_path: str, db_path: str, clear: bool = True,
                 float_columns=ITEM_TEMPLATE_FLOATS,
                 text_columns=ITEM_TEMPLATE_TEXTS,
             ),
+            "npc_vendor": insert_vendor_rows(
+                con,
+                build_vendor_rows(raw_npc_vendor, raw_npc_vendor_template,
+                                  raw_templates),
+            ),
         }
 
         # CMaNGOS spell_template only ships SchoolMask, while the server stores
@@ -1062,6 +1173,7 @@ def import_world(dump_path: str, db_path: str, clear: bool = True,
         "quests": counts["quest_templates"],
         "quest_starters": counts["creature_quest_starters"],
         "quest_enders": counts["creature_quest_enders"],
+        "vendor_items": counts["npc_vendor"],
     }
     print(
         f"imported {stats['templates']:,} templates, {stats['spawns']:,} spawns, "
@@ -1074,7 +1186,7 @@ def import_world(dump_path: str, db_path: str, clear: bool = True,
         f"{stats['starter_spells']:,} starter spells, "
         f"{stats['starter_actions']:,} starter actions, "
         f"{stats['loot_rows']:,} loot rows, {stats['items']:,} item templates, "
-        f"{stats['quests']:,} quests "
+        f"{stats['quests']:,} quests, {stats['vendor_items']:,} vendor items "
         f"in {time.time() - started:.1f}s"
     )
     print(
@@ -1214,6 +1326,8 @@ def main() -> None:
     parser.add_argument("--quests-only", action="store_true",
                         help="only (re)import quest_template and the quest "
                              "relation tables into an existing database")
+    parser.add_argument("--vendors-only", action="store_true",
+                        help="only refresh npc_vendor and item buy counts")
     args = parser.parse_args()
 
     db_path = args.db
@@ -1227,6 +1341,9 @@ def main() -> None:
 
     if args.quests_only:
         import_quests(args.dump, db_path)
+        return
+    if args.vendors_only:
+        import_vendors(args.dump, db_path)
         return
 
     import_world(args.dump, db_path, clear=not args.keep_existing,
