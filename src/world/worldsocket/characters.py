@@ -216,7 +216,7 @@ class CharactersMixin:
             login_packets.build_npc_text_update(text_id, row),
         )
 
-    async def _send_gossip_menu(self, guid: int, menu_id: int) -> bool:
+    async def _send_gossip_menu(self, guid: int, menu_id: int, quests=()) -> bool:
         menu = creature.get_gossip_menu(self.config.database.world_path, menu_id)
         if menu is None:
             return False
@@ -226,7 +226,7 @@ class CharactersMixin:
         await self.send_packet(
             Opcodes.SMSG_GOSSIP_MESSAGE,
             login_packets.build_gossip_message(
-                guid, menu_id, int(menu["text_id"]), options
+                guid, menu_id, int(menu["text_id"]), options, quests
             ),
         )
         return True
@@ -247,7 +247,15 @@ class CharactersMixin:
             return
 
         menu_id = int(spawn["gossip_menu_id"])
-        if menu_id and await self._send_gossip_menu(guid, menu_id):
+        quests = (self._gossip_quest_items(spawn)
+                  if hasattr(self, "_gossip_quest_items") else [])
+        if quests and not (menu_id and creature.get_gossip_options(
+                self.config.database.world_path, menu_id)):
+            # ``Player::SendPreparedGossip``: a menu without options opens the
+            # quest window (or the single quest) instead of the gossip window.
+            if await self._send_quest_menu(guid, spawn):
+                return
+        if menu_id and await self._send_gossip_menu(guid, menu_id, quests):
             self.log.info(
                 f"Opened gossip menu {menu_id} for creature "
                 f"'{spawn['name']}' ({guid})"
@@ -257,7 +265,7 @@ class CharactersMixin:
         # A gossip-flagged NPC without a menu still gets an empty window.
         await self.send_packet(
             Opcodes.SMSG_GOSSIP_MESSAGE,
-            login_packets.build_gossip_message(guid, menu_id, 0, ()),
+            login_packets.build_gossip_message(guid, menu_id, 0, (), quests),
         )
 
     async def handle_gossip_select_option(self, data: bytes):

@@ -13,6 +13,7 @@ sys.path.insert(0, root)
 from src.common.config import Config
 from src.world.character_db import init_character_db
 from src.world.creature import init_creature_db
+from src.world.quests import init_quest_db
 
 
 SQL_AUTH = """
@@ -114,6 +115,7 @@ def init_databases(cfg: Config) -> None:
 
     init_creature_db(cfg.database.world_path)
     init_character_db(cfg.database.world_path)
+    init_quest_db(cfg.database.world_path)
 
 
 def load_config() -> Config:

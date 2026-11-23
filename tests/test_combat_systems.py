@@ -709,3 +709,39 @@ async def test_spell_power_scales_direct_damage():
         await session._apply_spell_effects(cast, fireball, target)
     high = 500 - session._creature_health(target)
     assert high > low
+
+
+class _PassedLeash(Exception):
+    """Raised by the patched AI-state lookup right after the leash check."""
+
+
+@_async_test
+async def test_fled_creature_does_not_reset_while_victim_stays_near_home():
+    """A low-health humanoid that fled far from its spawn keeps fighting.
+
+    ``Creature::CanCreatureAttack`` only measures the victim's distance from
+    the spawn; the old rule also reset creatures standing 45+ yards from home,
+    which every flee ending past that point triggered.
+    """
+    session = FakeUnit()
+    session.add_creature(5, x=0.0)                # spawn / home at the origin
+    session._spawns[5]["current_health"] = 50       # 10%: already fled once
+    session._combat_state["aggro"][5] = {"fled": True, "fleeing": False}
+    session.character["x"] = 50.0                  # victim 50 yd from home
+    fled_to = (55.0, 0.0, 0.0)                     # creature 55 yd from home
+    with mock.patch.object(session, "_creature_position", lambda low: fled_to), \
+            mock.patch.object(session, "_reset_creature",
+                              mock.AsyncMock()) as reset, \
+            mock.patch.object(session, "_creature_ai_state",
+                              mock.AsyncMock(side_effect=_PassedLeash),
+                              create=True):
+        try:
+            await session._creature_combat_tick(5, time.monotonic())
+        except _PassedLeash:
+            pass
+        reset.assert_not_called()
+
+        # A victim beyond the 60-yard threat radius still leashes it home.
+        session.character["x"] = 61.0
+        await session._creature_combat_tick(5, time.monotonic())
+        reset.assert_awaited_once_with(5)

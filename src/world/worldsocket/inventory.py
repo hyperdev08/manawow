@@ -250,6 +250,8 @@ class InventoryMixin:
             # Clear the slot on this client and on every peer that can see the
             # character (destroying worn armour has to remove the model too).
             await self.broadcast_equipment_update()
+            if hasattr(self, "_quest_items_changed"):
+                await self._quest_items_changed([int(item["item_entry"])])
             self.log.info(f"Destroyed item in slot {slot} for guid {self.player_guid}")
             return
 
@@ -271,6 +273,8 @@ class InventoryMixin:
             item, {F.ITEM_FIELD_STACK_COUNT: new_count}
         )
         await self.send_packet(opcode, payload)
+        if hasattr(self, "_quest_items_changed"):
+            await self._quest_items_changed([int(item["item_entry"])])
         self.log.info(f"Reduced stack in slot {slot} to {new_count}")
 
     async def _send_item_create_block(self, item: dict) -> None:

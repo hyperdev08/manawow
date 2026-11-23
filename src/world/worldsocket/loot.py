@@ -120,8 +120,8 @@ class LootMixin:
         in the CMaNGOS dump as a negative ``mincountOrRef``: the absolute value
         is the ``reference_loot_template.entry`` to process.  Group ids select
         at most one row from a set, with CMaNGOS' shuffled explicit/equal-chance
-        semantics.  Quest-only and conditional rows are skipped because this
-        server has no quest/condition engine.
+        semantics.  Quest-only rows drop only for a player who needs the item;
+        conditional rows are skipped because there is no condition engine.
         """
         con = sqlite3.connect(self.config.database.world_path)
         try:
@@ -138,23 +138,22 @@ class LootMixin:
         return self._filter_loot_items(rolled)[:self.MAX_LOOT_ITEMS]
 
     @staticmethod
-    def _loot_row_chance(row) -> float:
-        return float(row[1] or 0.0)
-
-    @staticmethod
     def _loot_row_condition(row) -> int:
         return int(row[5] or 0) if len(row) > 5 else 0
 
     def _loot_row_usable(self, row) -> bool:
-        """Skip quest-only and conditional rows (no quest/condition engine)."""
-        chance = self._loot_row_chance(row)
-        return chance >= 0.0 and self._loot_row_condition(row) == 0
+        """Skip conditional rows (no condition engine yet).
+
+        Quest-only rows are filtered earlier by ``_loot_row_allowed``.
+        """
+        return self._loot_row_condition(row) == 0
 
     def _roll_loot_rows(self, con, rows, out: List[Tuple[int, int]],
                         depth: int) -> None:
         """Roll a list of loot rows into ``out`` as separate loot slots."""
         if depth > 8 or not rows:
             return
+        rows = [row for row in rows if self._loot_row_allowed(row)]
         groups: Dict[int, list] = {}
         for row in rows:
             if not self._loot_row_usable(row):
@@ -169,6 +168,23 @@ class LootMixin:
             chosen = self._pick_group_row(group_rows, out)
             if chosen is not None:
                 self._resolve_loot_row(con, chosen, out, depth)
+
+    @staticmethod
+    def _loot_row_chance(row) -> float:
+        # A negative chance marks a quest item; the magnitude is still the
+        # drop percentage (see ``_loot_row_allowed`` for the quest check).
+        return abs(float(row[1] or 0.0))
+
+    def _loot_row_allowed(self, row) -> bool:
+        """Quest items (negative chance) only drop for a player who needs them.
+
+        ``LootItem::AllowedForPlayer``: the item must be an objective of an
+        active, unfinished quest.
+        """
+        if float(row[1] or 0.0) >= 0.0 or int(row[3] or 0) < 0:
+            return True
+        needs = getattr(self, "_quest_needs_item", None)
+        return bool(needs and needs(int(row[0])))
 
     def _loot_row_hits(self, row) -> bool:
         chance = self._loot_row_chance(row)
@@ -376,6 +392,8 @@ class LootMixin:
             )
         combat["loot_taken"].append(list_id)
         await self.broadcast_equipment_update()
+        if hasattr(self, "_quest_items_changed"):
+            await self._quest_items_changed([int(item_entry)])
         await self.send_packet(Opcodes.SMSG_LOOT_REMOVED, struct.pack("<B", list_id))
         self._persist_loot(combat)
         await self._finish_loot_if_empty(combat)

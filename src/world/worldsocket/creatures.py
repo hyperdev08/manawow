@@ -456,6 +456,11 @@ class CreaturesMixin:
         })
         for session, award in xp_awards:
             await session._award_xp(award, guid)
+        # ``Player::RewardPlayerAndGroupAtKill``: every rewarded group member
+        # in range gets kill credit, even when the kill is grey for them.
+        for session in award_sessions:
+            if hasattr(session, "_quest_on_creature_killed"):
+                await session._quest_on_creature_killed(int(guid), entry)
         self.log.info(
             f"Creature {entry} ({low_guid}) killed by {tagger_guid}, "
             f"awarded {xp} XP to {len(xp_awards)} player(s)")
@@ -547,10 +552,12 @@ class CreaturesMixin:
         distance = self._distance(player, here)
         reach = self._melee_reach(spawn)
 
-        # Leash: too far from home, or the player is dead or gone.
+        # Leash: only the victim's distance from the spawn counts
+        # (``Creature::CanCreatureAttack``).  The creature's own position must
+        # not: a low-health humanoid that just fled ~40 yards would otherwise
+        # reset to full health as soon as its flee ended.
         home = (float(spawn["x"]), float(spawn["y"]), float(spawn["z"]))
-        if (self._distance(home, player) > CREATURE_LEASH_RADIUS
-                or self._distance(home, here) > CREATURE_LEASH_RADIUS + 15.0):
+        if self._distance(home, player) > CREATURE_LEASH_RADIUS:
             await self._reset_creature(int(low_guid))
             return
 
