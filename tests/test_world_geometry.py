@@ -281,12 +281,18 @@ def test_real_starter_data_smoke():
 def test_monster_move_path_serializes_all_waypoints():
     payload = object_update.build_monster_move_path(
         0x1234, 1.0, 2.0, 3.0, 0.0,
-        [(4.0, 5.0, 6.0), (7.0, 8.0, 9.0)],
+        [(3.0, 5.0, 6.0), (5.0, 6.0, 7.0), (7.0, 8.0, 9.0)],
         duration_ms=1500, move_id=7)
     # packed guid + toggle + start xyz + spline id + face mode + flags + time
     offset = len(pack_guid(0x1234)) + 1 + 12 + 4 + 1
     flags, duration, count = struct.unpack_from("<3I", payload, offset)
-    assert (flags, duration, count) == (0, 1500, 2)
-    points = struct.unpack_from("<6f", payload, offset + 12)
-    assert points[:3] == (4.0, 5.0, 6.0)
-    assert points[3:] == (7.0, 8.0, 9.0)
+    assert (flags, duration, count) == (0, 1500, 3)
+    destination = struct.unpack_from("<3f", payload, offset + 12)
+    assert destination == (7.0, 8.0, 9.0)
+    # CMaNGOS packs intermediates as quarter-yard offsets from the midpoint
+    # between start (1,2,3) and destination (7,8,9), i.e. (4,5,6).
+    first, second = struct.unpack_from("<2I", payload, offset + 24)
+    assert first == ((4 & 0x7FF) | ((0 & 0x7FF) << 11)
+                     | ((0 & 0x3FF) << 22))
+    assert second == (((-4) & 0x7FF) | (((-4) & 0x7FF) << 11)
+                      | (((-4) & 0x3FF) << 22))

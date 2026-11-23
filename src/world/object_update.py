@@ -908,14 +908,25 @@ def build_monster_move(guid: int, x: float, y: float, z: float, o: float,
     return bytes(out)
 
 
+def _append_pack_xyz(out: bytearray, x: float, y: float, z: float) -> None:
+    """CMaNGOS ``ByteBuffer::appendPackXYZ`` (11/11/10-bit quarter yards)."""
+    packed = (int(x / 0.25) & 0x7FF)
+    packed |= (int(y / 0.25) & 0x7FF) << 11
+    packed |= (int(z / 0.25) & 0x3FF) << 22
+    out += struct.pack("<I", packed & 0xFFFFFFFF)
+
+
 def build_monster_move_path(guid: int, x: float, y: float, z: float,
                             o: float, points: list[tuple[float, float, float]],
                             duration_ms: int = 1000, move_id: int = 0) -> bytes:
-    """Build a multi-point linear ``SMSG_MONSTER_MOVE`` spline.
+    """Build a linear ``SMSG_MONSTER_MOVE`` spline with intermediate points.
 
-    ``build_monster_move`` is the one-point special case.  Navigation paths
-    carry the funnel/string-pulled waypoints as intermediate points so the
-    client can animate the whole detour without a packet per segment.
+    CMaNGOS' ``WriteLinearPath`` writes the destination as a full Vector3 and
+    then packs each intermediate point as an offset from the midpoint between
+    the start and destination.  Writing raw floats for the intermediates (the
+    obvious but wrong interpretation) makes the 3.3.5 client misparse the
+    packet, which shows up as units teleporting into the air or drifting away.
+    ``build_monster_move`` remains the one-point fast path.
     """
     cleaned: list[tuple[float, float, float]] = []
     for point in points:
@@ -929,12 +940,21 @@ def build_monster_move_path(guid: int, x: float, y: float, z: float,
         return build_monster_move(
             guid, x, y, z, o, cleaned[0][0], cleaned[0][1], cleaned[0][2],
             duration_ms=duration_ms, move_id=move_id)
+
+    start = (float(x), float(y), float(z))
+    destination = cleaned[-1]
+    middle = ((start[0] + destination[0]) * 0.5,
+              (start[1] + destination[1]) * 0.5,
+              (start[2] + destination[2]) * 0.5)
     out = _monster_move_header(guid, x, y, z, move_id, MONSTER_MOVE_NORMAL)
     out += struct.pack("<I", 0)                       # spline flags
     out += struct.pack("<I", max(1, int(duration_ms)))
-    out += struct.pack("<I", len(cleaned))            # point count
-    for point in cleaned:
-        out += struct.pack("<fff", point[0], point[1], point[2])
+    out += struct.pack("<I", len(cleaned))            # last_idx
+    out += struct.pack("<fff", destination[0], destination[1],
+                       destination[2])
+    for point in cleaned[:-1]:
+        _append_pack_xyz(out, middle[0] - point[0],
+                         middle[1] - point[1], middle[2] - point[2])
     return bytes(out)
 
 
