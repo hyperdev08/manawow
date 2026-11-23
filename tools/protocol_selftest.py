@@ -110,24 +110,49 @@ def client_srp(username: str, password: str, b_bytes: bytes, salt: bytes):
     return a_bytes, m1, session_key
 
 
-async def read_server_packet(reader: asyncio.StreamReader, crypt: WorldCrypt | None = None):
-    """Read one world-server packet, decrypting the header if needed."""
-    header = await reader.readexactly(4)
-    if crypt is not None:
-        header = crypt.decrypt(header)
+async def read_server_packet(reader: asyncio.StreamReader,
+                             crypt: WorldCrypt | None = None,
+                             skip_monster_moves: bool = True):
+    """Read one world-server packet, decrypting the header if needed.
 
-    if header[0] & 0x80:
-        extra = await reader.readexactly(1)
+    Ambient creatures can emit ``SMSG_MONSTER_MOVE`` at any time (especially
+    with the world-shared idle driver).  Those packets are unrelated to the
+    request/response checks below, so skip them unless a caller explicitly
+    wants them.
+    """
+    while True:
+        header = await reader.readexactly(4)
         if crypt is not None:
-            extra = crypt.decrypt(extra)
-        header += extra
-        header_len, size, opcode = parse_server_header(header)
-    else:
-        header_len, size, opcode = parse_server_header(header)
+            header = crypt.decrypt(header)
 
-    payload_len = size - 2
-    payload = await reader.readexactly(payload_len) if payload_len else b""
-    return opcode, payload
+        if header[0] & 0x80:
+            extra = await reader.readexactly(1)
+            if crypt is not None:
+                extra = crypt.decrypt(extra)
+            header += extra
+            header_len, size, opcode = parse_server_header(header)
+        else:
+            header_len, size, opcode = parse_server_header(header)
+
+        payload_len = size - 2
+        payload = await reader.readexactly(payload_len) if payload_len else b""
+        if skip_monster_moves and opcode == int(Opcodes.SMSG_MONSTER_MOVE):
+            continue
+        return opcode, payload
+
+
+async def read_server_packet_until(reader: asyncio.StreamReader,
+                                   crypt: WorldCrypt | None,
+                                   expected: int, label: str,
+                                   ignored: tuple[int, ...] = ()):
+    """Read packets until ``expected``, skipping known asynchronous traffic."""
+    while True:
+        opcode, payload = await read_server_packet(reader, crypt)
+        if opcode == expected:
+            return opcode, payload
+        if opcode in ignored:
+            continue
+        assert_eq(opcode, expected, label)
 
 
 async def send_client_packet(writer: asyncio.StreamWriter, opcode: int, payload: bytes = b"",
@@ -2178,8 +2203,10 @@ async def worldserver_flow(host: str, port: int, session_key: bytes, realm_id: i
             writer, int(Opcodes.CMSG_CAST_SPELL),
             struct.pack("<BiBI", 1, 6603, 0, 0), crypt,
         )
-        opcode, payload = await read_server_packet(reader, crypt)
-        assert_eq(opcode, int(Opcodes.SMSG_SPELL_START), "spell start opcode")
+        opcode, payload = await read_server_packet_until(
+            reader, crypt, int(Opcodes.SMSG_SPELL_START),
+            "spell start opcode",
+            ignored=(int(Opcodes.SMSG_MONSTER_MOVE),))
         caster, pos = parse_packed_guid(payload, 0)
         assert_eq(caster, guid, "spell start caster guid")
         _caster_unit, pos = parse_packed_guid(payload, pos)
@@ -2195,8 +2222,10 @@ async def worldserver_flow(host: str, port: int, session_key: bytes, realm_id: i
         assert_eq(struct.unpack_from("<I", payload, pos)[0], 0, "spell start cast time")
         pos += 4
         assert_eq(struct.unpack_from("<I", payload, pos)[0], 0, "spell start target flags")
-        opcode, payload = await read_server_packet(reader, crypt)
-        assert_eq(opcode, int(Opcodes.SMSG_SPELL_GO), "spell go opcode")
+        opcode, payload = await read_server_packet_until(
+            reader, crypt, int(Opcodes.SMSG_SPELL_GO),
+            "spell go opcode",
+            ignored=(int(Opcodes.SMSG_MONSTER_MOVE),))
         # ``Spell::SendSpellGo``: caster, caster, cast id, spell, flags, tick,
         # then the hit/miss lists and finally the target data.  The lists are
         # always present, so they have to be parsed even when empty.

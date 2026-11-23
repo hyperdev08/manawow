@@ -25,8 +25,12 @@ class FakeLoot(LootMixin):
         self.character = {"map": 0}
         self.spawn = None
         self.responses = []
+        self.group_manager = None
         self.combat = {"loot_target": 0, "loot_items": [], "loot_taken": [],
                        "loot_money": 0}
+
+    def _group_manager(self):
+        return self.group_manager
 
     def _get_combat_state(self):
         return self.combat
@@ -169,3 +173,19 @@ def test_loot_owner_can_open_corpse_only_as_tagger(tmp_path):
     asyncio.run(stranger.handle_loot(object_guid.to_bytes(8, "little")))
     assert stranger.responses[-1][1] == []
     assert stranger.responses[-1][2] == 0
+
+    class SameGroup:
+        def same_group(self, first, second):
+            return {int(first), int(second)} == {100, 200}
+
+        def acquire_loot(self, low, player):
+            return True
+
+        def release_loot(self, low, player):
+            pass
+
+    member = FakeLoot(path, player_guid=200)
+    member.spawn = owner.spawn
+    member.group_manager = SameGroup()
+    asyncio.run(member.handle_loot(object_guid.to_bytes(8, "little")))
+    assert member.responses[-1][1] == [(100, 1)]

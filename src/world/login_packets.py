@@ -648,6 +648,8 @@ def build_tutorial_flags(all_seen: bool = True) -> bytes:
 # are the ones we actually relay.
 CHAT_MSG_SYSTEM = 0
 CHAT_MSG_SAY = 1
+CHAT_MSG_PARTY = 2
+CHAT_MSG_RAID = 3
 CHAT_MSG_YELL = 6
 CHAT_MSG_WHISPER = 7
 CHAT_MSG_WHISPER_INFORM = 9

@@ -119,6 +119,22 @@ class ChatMixin:
                 )
                 await self.send_packet(Opcodes.SMSG_MESSAGECHAT, payload)
 
+        elif msg_type in (login_packets.CHAT_MSG_PARTY,
+                          login_packets.CHAT_MSG_RAID):
+            manager = (self._group_manager()
+                       if hasattr(self, "_group_manager") else None)
+            if manager is None or manager.group_for(
+                    int(self.player_guid)) is None:
+                payload = login_packets.build_message_chat_payload(
+                    login_packets.CHAT_MSG_SYSTEM, 0, 0, "",
+                    sender_guid, sender_name, "You are not in a party.")
+                await self.send_packet(Opcodes.SMSG_MESSAGECHAT, payload)
+                return
+            payload = login_packets.build_message_chat_payload(
+                msg_type, language, sender_guid, sender_name, 0, "", message)
+            for peer in manager.group_member_sessions(int(self.player_guid)):
+                await peer.send_packet(Opcodes.SMSG_MESSAGECHAT, payload)
+
         elif msg_type in (login_packets.CHAT_MSG_SAY, login_packets.CHAT_MSG_YELL,
                           login_packets.CHAT_MSG_EMOTE):
             # Relay to all peers on the same map

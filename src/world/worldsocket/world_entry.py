@@ -152,6 +152,10 @@ class WorldEntryMixin:
                     self.server, "creature_combat", None) is not None:
                 self.server.creature_combat.detach_session(
                     int(self.player_guid or 0))
+            if self.server is not None and getattr(
+                    self.server, "groups", None) is not None:
+                await self.server.groups.on_session_end(
+                    int(self.player_guid or 0))
             self.log.info(f"Returning '{self.account_name}' to character selection")
             self.in_world = False
             self.world_entry_complete = False
@@ -169,6 +173,7 @@ class WorldEntryMixin:
             combat["auras"] = []
             combat["creature_auras"] = {}
             combat["aura_state"] = {}
+            combat["threat_redirect"] = None
         await self.send_packet(Opcodes.SMSG_LOGOUT_RESPONSE, struct.pack("<IB", 0, 0))
         await self.send_packet(Opcodes.SMSG_LOGOUT_COMPLETE, b"")
 
@@ -267,6 +272,7 @@ class WorldEntryMixin:
         combat["auras"] = []
         combat["creature_auras"] = {}
         combat["aura_state"] = {}
+        combat["threat_redirect"] = None
         combat["aggro"].clear()
         # CMaNGOS resurrects with a full rune set; re-init and resync so the
         # client does not keep the cooldowns from before the death.

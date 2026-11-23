@@ -7,7 +7,7 @@ import os
 import sqlite3
 import sys
 
-root = os.path.dirname(os.path.dirname(__file__))
+root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, os.path.join(root, "src"))
 sys.path.insert(0, root)
 
@@ -29,6 +29,7 @@ def create_account(username: str, password: str, email: str = "") -> None:
         raise ValueError("username and password must not be empty")
 
     cfg = load_config()
+    cfg.resolve_database_paths(root)
     os.makedirs(os.path.dirname(cfg.database.auth_path) or ".", exist_ok=True)
 
     user = username.upper()

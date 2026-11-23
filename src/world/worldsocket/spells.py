@@ -1535,6 +1535,23 @@ class SpellsMixin:
                         manager.taunt(
                             creature.creature_low_guid(target_guid),
                             player_guid, duration=3.0)
+            elif etype == spells.SPELL_EFFECT_REDIRECT_THREAT:
+                if target_guid and (self._is_player_guid(target_guid)
+                                    or (hasattr(self, "_is_peer_player_guid")
+                                        and self._is_peer_player_guid(
+                                            target_guid))):
+                    if not hasattr(self, "_is_group_member_with") \
+                            or self._is_group_member_with(target_guid):
+                        duration_ms = spells.spell_duration_ms(
+                            self.config.database.world_path,
+                            template.duration_index, caster_level)
+                        if duration_ms <= 0:
+                            duration_ms = 30_000
+                        self._get_combat_state()["threat_redirect"] = {
+                            "guid": int(target_guid),
+                            "until": time.monotonic()
+                            + duration_ms / 1000.0,
+                        }
             elif etype == spells.SPELL_EFFECT_KNOCK_BACK:
                 if target_guid:
                     await self._apply_knockback(
@@ -1738,7 +1755,10 @@ class SpellsMixin:
                     healed, overheal = await self._heal_player(amount)
                     await self._send_spell_heal_log(
                         player_guid, player_guid, template.id, healed, overheal)
-                    for peer in (self.peers() if hasattr(self, "peers") else ()):
+                    for peer in (self._group_member_sessions(
+                            exclude_self=True)
+                            if hasattr(self, "_group_member_sessions")
+                            else ()):
                         peer_pos = (
                             float(peer.character.get("x", 0.0)),
                             float(peer.character.get("y", 0.0)),
@@ -1757,7 +1777,10 @@ class SpellsMixin:
                     await self._apply_aura_from_effect(
                         template, effect, index, player_guid, player_guid,
                         caster_level, combo_points, target_kind="player")
-                    for peer in (self.peers() if hasattr(self, "peers") else ()):
+                    for peer in (self._group_member_sessions(
+                            exclude_self=True)
+                            if hasattr(self, "_group_member_sessions")
+                            else ()):
                         peer_pos = (
                             float(peer.character.get("x", 0.0)),
                             float(peer.character.get("y", 0.0)),

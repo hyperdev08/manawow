@@ -11,6 +11,7 @@ from src.world.realmsocket import WorldSocket
 from src.world import character_db
 from src.world import creature
 from src.world import geometry
+from src.world.groups import GroupManager
 from src.world.world_combat import WorldCombatManager
 from src.network.packet_log import get_packet_log
 
@@ -23,6 +24,8 @@ class WorldServer:
         self.sessions = []
         # One shared aggro/threat/target/position state per engaged creature.
         self.creature_combat = WorldCombatManager(self)
+        # Party/raid membership (session-scoped until persisted group support).
+        self.groups = GroupManager(self)
         self.packet_log = get_packet_log()
         self.packet_log.Initialize(config.logging.log_dir)
         # Creature/spell tables (including the bundled 3.3.5a starter spells)
@@ -56,8 +59,9 @@ class WorldServer:
             self.log.exception(f"World client error: {e}")
         finally:
             try:
-                self.creature_combat.detach_session(
-                    int(getattr(session, "player_guid", 0) or 0))
+                player_guid = int(getattr(session, "player_guid", 0) or 0)
+                self.creature_combat.detach_session(player_guid)
+                await self.groups.on_session_end(player_guid)
             except Exception:
                 pass
             try:

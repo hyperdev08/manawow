@@ -861,6 +861,7 @@ class StatsMixin:
         combat["pending_cast"] = None
         combat["channel"] = None
         combat["school_lockout"] = {}
+        combat["threat_redirect"] = None
         combat["dots"] = []
         combat.setdefault("area_effects", []).clear()
         if hasattr(self, "_clear_player_auras"):

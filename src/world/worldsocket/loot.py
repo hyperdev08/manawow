@@ -38,9 +38,16 @@ class LootMixin:
             return
         loot_owner = (int(spawn["loot_owner"] or 0)
                       if "loot_owner" in spawn.keys() else 0)
+        manager = (self._group_manager()
+                   if hasattr(self, "_group_manager") else None)
         if loot_owner and loot_owner != int(self.player_guid or 0):
-            # Solo tagging rights: another player's corpse is not lootable by
-            # this session until group loot is implemented.
+            if manager is None or not manager.same_group(
+                    loot_owner, int(self.player_guid or 0)):
+                await self._send_loot_response(target_guid, [], 0)
+                return
+        if manager is not None and not manager.acquire_loot(
+                low_guid, int(self.player_guid or 0)):
+            # Another group member is already looting this corpse.
             await self._send_loot_response(target_guid, [], 0)
             return
         # Read the loot that was rolled once, at death.  There is deliberately
@@ -70,6 +77,8 @@ class LootMixin:
             # Nothing left: stop offering the loot cursor (TrinityCore removes
             # UNIT_DYNFLAG_LOOTABLE when the loot is emptied).
             await self._send_creature_fields(low_guid, {F.UNIT_DYNAMIC_FLAGS: 0})
+            if manager is not None:
+                manager.release_loot(low_guid, int(self.player_guid or 0))
 
     def _filter_loot_items(self, items) -> List[Tuple[int, int]]:
         """Drop loot entries the client has no item template for.
@@ -374,6 +383,13 @@ class LootMixin:
     async def _close_loot(self) -> None:
         """Forget the open loot window without changing the stored loot."""
         combat = self._get_combat_state()
+        target = int(combat.get("loot_target") or 0)
+        if target and hasattr(self, "_group_manager"):
+            manager = self._group_manager()
+            if manager is not None:
+                manager.release_loot(
+                    creature.creature_low_guid(target),
+                    int(self.player_guid or 0))
         combat["loot_target"] = 0
         combat["loot_items"] = []
         combat["loot_taken"] = []

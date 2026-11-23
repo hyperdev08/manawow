@@ -164,8 +164,11 @@ class SocketBase:
 
                 await self.handle_packet(header.opcode, payload)
 
-        except (asyncio.IncompleteReadError, asyncio.TimeoutError, ConnectionResetError):
-            pass
+        except (asyncio.IncompleteReadError, asyncio.TimeoutError,
+                ConnectionError) as exc:
+            # A normal client disconnect on Windows often surfaces as
+            # ConnectionAbortedError (WinError 10053), not IncompleteReadError.
+            self.log.debug(f"World client disconnected: {exc}")
         except Exception as exc:
             self.log.exception(f"World socket error: {exc}")
         finally:
@@ -290,6 +293,28 @@ class SocketBase:
                 await self.handle_set_selection(data)
             elif opcode == Opcodes.CMSG_LOOT:
                 await self.handle_loot(data)
+            elif opcode == Opcodes.CMSG_GROUP_INVITE:
+                await self.handle_group_invite(data)
+            elif opcode == Opcodes.CMSG_GROUP_ACCEPT:
+                await self.handle_group_accept(data)
+            elif opcode == Opcodes.CMSG_GROUP_DECLINE:
+                await self.handle_group_decline(data)
+            elif opcode == Opcodes.CMSG_GROUP_UNINVITE:
+                await self.handle_group_uninvite(data)
+            elif opcode == Opcodes.CMSG_GROUP_UNINVITE_GUID:
+                await self.handle_group_uninvite_guid(data)
+            elif opcode == Opcodes.CMSG_GROUP_SET_LEADER:
+                await self.handle_group_set_leader(data)
+            elif opcode == Opcodes.CMSG_GROUP_DISBAND:
+                await self.handle_group_disband(data)
+            elif opcode == Opcodes.CMSG_GROUP_RAID_CONVERT:
+                await self.handle_group_raid_convert(data)
+            elif opcode == Opcodes.CMSG_GROUP_CHANGE_SUB_GROUP:
+                await self.handle_group_change_subgroup(data)
+            elif opcode == Opcodes.CMSG_GROUP_SWAP_SUB_GROUP:
+                await self.handle_group_swap_subgroup(data)
+            elif opcode == Opcodes.CMSG_REQUEST_PARTY_MEMBER_STATS:
+                await self.handle_request_party_member_stats(data)
             elif opcode == Opcodes.CMSG_LOOT_RELEASE:
                 await self.handle_loot_release(data)
             elif opcode == Opcodes.CMSG_LOOT_MONEY:
@@ -331,6 +356,8 @@ class SocketBase:
                 "cooldowns": {},
                 # low_guid -> {last_swing, chase_until}
                 "aggro": {},
+                # Misdirection/Tricks-style threat redirect for this player.
+                "threat_redirect": None,
                 # active damage/heal over time effects
                 "dots": [],
                 # persistent ground AoE effects (Blizzard, Consecration, ...)

@@ -118,6 +118,8 @@ class CombatMixin:
 
         # 6. out-of-combat regeneration
         await self._regenerate(now)
+        if hasattr(self, "_party_stats_tick"):
+            await self._party_stats_tick(now)
 
         # 7. corpses that have waited long enough come back
         if now - combat["last_respawn_scan"] >= RESPAWN_SCAN_INTERVAL:

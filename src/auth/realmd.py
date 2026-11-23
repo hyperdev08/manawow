@@ -71,8 +71,9 @@ class AuthSession:
                 else:
                     self.log.debug(f"Unknown auth command: 0x{cmd:02X}")
                     break
-        except (asyncio.IncompleteReadError, asyncio.TimeoutError, ConnectionResetError):
-            pass
+        except (asyncio.IncompleteReadError, asyncio.TimeoutError,
+                ConnectionError) as exc:
+            self.log.debug(f"Auth client disconnected: {exc}")
         except Exception as exc:
             self.log.exception(f"Auth session error: {exc}")
         finally:

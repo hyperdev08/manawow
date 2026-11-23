@@ -88,8 +88,18 @@ A real 3.3.5a client can now log in, pick a character and **enter the world**:
   - chain spells (Chain Lightning, Multi-Shot) jump through up to `EffectChainTargets` nearby enemies with the reference 30% falloff per jump
   - persistent ground effects tick from `SpellDuration.dbc` and take their damage from the periodic aura or its `PERIODIC_TRIGGER_SPELL` (e.g. Blizzard 42208, Rain of Fire 42223)
   - `MaxTargets` is honoured (Whirlwind hits four), the caster's own pet is excluded, and creature AoE (Flamestrike) damages the player and leaves a hostile ground effect
-  - party/raid-only heals and buffs are applied to the caster and to every other in-world player inside the area (there is no formal group system yet)
+  - party/raid-only heals and buffs are applied to the caster and to every group member on the same map inside the area; a solo caster only affects themselves
   - ground effects with a slow component (Blizzard, Hurricane, ...) also refresh a short movement-slow aura on each hit target
+
+### Party and raid
+- `CMSG_GROUP_INVITE` / accept / decline / uninvite / leave / disband / set leader / raid convert / subgroup change and swap
+- `SMSG_GROUP_LIST`, `SMSG_GROUP_INVITE`, `SMSG_GROUP_DECLINE`, `SMSG_GROUP_UNINVITE`, `SMSG_GROUP_SET_LEADER`, `SMSG_GROUP_DESTROYED`, `SMSG_PARTY_COMMAND_RESULT`
+- Party member frames receive periodic `SMSG_PARTY_MEMBER_STATS_FULL` updates (health, power, level, zone, position)
+- Party/raid chat is relayed only to group members; cross-faction invites are rejected
+- Groups are 5-player parties or 40-player raids with eight subgroups; the leader is transferred when the current leader leaves
+- Group XP is split among nearby living members on the same map with a 10% bonus per extra member (capped at 1.5x)
+- Loot rights belong to the tagger's group; only one member can have a corpse's loot window open at a time to prevent duplicate item takes
+- Limitations: groups are session-scoped (no MySQL persistence/offline members yet); need/greed/master loot, raid markers, ready checks and LFG are not implemented
 
 ### Auras (buffs, debuffs, control and mitigation)
 - A real aura registry for players (`combat["auras"]`) and creatures (`combat["creature_auras"]`), keyed by spell so a recast refreshes the duration and stacks up to `Spell.dbc` `StackAmount`
@@ -129,7 +139,7 @@ A real 3.3.5a client can now log in, pick a character and **enter the world**:
 - Threat switching uses the 110% melee / 130% ranged rules, healing generates half-effective-heal threat, threat modifiers and taunt effects (Taunt, Growl, Mocking Blow) update the shared table
 - Nearby same-faction creatures are called for help when a fight starts
 - Loot/XP goes to the first tagger (pet damage credits the owner); the corpse stores `loot_owner`, so other solo players cannot open it
-- Remaining threat gap: threat redirect (Misdirection/Tricks of the Trade) and group threat splitting
+- Misdirection/Tricks-style threat redirect is supported; threat wipes/vanish/encounter-specific threat mechanics are not
 - Low-health humanoid creatures flee for six seconds instead of fighting to the death
 - `SPELL_EFFECT_ACTIVATE_RUNE` (146) not implemented
 - Creature casts and melee respect the same facing/LOS rules; chase, flee, wander and waypoint movement use the extracted navigation mesh when a straight line is obstructed

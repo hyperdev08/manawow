@@ -55,6 +55,14 @@ class Config:
     database: DBConfig
     logging: LogConfig
 
+    def resolve_database_paths(self, base_dir: str) -> None:
+        """Make relative DB paths independent of the caller's CWD."""
+        for attribute in ("auth_path", "world_path"):
+            value = getattr(self.database, attribute)
+            if value and not os.path.isabs(value):
+                setattr(self.database, attribute,
+                        os.path.normpath(os.path.join(base_dir, value)))
+
     @classmethod
     def load(cls, path: str | os.PathLike[str]) -> "Config":
         with open(path, "r", encoding="utf-8") as f:

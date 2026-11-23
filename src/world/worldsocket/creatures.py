@@ -294,6 +294,10 @@ class CreaturesMixin:
                     amount: float, kind: str = "melee") -> None:
         """Add threat to a creature's table (``ThreatManager::AddThreat``)."""
         source_guid = self._threat_source_guid(source_guid)
+        redirect = self._get_combat_state().get("threat_redirect")
+        if redirect and int(redirect.get("until") or 0.0) > time.monotonic() \
+                and source_guid == int(self.player_guid or 0):
+            source_guid = int(redirect.get("guid") or source_guid)
         manager = self._creature_combat_manager()
         if manager is not None and manager.is_engaged(int(low_guid)):
             manager.add_threat(int(low_guid), source_guid, amount, kind=kind)
@@ -344,6 +348,24 @@ class CreaturesMixin:
             self.log.debug(
                 f"Creature {spawn['entry']} called {helped} ally/allies for help")
 
+    @staticmethod
+    def _xp_for_kill(player_level: int, creature_level: int) -> int:
+        level = max(1, int(creature_level))
+        player_level = max(1, int(player_level))
+        base_xp = level * 5 + 45
+        if player_level >= level + 5:
+            return 0
+        if player_level <= level:
+            return base_xp
+        return int(base_xp * max(
+            0.1, 1.0 - (player_level - level) * 0.1))
+
+    @staticmethod
+    def _player_position_for(session) -> tuple[float, float, float]:
+        return (float(session.character.get("x", 0.0) or 0.0),
+                float(session.character.get("y", 0.0) or 0.0),
+                float(session.character.get("z", 0.0) or 0.0))
+
     async def _on_creature_killed(self, guid: int) -> None:
         """Handle creature death: stop combat, award XP and make a corpse."""
         low_guid = creature.creature_low_guid(guid)
@@ -363,15 +385,36 @@ class CreaturesMixin:
             tagger_guid = int(self.player_guid or 0)
         entry = int(spawn["entry"])
         level = max(1, int(spawn["min_level"])) if "min_level" in spawn.keys() else 1
-        player_level = int(tagger.character.get("level", 1)) \
-            if tagger.character else int(self.character.get("level", 1))
-        base_xp = level * 5 + 45
-        if player_level >= level + 5:
-            xp = 0
-        elif player_level <= level:
-            xp = base_xp
-        else:
-            xp = int(base_xp * max(0.1, 1.0 - (player_level - level) * 0.1))
+        corpse_pos = (float(spawn["x"]), float(spawn["y"]),
+                      float(spawn["z"]))
+        award_sessions = [tagger] if tagger is not None else []
+        group_manager = getattr(getattr(self, "server", None), "groups", None)
+        group = (group_manager.group_for(tagger_guid)
+                 if group_manager is not None else None)
+        if group is not None:
+            award_sessions = []
+            map_id = (int(spawn["map"] or 0)
+                      if "map" in spawn.keys()
+                      else int(self.character.get("map", 0) or 0))
+            for session in group_manager.member_sessions(group, map_id):
+                if not session.character:
+                    continue
+                if session._get_combat_state().get("dead"):
+                    continue
+                pos = self._player_position_for(session)
+                if self._distance(corpse_pos, pos) > 100.0:
+                    continue
+                award_sessions.append(session)
+            if tagger is not None and tagger not in award_sessions:
+                award_sessions.append(tagger)
+        group_bonus = min(1.5, 1.0 + 0.1 * max(0, len(award_sessions) - 1))
+        xp_awards = []
+        for session in award_sessions:
+            player_level = int(session.character.get("level", 1))
+            xp = self._xp_for_kill(player_level, level)
+            if xp > 0:
+                xp_awards.append((session, int(xp * group_bonus)))
+        xp = sum(value for _session, value in xp_awards)
         # Generate loot ONCE when the creature dies.  CMaNGOS stores the loot
         # template id separately from the creature entry; 190 creatures (Naxx
         # and a few event NPCs) share another creature's loot table.
@@ -411,11 +454,11 @@ class CreaturesMixin:
             F.UNIT_FIELD_HEALTH: 0,
             F.UNIT_DYNAMIC_FLAGS: 1,      # UNIT_DYNFLAG_LOOTABLE
         })
-        if xp > 0:
-            await tagger._award_xp(xp, guid)
+        for session, award in xp_awards:
+            await session._award_xp(award, guid)
         self.log.info(
             f"Creature {entry} ({low_guid}) killed by {tagger_guid}, "
-            f"awarded {xp} XP")
+            f"awarded {xp} XP to {len(xp_awards)} player(s)")
 
     async def _creature_combat_tick(self, low_guid: int, now: float) -> None:
         """One AI tick for a creature that is fighting this player."""

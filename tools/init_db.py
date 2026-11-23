@@ -6,7 +6,7 @@ import os
 import sqlite3
 import sys
 
-root = os.path.dirname(os.path.dirname(__file__))
+root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, os.path.join(root, "src"))
 sys.path.insert(0, root)
 
@@ -126,6 +126,7 @@ def load_config() -> Config:
 
 def main() -> None:
     cfg = load_config()
+    cfg.resolve_database_paths(root)
     init_databases(cfg)
     print(f"Initialized auth database:  {cfg.database.auth_path}")
     print(f"Initialized world database: {cfg.database.world_path}")

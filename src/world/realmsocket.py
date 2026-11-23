@@ -26,6 +26,7 @@ from src.world.worldsocket.constants import __all__ as _CONSTANT_NAMES
 from src.world.worldsocket.creature_ai import CreatureAIMixin
 from src.world.worldsocket.creature_movement import CreatureMovementMixin
 from src.world.worldsocket.creatures import CreaturesMixin
+from src.world.worldsocket.groups import GroupsMixin
 from src.world.worldsocket.inventory import InventoryMixin
 from src.world.worldsocket.loot import LootMixin
 from src.world.worldsocket.peers import PeersMixin
@@ -55,6 +56,7 @@ class WorldSocket(
     CreaturesMixin,
     CreatureAIMixin,
     CreatureMovementMixin,
+    GroupsMixin,
     SummonsMixin,
     LootMixin,
     InventoryMixin,
