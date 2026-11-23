@@ -175,8 +175,10 @@ SPELL_FAILED_TARGETS_DEAD = 109
 COMBAT_TICK_INTERVAL = 0.25
 
 
-# A creature gives up and walks home after being pulled this far from its spawn.
-CREATURE_LEASH_RADIUS = 30.0
+# A creature gives up and walks home when its victim is this far from the
+# creature's spawn (TrinityCore ``Creature::CanCreatureAttack`` with the
+# default ``CONFIG_THREAT_RADIUS`` of 60 yards).
+CREATURE_LEASH_RADIUS = 60.0
 
 
 # How often dead spawns are checked for respawn (seconds).

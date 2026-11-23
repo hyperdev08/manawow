@@ -158,6 +158,7 @@ CREATE TABLE IF NOT EXISTS item_templates(
   lock_id INTEGER NOT NULL DEFAULT 0,
   material INTEGER NOT NULL DEFAULT 0,
   sheath_type INTEGER NOT NULL DEFAULT 0,
+  buy_count INTEGER NOT NULL DEFAULT 1,
   random_property INTEGER NOT NULL DEFAULT 0,
   random_suffix INTEGER NOT NULL DEFAULT 0,
   block INTEGER NOT NULL DEFAULT 0,
@@ -413,6 +414,11 @@ def init_character_db(path: str) -> None:
                 con.execute(
                     f"ALTER TABLE item_templates ADD COLUMN {column}"
                     " REAL NOT NULL DEFAULT 0.0")
+        if "buy_count" not in item_columns:
+            # Vendors sell some items in fixed bundles (water x5, arrows x200).
+            con.execute(
+                "ALTER TABLE item_templates ADD COLUMN buy_count INTEGER NOT NULL DEFAULT 1"
+            )
         _migrate_start_positions(con)
         _seed_starter_items(con)
         _backfill_starter_spells(con)
@@ -642,6 +648,9 @@ def delete_character(path: str, account_id: int, guid: int) -> bool:
             "DELETE FROM characters WHERE guid = ? AND account_id = ?",
             (guid, account_id),
         )
+        if cur.rowcount > 0:
+            from src.world import quests
+            quests.delete_character_quests(con, guid)
         con.commit()
         return cur.rowcount > 0
     finally:
@@ -1313,7 +1322,7 @@ def add_item_to_inventory(path: str, character_guid: int, entry: int,
         remaining = max(1, int(count))
 
         rows = con.execute(
-            "SELECT id, slot, stack_count FROM character_items "
+            "SELECT id, slot, stack_count, item_entry FROM character_items "
             "WHERE character_guid = ?",
             (character_guid,),
         ).fetchall()
@@ -1321,7 +1330,10 @@ def add_item_to_inventory(path: str, character_guid: int, entry: int,
 
         changes: List[Dict] = []
         if stackable > 1:
-            for item_id, slot, stack_count in rows:
+            for item_id, slot, stack_count, row_entry in rows:
+                # Only a partial stack of the *same* item can take more.
+                if int(row_entry) != int(entry):
+                    continue
                 slot = int(slot)
                 if not (256 <= slot <= 271):
                     continue

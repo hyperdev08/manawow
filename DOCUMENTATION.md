@@ -23,9 +23,10 @@ A real 3.3.5a client can now log in, pick a character and **enter the world**:
 
 ### SQLite storage
 - Accounts, realms and characters
+- `src/common/sqlite_tuning.py` (installed by the worldserver): WAL journal, `synchronous=NORMAL` and `wal_autocheckpoint=0` on every connection, plus a background thread that keeps one connection open and runs PASSIVE checkpoints. The server opens a connection per query on the event-loop thread, and rollback-journal commits used to freeze every session for seconds on Windows (median 362 ms, worst 16 s per commit; now ~5 ms). Stop the server before committing `data/world.db` so the WAL is folded back in
 
 ### Item system (initial milestone)
-- `SMSG_ITEM_QUERY_SINGLE_RESPONSE` from `item_templates` SQLite table
+- `SMSG_ITEM_QUERY_SINGLE_RESPONSE` from `item_templates` SQLite table (all 44,613 CMaNGOS `item_template` rows; the shipped `world.db` used to lack 17,539 of them, which silently removed quest items such as 50432 Diseased Wolf Pelt from loot)
 - Character inventory in `character_items` table (slot -> item instance)
 - Starter kit: the exact `CharStartOutfit.dbc` outfit for the character's race/class (63 rows for the 62 legal 3.3.5a combinations, including the death-knight set and its four bags), with every referenced template seeded from the client's own `Item.dbc` data. Race/class legality comes from `CharBaseInfo.dbc`, so `CMSG_CHAR_CREATE` rejects impossible combinations (e.g., gnome paladin or tauren mage) with `CHAR_CREATE_FAILED`
 - On world entry, items are emitted as `UPDATETYPE_CREATE_OBJECT2` blocks *before* the player block so the `PLAYER_FIELD_INV_SLOT_HEAD` / `PACK_SLOT_1` guids resolve immediately
@@ -57,7 +58,7 @@ A real 3.3.5a client can now log in, pick a character and **enter the world**:
 - `Summon Imp` (688) is the only deliberate addition to the authentic list: it is trainer-taught at level 1 and this server has no class trainers, so warlocks would otherwise have no summon
 - `SMSG_LOGIN_VERIFY_WORLD` is the first world packet, followed by `SMSG_INITIAL_SPELLS` and `SMSG_ACTION_BUTTONS`
 - `CMSG_CAST_SPELL` / `CMSG_CANCEL_CAST` use imported `spell_templates`: cast time, range, power cost, GCD (`StartRecoveryTime`), school, damage/heal rolls and effect/aura enums
-- Melee auto-attack, weapon damage/delay, creature aggro + chase + leash AI, creature melee, death, respawn, XP and level-up
+- Melee auto-attack, weapon damage/delay, creature aggro + chase + leash AI (a creature evades when its victim is more than 60 yards from the spawn, `Creature::CanCreatureAttack`; its own position does not count, so low-health humanoids can flee without resetting), creature melee, death, respawn, XP and level-up
 - `SMSG_SPELL_START` / `SMSG_SPELL_GO` / `SMSG_CAST_FAILED` with miss/crit flags
 - `SMSG_SPELLHEALLOG`, `SMSG_SPELLENERGIZELOG`, `SMSG_LOG_XPGAIN` and `SMSG_LEVELUP_INFO`
 - Rage is stored in tenths (full bar = 1000) and generated with the real 3.3.5 formula; out of combat rage decays 25 points every two seconds
@@ -167,9 +168,35 @@ A real 3.3.5a client can now log in, pick a character and **enter the world**:
 ### Loot
 - `creature_loot_template` (218,066 rows) and `reference_loot_template` (44,244 rows / 896 pools) imported from CMaNGOS
 - Loot is rolled exactly once when the creature dies, stored in `creature_spawns.loot_json`; the first tagger is recorded in `creature_spawns.loot_owner`
-- Roll rules follow CMaNGOS: references use `mincountOrRef` multiplicities, groups shuffle explicit-chance rows and use equal-chance fallbacks, quest-only and conditional rows are skipped until quest/condition engines exist, and the window is capped at 16 slots
+- Roll rules follow CMaNGOS: references use `mincountOrRef` multiplicities, groups shuffle explicit-chance rows and use equal-chance fallbacks, conditional rows are skipped until a condition engine exists, and the window is capped at 16 slots
 - Corpse money uses the real `creature_template.MinLootGold` / `MaxLootGold` values imported from CMaNGOS (no synthetic level-based coins)
 - `CMSG_LOOT`, `CMSG_AUTOSTORE_LOOT_ITEM`, `CMSG_LOOT_MONEY`, `CMSG_LOOT_RELEASE`
+- Quest items (negative `ChanceOrQuestChance`) only drop for a player with an active, unfinished quest that needs them
+
+### Quests
+- `quest_templates` (9,086 quests), `creature_quest_starters` / `creature_quest_enders` (from `creature_questrelation` / `creature_involvedrelation`) and `areatrigger_quests` (from `areatrigger_involvedrelation`) imported from CMaNGOS; an existing `world.db` gets them with `python tools/import_wotlk_db.py --dump WoTLKDB.sql --quests-only`
+- Rules and packet builders live in `src/world/quests.py` (socket-free), handlers in `src/world/worldsocket/quests.py`
+- Quest giver markers: `CMSG_QUESTGIVER_STATUS_QUERY` / `CMSG_QUESTGIVER_STATUS_MULTIPLE_QUERY` answer with the 3.3.5 dialog status (yellow/grey "!" and "?"); statuses are re-sent after accepting, abandoning, progressing or turning in a quest
+- `CMSG_QUESTGIVER_HELLO` and `CMSG_GOSSIP_HELLO`: quests are appended to the gossip window; a giver whose menu has no options opens the quest list, or the single quest directly (`Player::SendPreparedQuest`)
+- `QUEST_FLAGS_AUTO_ACCEPT` (0x80000) is stripped from every quest packet. The CMaNGOS dump sets it on all 178 starting-zone quests, but no 3.3.5a quest had it on retail (TrinityCore `QuestDef.h`); the client would turn Accept into a plain close button and never send `CMSG_QUESTGIVER_ACCEPT_QUEST`
+- `CMSG_QUESTGIVER_QUERY_QUEST` -> `SMSG_QUESTGIVER_QUEST_DETAILS`, `CMSG_QUESTGIVER_ACCEPT_QUEST`, `CMSG_QUEST_QUERY` -> `SMSG_QUEST_QUERY_RESPONSE`, `CMSG_QUESTLOG_REMOVE_QUEST`, `CMSG_QUESTGIVER_CANCEL`
+- Taking a quest checks race/class masks, level, `PrevQuestId` and quests pointing at it through `NextQuestId`, positive `ExclusiveGroup`, already-done (unless repeatable) and the 25-slot log; `SrcItemId` is handed out on accept and taken back on abandon
+- The quest log is stored per character in `character_quests` (slot, status, explored flag, four kill counters) and `character_quests_rewarded`, and mirrored in the `PLAYER_QUEST_LOG_*` update fields (sent in the create block on login)
+- Objectives: creature kills (including `KillCredit1/2`) send `SMSG_QUESTUPDATE_ADD_KILL`; item objectives are counted from the bags, so looting, destroying or handing in items re-evaluates the quest; exploration quests complete on `CMSG_AREATRIGGER`; `SMSG_QUESTUPDATE_COMPLETE` marks a finished objective set
+- Turn in: `CMSG_QUESTGIVER_COMPLETE_QUEST` -> `SMSG_QUESTGIVER_REQUEST_ITEMS` (or straight to the reward), `CMSG_QUESTGIVER_REQUEST_REWARD` -> `SMSG_QUESTGIVER_OFFER_REWARD`, `CMSG_QUESTGIVER_CHOOSE_REWARD` takes the required items/money, gives fixed + chosen reward items, money and XP and sends `SMSG_QUESTGIVER_QUEST_COMPLETE`; the next quest of the chain opens right away when the same NPC starts it
+- Quest XP is derived from `RewMoneyMaxLevel` like CMaNGOS (QuestXP.dbc is not in the SQL dump); at level 80 the quest pays that money instead
+- `CMSG_QUEST_POI_QUERY` is answered with empty POI lists
+- Not implemented yet: game object starters/enders and objectives, quest-starting items, timed and escort/event quests, reputation/skill/condition requirements, reputation, spell and title rewards, quest sharing, quest greeting texts and daily/weekly resets
+
+### Vendors
+- `npc_vendor` (35,910 rows for 1,982 vendors) imported from CMaNGOS `npc_vendor` plus the shared `npc_vendor_template` lists, and `item_templates.buy_count` (water and food come in bundles of 5, ammo in 200s)
+- `CMSG_LIST_INVENTORY` -> `SMSG_LIST_INVENTORY`; gossip vendors open the list straight away, or get a "browse your goods" option added to their menu; CMaNGOS gossip options of type vendor open it too; a vendor that also gives quests shows the quests next to the "browse your goods" option (`Player::SendPreparedGossip`)
+- `CMSG_BUY_ITEM` / `CMSG_BUY_ITEM_IN_SLOT` -> `SMSG_BUY_ITEM` / `SMSG_BUY_FAILED` (not enough money, sold out, wrong slot, too far); items go to the backpack and stack with copies already there
+- Limited stock (`maxcount`/`incrtime`) per spawn, refilled after `incrtime` seconds
+- `CMSG_SELL_ITEM` for backpack items at `sell_price`, whole or partial stacks
+- Hidden from the list: other-faction items and bind-on-pickup gear for other classes
+- Not implemented yet: honor/token prices (`ExtendedCost`, those items are hidden), buyback, repair, reputation discounts, `condition_id`
+- Upgrade an existing `world.db` with `python tools/import_wotlk_db.py --dump WoTLKDB.sql --vendors-only`
 
 ### Chat + emotes
 - `CMSG_MESSAGECHAT` / `SMSG_MESSAGECHAT`: `/say`, `/yell`, `/whisper`, `/me` (emote)

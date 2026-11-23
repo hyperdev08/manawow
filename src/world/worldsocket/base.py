@@ -246,6 +246,32 @@ class SocketBase:
                 await self.handle_gossip_select_option(data)
             elif opcode == Opcodes.CMSG_NPC_TEXT_QUERY:
                 await self.handle_npc_text_query(data)
+            elif opcode == Opcodes.CMSG_QUESTGIVER_STATUS_QUERY:
+                await self.handle_questgiver_status_query(data)
+            elif opcode == Opcodes.CMSG_QUESTGIVER_STATUS_MULTIPLE_QUERY:
+                await self.handle_questgiver_status_multiple_query(data)
+            elif opcode == Opcodes.CMSG_QUESTGIVER_HELLO:
+                await self.handle_questgiver_hello(data)
+            elif opcode == Opcodes.CMSG_QUESTGIVER_QUERY_QUEST:
+                await self.handle_questgiver_query_quest(data)
+            elif opcode == Opcodes.CMSG_QUESTGIVER_ACCEPT_QUEST:
+                await self.handle_questgiver_accept_quest(data)
+            elif opcode == Opcodes.CMSG_QUESTGIVER_COMPLETE_QUEST:
+                await self.handle_questgiver_complete_quest(data)
+            elif opcode == Opcodes.CMSG_QUESTGIVER_REQUEST_REWARD:
+                await self.handle_questgiver_request_reward(data)
+            elif opcode == Opcodes.CMSG_QUESTGIVER_CHOOSE_REWARD:
+                await self.handle_questgiver_choose_reward(data)
+            elif opcode == Opcodes.CMSG_QUESTGIVER_CANCEL:
+                await self.handle_questgiver_cancel(data)
+            elif opcode == Opcodes.CMSG_QUESTLOG_REMOVE_QUEST:
+                await self.handle_questlog_remove_quest(data)
+            elif opcode == Opcodes.CMSG_QUEST_QUERY:
+                await self.handle_quest_query(data)
+            elif opcode == Opcodes.CMSG_QUEST_POI_QUERY:
+                await self.handle_quest_poi_query(data)
+            elif opcode == Opcodes.CMSG_AREATRIGGER:
+                await self.handle_area_trigger(data)
             elif opcode == Opcodes.CMSG_SWAP_INV_ITEM:
                 await self.handle_swap_inv_item(data)
             elif opcode == Opcodes.CMSG_SWAP_ITEM:
@@ -321,6 +347,14 @@ class SocketBase:
                 await self.handle_loot_money(data)
             elif opcode == Opcodes.CMSG_AUTOSTORE_LOOT_ITEM:
                 await self.handle_autostore_loot_item(data)
+            elif opcode == Opcodes.CMSG_LIST_INVENTORY:
+                await self.handle_list_inventory(data)
+            elif opcode == Opcodes.CMSG_BUY_ITEM:
+                await self.handle_buy_item(data)
+            elif opcode == Opcodes.CMSG_BUY_ITEM_IN_SLOT:
+                await self.handle_buy_item(data, in_slot=True)
+            elif opcode == Opcodes.CMSG_SELL_ITEM:
+                await self.handle_sell_item(data)
             elif opcode == Opcodes.CMSG_REPOP_REQUEST:
                 await self.handle_repop_request(data)
             elif opcode == Opcodes.MSG_MOVE_WORLDPORT_ACK:

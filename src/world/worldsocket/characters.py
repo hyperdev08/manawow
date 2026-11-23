@@ -7,6 +7,7 @@ import struct
 from src.protocol.opcodes import Opcodes
 from src.world import character_db
 from src.world import creature
+from src.world import vendor
 from src.world import login_packets
 
 from .constants import (
@@ -216,17 +217,22 @@ class CharactersMixin:
             login_packets.build_npc_text_update(text_id, row),
         )
 
-    async def _send_gossip_menu(self, guid: int, menu_id: int) -> bool:
+    async def _send_gossip_menu(self, guid: int, menu_id: int, quests=(),
+                                vendor_option: bool = False) -> bool:
         menu = creature.get_gossip_menu(self.config.database.world_path, menu_id)
         if menu is None:
             return False
-        options = creature.get_gossip_options(
+        options = list(creature.get_gossip_options(
             self.config.database.world_path, menu_id
-        )
+        ))
+        if vendor_option and not any(
+            int(o["option_type"]) == vendor.GOSSIP_OPTION_VENDOR for o in options
+        ):
+            options.append(vendor.vendor_gossip_option())
         await self.send_packet(
             Opcodes.SMSG_GOSSIP_MESSAGE,
             login_packets.build_gossip_message(
-                guid, menu_id, int(menu["text_id"]), options
+                guid, menu_id, int(menu["text_id"]), options, quests
             ),
         )
         return True
@@ -246,18 +252,43 @@ class CharactersMixin:
             self.log.debug(f"Creature {guid} has no gossip flag")
             return
 
+        is_vendor = bool(int(spawn["npc_flags"]) & vendor.NPC_FLAG_VENDOR)
         menu_id = int(spawn["gossip_menu_id"])
-        if menu_id and await self._send_gossip_menu(guid, menu_id):
+        quests = (self._gossip_quest_items(spawn)
+                  if hasattr(self, "_gossip_quest_items") else [])
+        has_options = is_vendor or bool(menu_id and creature.get_gossip_options(
+            self.config.database.world_path, menu_id))
+        if quests and not has_options:
+            # ``Player::SendPreparedGossip``: a menu without options opens the
+            # quest window (or the single quest) instead of the gossip window.
+            if await self._send_quest_menu(guid, spawn):
+                return
+        if menu_id and await self._send_gossip_menu(
+                guid, menu_id, quests, vendor_option=is_vendor):
             self.log.info(
                 f"Opened gossip menu {menu_id} for creature "
                 f"'{spawn['name']}' ({guid})"
             )
             return
 
+        if is_vendor and not quests:
+            # Nothing to say: go straight to the goods, like the real server.
+            await self._send_vendor_list(guid, spawn)
+            return
+        if is_vendor:
+            # A vendor that also offers quests but has no gossip menu: show
+            # the quests next to a "browse your goods" option.
+            await self.send_packet(
+                Opcodes.SMSG_GOSSIP_MESSAGE,
+                login_packets.build_gossip_message(
+                    guid, menu_id, 0, [vendor.vendor_gossip_option()], quests),
+            )
+            return
+
         # A gossip-flagged NPC without a menu still gets an empty window.
         await self.send_packet(
             Opcodes.SMSG_GOSSIP_MESSAGE,
-            login_packets.build_gossip_message(guid, menu_id, 0, ()),
+            login_packets.build_gossip_message(guid, menu_id, 0, (), quests),
         )
 
     async def handle_gossip_select_option(self, data: bytes):
@@ -270,6 +301,9 @@ class CharactersMixin:
         if not self.in_world or len(data) < 16:
             return
         guid, menu_id, option_index = struct.unpack_from("<QII", data, 0)
+        if option_index == vendor.VENDOR_GOSSIP_OPTION_INDEX:
+            await self._open_vendor_from_gossip(guid)
+            return
         option = creature.get_gossip_option(
             self.config.database.world_path, menu_id, option_index
         )
@@ -278,6 +312,10 @@ class CharactersMixin:
                 f"Gossip option {option_index} missing from menu {menu_id}"
             )
             await self.send_packet(Opcodes.SMSG_GOSSIP_COMPLETE, b"")
+            return
+
+        if int(option["option_type"]) == vendor.GOSSIP_OPTION_VENDOR:
+            await self._open_vendor_from_gossip(guid)
             return
 
         action_menu_id = int(option["action_menu_id"])
@@ -303,3 +341,10 @@ class CharactersMixin:
 
         # An option with no action closes the gossip window.
         await self.send_packet(Opcodes.SMSG_GOSSIP_COMPLETE, b"")
+
+    async def _open_vendor_from_gossip(self, guid: int) -> None:
+        """A "browse your goods" gossip option: close the menu, show the goods."""
+        spawn = self._vendor_spawn(guid)
+        await self.send_packet(Opcodes.SMSG_GOSSIP_COMPLETE, b"")
+        if spawn is not None:
+            await self._send_vendor_list(guid, spawn)

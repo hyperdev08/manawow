@@ -120,8 +120,8 @@ class LootMixin:
         in the CMaNGOS dump as a negative ``mincountOrRef``: the absolute value
         is the ``reference_loot_template.entry`` to process.  Group ids select
         at most one row from a set, with CMaNGOS' shuffled explicit/equal-chance
-        semantics.  Quest-only and conditional rows are skipped because this
-        server has no quest/condition engine.
+        semantics.  Quest-only rows drop only for a player who needs the item;
+        conditional rows are skipped because there is no condition engine.
         """
         con = sqlite3.connect(self.config.database.world_path)
         try:
@@ -138,23 +138,22 @@ class LootMixin:
         return self._filter_loot_items(rolled)[:self.MAX_LOOT_ITEMS]
 
     @staticmethod
-    def _loot_row_chance(row) -> float:
-        return float(row[1] or 0.0)
-
-    @staticmethod
     def _loot_row_condition(row) -> int:
         return int(row[5] or 0) if len(row) > 5 else 0
 
     def _loot_row_usable(self, row) -> bool:
-        """Skip quest-only and conditional rows (no quest/condition engine)."""
-        chance = self._loot_row_chance(row)
-        return chance >= 0.0 and self._loot_row_condition(row) == 0
+        """Skip conditional rows (no condition engine yet).
+
+        Quest-only rows are filtered earlier by ``_loot_row_allowed``.
+        """
+        return self._loot_row_condition(row) == 0
 
     def _roll_loot_rows(self, con, rows, out: List[Tuple[int, int]],
                         depth: int) -> None:
         """Roll a list of loot rows into ``out`` as separate loot slots."""
         if depth > 8 or not rows:
             return
+        rows = [row for row in rows if self._loot_row_allowed(row)]
         groups: Dict[int, list] = {}
         for row in rows:
             if not self._loot_row_usable(row):
@@ -169,6 +168,23 @@ class LootMixin:
             chosen = self._pick_group_row(group_rows, out)
             if chosen is not None:
                 self._resolve_loot_row(con, chosen, out, depth)
+
+    @staticmethod
+    def _loot_row_chance(row) -> float:
+        # A negative chance marks a quest item; the magnitude is still the
+        # drop percentage (see ``_loot_row_allowed`` for the quest check).
+        return abs(float(row[1] or 0.0))
+
+    def _loot_row_allowed(self, row) -> bool:
+        """Quest items (negative chance) only drop for a player who needs them.
+
+        ``LootItem::AllowedForPlayer``: the item must be an objective of an
+        active, unfinished quest.
+        """
+        if float(row[1] or 0.0) >= 0.0 or int(row[3] or 0) < 0:
+            return True
+        needs = getattr(self, "_quest_needs_item", None)
+        return bool(needs and needs(int(row[0])))
 
     def _loot_row_hits(self, row) -> bool:
         chance = self._loot_row_chance(row)
@@ -335,45 +351,7 @@ class LootMixin:
             # client's "inventory is full" error (EQUIP_ERR_INV_FULL = 50).
             await self._send_inventory_failure(self.INVENTORY_FULL)
             return
-        inventory = self.character.setdefault("inventory", {})
-        for change in changes:
-            slot = int(change["slot"])
-            if change["created"]:
-                item_guid = F.ITEM_HIGH_GUID | (int(change["id"]) & 0xFFFFFFFF)
-                item_dict = {
-                    "guid": item_guid,
-                    "id": change["id"],
-                    "item_entry": int(item_entry),
-                    "stack_count": change["stack_count"],
-                    "durability": change["durability"],
-                    "max_durability": change["max_durability"],
-                    "slot": slot,
-                    "owner_guid": int(self.player_guid),
-                    "enchantment_1": 0,
-                }
-                inventory[slot] = item_dict
-                # The client cannot show a bag item whose object does not
-                # exist, so the create block has to precede the field update
-                # that references it.
-                await self._send_item_create_block(item_dict)
-            else:
-                item_dict = inventory.get(slot)
-                if item_dict is not None:
-                    item_dict["stack_count"] = change["stack_count"]
-                    opcode, payload = object_update.build_item_values_update(
-                        item_dict,
-                        {F.ITEM_FIELD_STACK_COUNT: int(change["stack_count"])},
-                    )
-                    await self.send_packet(opcode, payload)
-            client_slot = self._internal_slot_to_client(slot)
-            await self.send_packet(
-                Opcodes.SMSG_ITEM_PUSH_RESULT,
-                login_packets.build_item_push_result(
-                    int(self.player_guid), int(item_entry), 255, client_slot,
-                    count=change["added"], total_count=change["stack_count"],
-                    received=change["added"], created=0, send_chat_message=1,
-                ),
-            )
+        await self._deliver_item_changes(int(item_entry), changes)
         combat["loot_taken"].append(list_id)
         await self.broadcast_equipment_update()
         await self.send_packet(Opcodes.SMSG_LOOT_REMOVED, struct.pack("<B", list_id))

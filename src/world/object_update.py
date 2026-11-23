@@ -482,6 +482,11 @@ def build_player_values(char: Mapping, peer: bool = False) -> Dict[int, int]:
     if inventory:
         values.update(build_equipment_values(inventory))
 
+    # The quest log fields are private to the owner (UF_FLAG_PRIVATE).
+    quest_fields = char["quest_fields"] if "quest_fields" in char.keys() else None
+    if quest_fields and not peer:
+        values.update({int(k): int(v) for k, v in quest_fields.items() if int(v)})
+
     return values
 
 
