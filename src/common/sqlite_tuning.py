@@ -60,7 +60,7 @@ class _Checkpointer(threading.Thread):
         super().__init__(name=f"sqlite-checkpoint:{path}", daemon=True)
         self.path = path
         self.interval = interval
-        self._stop = threading.Event()
+        self._stop_event = threading.Event()
         self._ready = threading.Event()
 
     def run(self) -> None:
@@ -69,7 +69,7 @@ class _Checkpointer(threading.Thread):
         try:
             con.execute("PRAGMA synchronous=NORMAL")
             self._ready.set()
-            while not self._stop.wait(self.interval):
+            while not self._stop_event.wait(self.interval):
                 try:
                     con.execute("PRAGMA wal_checkpoint(PASSIVE)").fetchone()
                 except sqlite3.Error:
@@ -83,7 +83,7 @@ class _Checkpointer(threading.Thread):
         self._ready.wait(timeout)
 
     def stop(self) -> None:
-        self._stop.set()
+        self._stop_event.set()
         self.join(timeout=60)
 
 
