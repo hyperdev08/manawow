@@ -14,6 +14,7 @@ from .constants import (
     MOVEMENT_OPCODES_TIME_ONLY,
     MOVEMENT_OPCODES_WITHOUT_GUID,
     POSITION_SAVE_INTERVAL,
+    SPELL_FAILED_INTERRUPTED,
 )
 
 class PlayerMovementMixin:
@@ -85,10 +86,28 @@ class PlayerMovementMixin:
             return
 
         self.movement_info = info
+        old_x = float(self.character.get("x", info.x) or 0.0)
+        old_y = float(self.character.get("y", info.y) or 0.0)
+        moved = ((info.x - old_x) ** 2 + (info.y - old_y) ** 2) ** 0.5
+        if (hasattr(self, "_player_can_move")
+                and not self._player_can_move() and moved > 0.5):
+            self.log.debug(
+                f"{name}: movement rejected while rooted/stunned")
+            return
         self.character["x"] = info.x
         self.character["y"] = info.y
         self.character["z"] = info.z
         self.character["o"] = info.o
+
+        # Moving cancels a normal cast or channel unless the spell is flagged
+        # uninterruptible.  The client sends a movement packet for tiny
+        # corrections as well, so only a real displacement triggers it.
+        if moved > 0.5:
+            combat = self._get_combat_state()
+            if combat.get("pending_cast") or combat.get("channel"):
+                if hasattr(self, "_interrupt_player_cast"):
+                    await self._interrupt_player_cast(
+                        SPELL_FAILED_INTERRUPTED)
 
         message = f"{name}: {info.describe()}"
         if opcode in MOVEMENT_OPCODES_QUIET:

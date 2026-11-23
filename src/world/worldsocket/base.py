@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 import os
 import struct
 import time
@@ -15,7 +16,9 @@ from src.network.packet_log import get_packet_log
 from src.network.packet_log import Direction
 from src.protocol.opcodes import Opcodes
 from src.world import creature
+from src.world import geometry
 from src.world import login_packets
+from src.world import los
 from src.world import movement
 from src.world import object_update
 
@@ -161,8 +164,11 @@ class SocketBase:
 
                 await self.handle_packet(header.opcode, payload)
 
-        except (asyncio.IncompleteReadError, asyncio.TimeoutError, ConnectionResetError):
-            pass
+        except (asyncio.IncompleteReadError, asyncio.TimeoutError,
+                ConnectionError) as exc:
+            # A normal client disconnect on Windows often surfaces as
+            # ConnectionAbortedError (WinError 10053), not IncompleteReadError.
+            self.log.debug(f"World client disconnected: {exc}")
         except Exception as exc:
             self.log.exception(f"World socket error: {exc}")
         finally:
@@ -277,10 +283,38 @@ class SocketBase:
                 await self.handle_cast_spell(data)
             elif opcode == Opcodes.CMSG_CANCEL_CAST:
                 await self.handle_cancel_cast(data)
+            elif opcode == Opcodes.CMSG_CANCEL_CHANNELLING:
+                await self.handle_cancel_channel(data)
+            elif opcode == Opcodes.CMSG_CANCEL_AURA:
+                await self.handle_cancel_aura(data)
+            elif opcode == Opcodes.CMSG_CANCEL_TEMP_ENCHANTMENT:
+                await self.handle_cancel_temp_enchantment(data)
             elif opcode == Opcodes.CMSG_SET_SELECTION:
                 await self.handle_set_selection(data)
             elif opcode == Opcodes.CMSG_LOOT:
                 await self.handle_loot(data)
+            elif opcode == Opcodes.CMSG_GROUP_INVITE:
+                await self.handle_group_invite(data)
+            elif opcode == Opcodes.CMSG_GROUP_ACCEPT:
+                await self.handle_group_accept(data)
+            elif opcode == Opcodes.CMSG_GROUP_DECLINE:
+                await self.handle_group_decline(data)
+            elif opcode == Opcodes.CMSG_GROUP_UNINVITE:
+                await self.handle_group_uninvite(data)
+            elif opcode == Opcodes.CMSG_GROUP_UNINVITE_GUID:
+                await self.handle_group_uninvite_guid(data)
+            elif opcode == Opcodes.CMSG_GROUP_SET_LEADER:
+                await self.handle_group_set_leader(data)
+            elif opcode == Opcodes.CMSG_GROUP_DISBAND:
+                await self.handle_group_disband(data)
+            elif opcode == Opcodes.CMSG_GROUP_RAID_CONVERT:
+                await self.handle_group_raid_convert(data)
+            elif opcode == Opcodes.CMSG_GROUP_CHANGE_SUB_GROUP:
+                await self.handle_group_change_subgroup(data)
+            elif opcode == Opcodes.CMSG_GROUP_SWAP_SUB_GROUP:
+                await self.handle_group_swap_subgroup(data)
+            elif opcode == Opcodes.CMSG_REQUEST_PARTY_MEMBER_STATS:
+                await self.handle_request_party_member_stats(data)
             elif opcode == Opcodes.CMSG_LOOT_RELEASE:
                 await self.handle_loot_release(data)
             elif opcode == Opcodes.CMSG_LOOT_MONEY:
@@ -310,14 +344,28 @@ class SocketBase:
                 "in_combat": False,
                 "target_guid": 0,
                 "auto_attacking": False,
+                "ranged_attacking": False,
+                "ranged_spell_id": 75,
+                "last_ranged_swing": 0.0,
+                "ranged_interval": 2.0,
                 "last_swing": 0.0,
                 "swing_interval": 2.0,
                 "pending_cast": None,
+                "channel": None,
+                "school_lockout": {},
                 "cooldowns": {},
                 # low_guid -> {last_swing, chase_until}
                 "aggro": {},
+                # Misdirection/Tricks-style threat redirect for this player.
+                "threat_redirect": None,
                 # active damage/heal over time effects
                 "dots": [],
+                # persistent ground AoE effects (Blizzard, Consecration, ...)
+                "area_effects": [],
+                # modifier auras (slow/root/stun/stat/...), player + creatures
+                "auras": [],
+                "creature_auras": {},
+                "aura_state": {},
                 "loot_target": 0,
                 "loot_items": [],
                 "loot_taken": [],
@@ -336,6 +384,10 @@ class SocketBase:
                 # when the rogue opens on a different target.
                 "combo_target": 0,
                 "combo_points": 0,
+                # slot -> temporary weapon enchant/poison and per-item proc state
+                "weapon_enchants": {},
+                "weapon_proc_cooldowns": {},
+                "weapon_proc_charges": {},
                 # Death knight runes: one entry per slot with the base type,
                 # the current type (death runes convert back when spent) and
                 # the remaining cooldown in milliseconds.
@@ -408,6 +460,168 @@ class SocketBase:
     def _distance(a: tuple[float, float, float],
                   b: tuple[float, float, float]) -> float:
         return ((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2 + (a[2] - b[2]) ** 2) ** 0.5
+
+    @staticmethod
+    def _normalised_delta(angle: float, facing: float) -> float:
+        return (angle - facing + math.pi) % (2.0 * math.pi) - math.pi
+
+    def _in_front(self, observer: tuple[float, float, float], facing: float,
+                  target: tuple[float, float, float],
+                  arc: float = math.pi) -> bool:
+        """True when ``target`` lies inside a frontal arc.
+
+        ``arc`` is the full arc width in radians; the reference melee/facing
+        checks use a 180-degree frontal arc.
+        """
+        dx = target[0] - observer[0]
+        dy = target[1] - observer[1]
+        if dx * dx + dy * dy < 0.0001:
+            return True
+        delta = SocketBase._normalised_delta(math.atan2(dy, dx), facing)
+        return abs(delta) <= arc / 2.0 + 1e-6
+
+    def _unit_facing(self, guid: int) -> float:
+        if self._is_player_guid(guid) and self.character:
+            return float(self.character.get("o", 0.0) or 0.0)
+        low = creature.creature_low_guid(int(guid or 0))
+        state = self._get_combat_state().get("aggro", {}).get(low)
+        if state is not None and state.get("facing") is not None:
+            return float(state["facing"])
+        spawn = self._get_creature_spawn(low)
+        if spawn is not None and "o" in spawn.keys():
+            return float(spawn["o"] or 0.0)
+        return 0.0
+
+    def _unit_eye_position(self, guid: int) -> tuple[float, float, float]:
+        if self._is_player_guid(guid):
+            pos = self._player_position()
+        else:
+            low = creature.creature_low_guid(int(guid or 0))
+            pos = self._creature_position(low)
+        return (pos[0], pos[1], pos[2] + 1.6)
+
+    def _get_geometry(self):
+        """Shared extracted terrain/VMap/MMap data, or ``None`` when absent."""
+        if not hasattr(self, "_world_geometry"):
+            self._world_geometry = geometry.get_geometry(
+                self.config, getattr(self.config.database, "world_path", None))
+        return self._world_geometry
+
+    def _current_map_id(self) -> int:
+        return int((getattr(self, "character", None) or {}).get("map", 0) or 0)
+
+    def _has_line_of_sight(self, start, end, map_id: int | None = None) -> bool:
+        if not getattr(self, "character", None):
+            return True
+        if map_id is None:
+            map_id = (self._current_map_id()
+                      if hasattr(self, "_current_map_id")
+                      else int(self.character.get("map", 0) or 0))
+        start = (float(start[0]), float(start[1]), float(start[2]))
+        end = (float(end[0]), float(end[1]), float(end[2]))
+        world = (self._get_geometry()
+                 if hasattr(self, "_get_geometry") else None)
+        if world is not None:
+            return world.has_line_of_sight(int(map_id), start, end)
+        return los.has_los(
+            self.config.database.world_path, int(map_id), start, end)
+
+    def _ground_height(self, x: float, y: float,
+                       map_id: int | None = None) -> float | None:
+        world = self._get_geometry()
+        if world is None:
+            return None
+        return world.ground_height(
+            self._current_map_id() if map_id is None else int(map_id),
+            float(x), float(y))
+
+    def _find_world_path(self, start, end, max_tiles: int = 2):
+        """Navmesh waypoints for ``start`` -> ``end`` (``None`` when unavailable)."""
+        world = self._get_geometry()
+        if world is None:
+            return None
+        return world.find_path(self._current_map_id(), start, end,
+                               max_tiles=max_tiles)
+
+    def _navmesh_point(self, point, max_distance: float = 8.0):
+        world = self._get_geometry()
+        if world is None:
+            return None
+        return world.point_on_mesh(self._current_map_id(), point)
+
+    def _random_world_point(self, center, radius: float):
+        world = self._get_geometry()
+        if world is None:
+            return None
+        return world.random_point(self._current_map_id(), center, radius)
+
+    @staticmethod
+    def _path_prefix(start, path, travel: float, stop_distance: float = 0.0):
+        """Return the path points reachable within ``travel`` yards.
+
+        The final point is interpolated so a caller can cap a spline at a
+        known duration.  ``stop_distance`` leaves room for melee reach.
+        """
+        if not path:
+            return []
+        remaining = max(0.0, float(travel))
+        if stop_distance:
+            # Do not spend the last yards that are reserved for melee.
+            total = 0.0
+            for index in range(1, len(path)):
+                total += ((path[index][0] - path[index - 1][0]) ** 2
+                          + (path[index][1] - path[index - 1][1]) ** 2
+                          + (path[index][2] - path[index - 1][2]) ** 2) ** 0.5
+            remaining = max(0.0, min(remaining, total - stop_distance))
+        points = []
+        current = (float(start[0]), float(start[1]), float(start[2]))
+        for point in path[1:]:
+            dx = point[0] - current[0]
+            dy = point[1] - current[1]
+            dz = point[2] - current[2]
+            segment = (dx * dx + dy * dy + dz * dz) ** 0.5
+            if segment <= 1e-6:
+                continue
+            if segment >= remaining:
+                if remaining > 0.05:
+                    scale = remaining / segment
+                    points.append((current[0] + dx * scale,
+                                   current[1] + dy * scale,
+                                   current[2] + dz * scale))
+                break
+            points.append((float(point[0]), float(point[1]),
+                           float(point[2])))
+            remaining -= segment
+            current = points[-1]
+        return points
+
+    def _target_in_front(self, target_guid: int, arc: float = math.pi) -> bool:
+        if not target_guid or self._is_player_guid(target_guid):
+            return True
+        observer = self._player_position()
+        if self._is_peer_player_guid(target_guid):
+            peer = self._peer_session_for_guid(target_guid)
+            if peer is None or not peer.character:
+                return True
+            target = (float(peer.character.get("x", 0.0)),
+                      float(peer.character.get("y", 0.0)),
+                      float(peer.character.get("z", 0.0)))
+        else:
+            low = creature.creature_low_guid(int(target_guid))
+            spawn = self._get_creature_spawn(low)
+            if spawn is None:
+                return True
+            target = self._creature_position(low)
+            # Standing inside a large target's collision volume should never
+            # fail, but ordinary melee range must still require facing.
+            radius = 1.0
+            if "bounding_radius" in spawn.keys():
+                radius += max(0.0, float(spawn["bounding_radius"] or 0.0))
+            if self._distance(observer, target) <= min(2.5, radius):
+                return True
+        return self._in_front(
+            observer, float(self.character.get("o", 0.0) or 0.0),
+            target, arc)
 
     def _unit_is_alive(self, guid: int) -> bool:
         """True while ``guid`` can hold combo points.

@@ -22,6 +22,7 @@ CREATE TABLE IF NOT EXISTS spell_templates(
   targets INTEGER NOT NULL DEFAULT 0,
   target_creature_type INTEGER NOT NULL DEFAULT 0,
   requires_spell_focus INTEGER NOT NULL DEFAULT 0,
+  facing_caster_flags INTEGER NOT NULL DEFAULT 0,
   caster_aura_state INTEGER NOT NULL DEFAULT 0,
   target_aura_state INTEGER NOT NULL DEFAULT 0,
   caster_aura_state_not INTEGER NOT NULL DEFAULT 0,
@@ -340,4 +341,24 @@ CREATE TABLE IF NOT EXISTS spell_duration(
   duration INTEGER NOT NULL DEFAULT 0,
   duration_per_level INTEGER NOT NULL DEFAULT 0,
   max_duration INTEGER NOT NULL DEFAULT 0
+);
+
+-- CMaNGOS ``playercreateinfo_spell``: the exact spells every race/class
+-- combination knows at creation.
+CREATE TABLE IF NOT EXISTS playercreateinfo_spell(
+  race INTEGER NOT NULL DEFAULT 0,
+  class INTEGER NOT NULL DEFAULT 0,
+  spell INTEGER NOT NULL DEFAULT 0,
+  note TEXT NOT NULL DEFAULT '',
+  PRIMARY KEY(race, class, spell)
+);
+
+-- CMaNGOS ``playercreateinfo_action``: the default action bar per race/class.
+CREATE TABLE IF NOT EXISTS playercreateinfo_action(
+  race INTEGER NOT NULL DEFAULT 0,
+  class INTEGER NOT NULL DEFAULT 0,
+  button INTEGER NOT NULL DEFAULT 0,
+  action INTEGER NOT NULL DEFAULT 0,
+  type INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY(race, class, button)
 );

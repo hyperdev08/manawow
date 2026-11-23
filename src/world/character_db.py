@@ -120,30 +120,35 @@ CREATE TABLE IF NOT EXISTS item_templates(
   spell_cooldown1 INTEGER NOT NULL DEFAULT 0,
   spell_category1 INTEGER NOT NULL DEFAULT 0,
   spell_category_cooldown1 INTEGER NOT NULL DEFAULT 0,
+  spell_ppm_rate1 REAL NOT NULL DEFAULT 0.0,
   spell_id2 INTEGER NOT NULL DEFAULT 0,
   spell_trigger2 INTEGER NOT NULL DEFAULT 0,
   spell_charges2 INTEGER NOT NULL DEFAULT 0,
   spell_cooldown2 INTEGER NOT NULL DEFAULT 0,
   spell_category2 INTEGER NOT NULL DEFAULT 0,
   spell_category_cooldown2 INTEGER NOT NULL DEFAULT 0,
+  spell_ppm_rate2 REAL NOT NULL DEFAULT 0.0,
   spell_id3 INTEGER NOT NULL DEFAULT 0,
   spell_trigger3 INTEGER NOT NULL DEFAULT 0,
   spell_charges3 INTEGER NOT NULL DEFAULT 0,
   spell_cooldown3 INTEGER NOT NULL DEFAULT 0,
   spell_category3 INTEGER NOT NULL DEFAULT 0,
   spell_category_cooldown3 INTEGER NOT NULL DEFAULT 0,
+  spell_ppm_rate3 REAL NOT NULL DEFAULT 0.0,
   spell_id4 INTEGER NOT NULL DEFAULT 0,
   spell_trigger4 INTEGER NOT NULL DEFAULT 0,
   spell_charges4 INTEGER NOT NULL DEFAULT 0,
   spell_cooldown4 INTEGER NOT NULL DEFAULT 0,
   spell_category4 INTEGER NOT NULL DEFAULT 0,
   spell_category_cooldown4 INTEGER NOT NULL DEFAULT 0,
+  spell_ppm_rate4 REAL NOT NULL DEFAULT 0.0,
   spell_id5 INTEGER NOT NULL DEFAULT 0,
   spell_trigger5 INTEGER NOT NULL DEFAULT 0,
   spell_charges5 INTEGER NOT NULL DEFAULT 0,
   spell_cooldown5 INTEGER NOT NULL DEFAULT 0,
   spell_category5 INTEGER NOT NULL DEFAULT 0,
   spell_category_cooldown5 INTEGER NOT NULL DEFAULT 0,
+  spell_ppm_rate5 REAL NOT NULL DEFAULT 0.0,
   bonding INTEGER NOT NULL DEFAULT 0,
   description TEXT NOT NULL DEFAULT '',
   page_text INTEGER NOT NULL DEFAULT 0,
@@ -397,6 +402,17 @@ def init_character_db(path: str) -> None:
             con.execute("ALTER TABLE characters ADD COLUMN xp INTEGER NOT NULL DEFAULT 0")
         if "money" not in columns:
             con.execute("ALTER TABLE characters ADD COLUMN money INTEGER NOT NULL DEFAULT 0")
+        # Item proc rates are imported from item_template.spellppmRate_*.  Older
+        # databases only have the spell ids/triggers.
+        item_columns = {
+            row[1] for row in con.execute("PRAGMA table_info(item_templates)")
+        }
+        for index in range(1, 6):
+            column = f"spell_ppm_rate{index}"
+            if column not in item_columns:
+                con.execute(
+                    f"ALTER TABLE item_templates ADD COLUMN {column}"
+                    " REAL NOT NULL DEFAULT 0.0")
         _migrate_start_positions(con)
         _seed_starter_items(con)
         _backfill_starter_spells(con)
@@ -405,18 +421,65 @@ def init_character_db(path: str) -> None:
         con.close()
 
 
+def _starter_spells_for(con: sqlite3.Connection, race: int,
+                        char_class: int) -> List[int]:
+    """Return the 3.3.5a starter spell ids for a race/class combination.
+
+    ``playercreateinfo_spell`` is the authoritative list (it includes racials,
+    languages, armor/weapon proficiencies and the class's level-1 abilities).
+    The class-only table below is only a fallback for a database that has not
+    loaded ``playercreateinfo.sql`` yet.
+    """
+    try:
+        rows = con.execute(
+            "SELECT spell FROM playercreateinfo_spell"
+            " WHERE race = ? AND class = ? ORDER BY spell",
+            (int(race), int(char_class)),
+        ).fetchall()
+    except sqlite3.Error:
+        rows = []
+    spells = [int(row[0]) for row in rows]
+    if not spells:
+        spells = list(_STARTER_SPELLS_BY_CLASS.get(int(char_class), []))
+    for spell_id in _EXTRA_STARTER_SPELLS_BY_CLASS.get(int(char_class), []):
+        if spell_id not in spells:
+            spells.append(spell_id)
+    return spells
+
+
+def get_starter_spells(path: str, race: int, char_class: int) -> List[int]:
+    """Public helper for callers that only have the database path."""
+    con = sqlite3.connect(path)
+    try:
+        return _starter_spells_for(con, race, char_class)
+    finally:
+        con.close()
+
+
 def _backfill_starter_spells(con: sqlite3.Connection) -> None:
     """Grant any missing starter spells to every character.
 
-    This used to run only for characters with an empty spellbook.  Starter
-    lists grow over time (for example Summon Imp for warlocks), and re-running
-    the insert for everyone lets an existing character pick those up without a
-    wipe.  ``INSERT OR IGNORE`` makes it a no-op for known spells.
+    Characters created before the authentic ``playercreateinfo_spell`` data
+    was imported still pick up their real level-1 spellbook without a wipe.
+    ``INSERT OR IGNORE`` makes the pass a no-op for spells already known.  If
+    the table does not exist yet (a tool opened the character database before
+    ``init_creature_db``), the backfill is skipped rather than guessing with
+    the class-only fallback.
     """
-    rows = con.execute("SELECT guid, class FROM characters").fetchall()
+    try:
+        if con.execute(
+                "SELECT 1 FROM playercreateinfo_spell LIMIT 1").fetchone() is None:
+            _seed_starter_items(con)
+            con.commit()
+            return
+    except sqlite3.Error:
+        _seed_starter_items(con)
+        con.commit()
+        return
+    rows = con.execute("SELECT guid, race, class FROM characters").fetchall()
     added = 0
-    for guid, char_class in rows:
-        for spell_id in _STARTER_SPELLS_BY_CLASS.get(int(char_class), []):
+    for guid, race, char_class in rows:
+        for spell_id in _starter_spells_for(con, int(race), int(char_class)):
             cur = con.execute(
                 "INSERT OR IGNORE INTO character_spells(character_guid, spell, active) VALUES(?,?,1)",
                 (int(guid), int(spell_id)),
@@ -565,7 +628,7 @@ def create_character(path: str, account_id: int, name: str, race: int, char_clas
              hair_style, hair_color, facial_style, level, map_id, zone, x, y, z, o),
         )
         guid = int(cur.lastrowid)
-        _grant_starter_spells(con, guid, char_class)
+        _grant_starter_spells(con, guid, race, char_class)
         con.commit()
         return guid
     finally:
@@ -1071,7 +1134,13 @@ def get_equipped_item_totals(path: str, character_guid: int) -> Dict[str, int]:
     totals: Dict[str, int] = {
         "str": 0, "agi": 0, "sta": 0, "inte": 0, "spi": 0,
         "health": 0, "mana": 0,
-        "attack_power": 0, "ranged_attack_power": 0,
+        "attack_power": 0, "ranged_attack_power": 0, "spell_power": 0,
+        "hit_rating": 0, "crit_rating": 0, "haste_rating": 0,
+        "defense_rating": 0, "dodge_rating": 0, "parry_rating": 0,
+        "block_rating": 0, "block_value": 0,
+        "resilience": 0, "armor_penetration": 0, "expertise": 0,
+        "spell_penetration": 0, "healing_power": 0,
+        "shield": 0,
         "armor": 0, "holy": 0, "fire": 0, "nature": 0,
         "frost": 0, "shadow": 0, "arcane": 0,
     }
@@ -1084,7 +1153,8 @@ def get_equipped_item_totals(path: str, character_guid: int) -> Dict[str, int]:
     con = sqlite3.connect(path)
     try:
         rows = con.execute(
-            f"SELECT {resistance_columns}, {stat_columns} "
+            f"SELECT {resistance_columns}, {stat_columns},"
+            " it.subclass, it.inventory_type "
             "FROM character_items ci "
             "JOIN item_templates it ON ci.item_entry = it.entry "
             "WHERE ci.character_guid = ? AND ci.slot BETWEEN 0 AND 18",
@@ -1099,6 +1169,10 @@ def get_equipped_item_totals(path: str, character_guid: int) -> Dict[str, int]:
         for index, (key, _column) in enumerate(_ITEM_RESISTANCES):
             totals[key] += int(row[index] or 0)
         offset = len(_ITEM_RESISTANCES)
+        subclass = int(row[offset + 20] or 0)
+        inventory_type = int(row[offset + 21] or 0)
+        if subclass == 6 or inventory_type == 14:      # shield
+            totals["shield"] = 1
         for stat_index in range(10):
             stat_type = int(row[offset + stat_index * 2] or 0)
             stat_value = int(row[offset + stat_index * 2 + 1] or 0)
@@ -1114,6 +1188,34 @@ def get_equipped_item_totals(path: str, character_guid: int) -> Dict[str, int]:
                 totals["attack_power"] += stat_value
             elif stat_type == 39:           # ITEM_MOD_RANGED_ATTACK_POWER
                 totals["ranged_attack_power"] += stat_value
+            elif stat_type == 45:           # ITEM_MOD_SPELL_POWER
+                totals["spell_power"] += stat_value
+            elif stat_type == 12:           # ITEM_MOD_DEFENSE_SKILL_RATING
+                totals["defense_rating"] += stat_value
+            elif stat_type == 13:           # ITEM_MOD_DODGE_RATING
+                totals["dodge_rating"] += stat_value
+            elif stat_type == 14:           # ITEM_MOD_PARRY_RATING
+                totals["parry_rating"] += stat_value
+            elif stat_type == 15:           # ITEM_MOD_BLOCK_RATING
+                totals["block_rating"] += stat_value
+            elif stat_type in (16, 17, 18, 31):  # melee/ranged/spell hit rating
+                totals["hit_rating"] += stat_value
+            elif stat_type in (19, 20, 21, 32):  # melee/ranged/spell crit rating
+                totals["crit_rating"] += stat_value
+            elif stat_type in (28, 29, 30, 36):  # melee/ranged/spell haste rating
+                totals["haste_rating"] += stat_value
+            elif stat_type == 35:           # ITEM_MOD_RESILIENCE_RATING
+                totals["resilience"] += stat_value
+            elif stat_type == 37:           # ITEM_MOD_EXPERTISE_RATING
+                totals["expertise"] += stat_value
+            elif stat_type == 44:           # ITEM_MOD_ARMOR_PENETRATION_RATING
+                totals["armor_penetration"] += stat_value
+            elif stat_type == 47:           # ITEM_MOD_SPELL_PENETRATION
+                totals["spell_penetration"] += stat_value
+            elif stat_type in (41, 42):     # healing / spell damage
+                totals["healing_power"] += stat_value
+            elif stat_type == 48:           # ITEM_MOD_BLOCK_VALUE
+                totals["block_value"] += stat_value
     return totals
 
 
@@ -1288,123 +1390,190 @@ def add_item_to_inventory(path: str, character_guid: int, entry: int,
         con.close()
 
 
-# Class-specific starter spells from playercreateinfo_spell (CMaNGOS WoTLKDB).
-# Maps class ID -> list of spell IDs to grant at character creation.
-# Class IDs: 1=Warrior, 2=Paladin, 3=Hunter, 4=Rogue, 5=Priest, 6=DK, 7=Shaman, 8=Mage, 9=Warlock, 11=Druid
+# Fallback spellbook used only when ``playercreateinfo_spell`` is empty (for
+# example a database created before playercreateinfo.sql was loaded).  The
+# authoritative, race-specific list lives in ``playercreateinfo.sql``; this
+# table keeps each class functional with its real level-1 abilities, armor and
+# weapon proficiencies.
 _STARTER_SPELLS_BY_CLASS = {
     1: [  # Warrior
-        6603,   # Attack
         78,     # Heroic Strike
         81,     # Dodge
         107,    # Block
         196,    # One-Handed Axes
+        197,    # Two-Handed Axes
         198,    # One-Handed Maces
+        199,    # Two-Handed Maces
+        201,    # One-Handed Swords
+        202,    # Two-Handed Swords
         203,    # Unarmed
         204,    # Defense
-        196,    # One-Handed Axes (duplicate entry in source)
-        198,    # One-Handed Maces (duplicate entry in source)
+        1180,   # Daggers
+        2457,   # Battle Stance
+        2567,   # Thrown
+        2764,   # Throw
+        6603,   # Attack
+        8737,   # Mail
+        9077,   # Leather
+        9116,   # Shield
     ],
     2: [  # Paladin
-        6603,   # Attack
-        21084,  # Seal of Righteousness
         81,     # Dodge
         107,    # Block
         198,    # One-Handed Maces
+        199,    # Two-Handed Maces
+        201,    # One-Handed Swords
+        202,    # Two-Handed Swords
         203,    # Unarmed
         204,    # Defense
         635,    # Holy Light
+        6603,   # Attack
+        8737,   # Mail
+        9077,   # Leather
+        9116,   # Shield
+        21084,  # Seal of Righteousness
+        27762,  # Libram
     ],
     3: [  # Hunter
-        6603,   # Attack
-        2973,   # Raptor Strike
+        75,     # Auto Shot
         81,     # Dodge
         196,    # One-Handed Axes
+        197,    # Two-Handed Axes
+        201,    # One-Handed Swords
         203,    # Unarmed
         204,    # Defense
         264,    # Bows
-        261,    # Arcane Shot (might not be in spell_templates)
+        266,    # Guns
+        1180,   # Daggers
+        2973,   # Raptor Strike
+        5011,   # Crossbows
+        6603,   # Attack
+        9077,   # Leather
     ],
     4: [  # Rogue
-        6603,   # Attack
+        81,     # Dodge
+        203,    # Unarmed
+        204,    # Defense
+        674,    # Dual Wield
+        1180,   # Daggers
         1752,   # Sinister Strike
         2098,   # Eviscerate
-        81,     # Dodge
-        1180,   # Daggers
-        203,    # Unarmed
-        204,    # Defense
         2567,   # Thrown
+        2764,   # Throw
+        6603,   # Attack
+        9077,   # Leather
+        16092,  # Defensive State (DND)
+        21184,  # Rogue Passive (DND)
     ],
     5: [  # Priest
-        6603,   # Attack
-        585,    # Smite
         81,     # Dodge
+        198,    # One-Handed Maces
         203,    # Unarmed
         204,    # Defense
-        585,    # Smite (duplicate)
+        227,    # Staves
+        585,    # Smite
         2050,   # Lesser Heal
         5009,   # Wands
         5019,   # Shoot
-    ],
-    6: [  # Death Knight
         6603,   # Attack
+    ],
+    6: [  # Death Knight (starts at level 55, so the kit is much larger)
+        81,     # Dodge
+        196,    # One-Handed Axes
+        197,    # Two-Handed Axes
+        200,    # Polearms
+        201,    # One-Handed Swords
+        202,    # Two-Handed Swords
+        203,    # Unarmed
+        204,    # Defense
+        674,    # Dual Wield
+        750,    # Plate Mail
+        3127,   # Parry
+        6603,   # Attack
+        8737,   # Mail
+        9077,   # Leather
         45462,  # Plague Strike
         45477,  # Icy Touch
         45902,  # Blood Strike
+        45903,  # Offensive State (DND)
+        47541,  # Death Coil
         48266,  # Blood Presence
+        49410,  # Forceful Deflection
         49576,  # Death Grip
-        81,     # Dodge
-        203,    # Unarmed
-        204,    # Defense
-        45462,  # Plague Strike
+        52665,  # Sigil
+        56816,  # Rune Strike
+        59879,  # Blood Plague
+        59921,  # Frost Fever
+        61455,  # Runic Focus
     ],
     7: [  # Shaman
-        6603,   # Attack
-        331,    # Healing Wave
-        403,    # Lightning Bolt
         81,     # Dodge
         107,    # Block
         198,    # One-Handed Maces
         203,    # Unarmed
-        204,    # Defense,
+        204,    # Defense
         227,    # Staves
+        331,    # Healing Wave
+        403,    # Lightning Bolt
+        6603,   # Attack
+        9077,   # Leather
+        9116,   # Shield
+        27763,  # Totem
+        75461,  # Flame Shock Passive
     ],
     8: [  # Mage
-        6603,   # Attack
+        81,     # Dodge
         133,    # Fireball
         168,    # Frost Armor
-        81,     # Dodge
         203,    # Unarmed
-        204,    # Defense,
+        204,    # Defense
         227,    # Staves
+        5009,   # Wands
+        5019,   # Shoot
+        6603,   # Attack
+        71761,  # Deep Freeze Immunity State
     ],
     9: [  # Warlock
-        6603,   # Attack
+        81,     # Dodge
+        203,    # Unarmed
+        204,    # Defense
+        227,    # Staves
         686,    # Shadow Bolt
         687,    # Demon Skin
-        688,    # Summon Imp (level-1 warlock pet; no trainer exists here)
-        81,     # Dodge
         1180,   # Daggers
-        203,    # Unarmed
-        204,    # Defense,
-        686,    # Shadow Bolt (duplicate)
+        5009,   # Wands
+        5019,   # Shoot
+        6603,   # Attack
+        18822,  # Improved Enslave Demon
+        58284,  # Chaos Bolt Passive
+        75445,  # Demonic Immolate
     ],
     11: [  # Druid
-        6603,   # Attack
-        5176,   # Wrath
-        5185,   # Healing Touch
         81,     # Dodge
         198,    # One-Handed Maces
         203,    # Unarmed
-        204,    # Defense,
+        204,    # Defense
         227,    # Staves
+        1180,   # Daggers
+        5176,   # Wrath
+        5185,   # Healing Touch
+        6603,   # Attack
+        9077,   # Leather
     ],
 }
 
+# Abilities a level-1 class trainer would teach but ``playercreateinfo_spell``
+# does not grant.  This server has no trainers, so summoning would otherwise be
+# unreachable for a warlock; the exception is deliberately kept tiny.
+_EXTRA_STARTER_SPELLS_BY_CLASS = {
+    9: [688],   # Summon Imp (level-1 trainer spell)
+}
 
-def _grant_starter_spells(con: sqlite3.Connection, character_guid: int, char_class: int) -> None:
-    """Grant class-specific starter spells to a new character."""
-    spells = _STARTER_SPELLS_BY_CLASS.get(int(char_class), [])
-    for spell_id in spells:
+
+def _grant_starter_spells(con: sqlite3.Connection, character_guid: int,
+                          race: int, char_class: int) -> None:
+    """Grant the authentic starter spellbook to a new character."""
+    for spell_id in _starter_spells_for(con, int(race), int(char_class)):
         con.execute(
             "INSERT OR IGNORE INTO character_spells(character_guid, spell, active) VALUES(?,?,1)",
             (character_guid, int(spell_id)),
@@ -1430,7 +1599,7 @@ def grant_starter_items(path: str, character_guid: int, race: int,
     # Also grant starter spells
     con = sqlite3.connect(path)
     try:
-        _grant_starter_spells(con, character_guid, char_class)
+        _grant_starter_spells(con, character_guid, race, char_class)
         con.commit()
     finally:
         con.close()
@@ -1552,3 +1721,61 @@ def get_character_action_spells(path: str, character_guid: int) -> List[int]:
     if has_attack:
         action_spells.insert(0, _AUTO_ATTACK_SPELL)
     return action_spells
+
+
+# ``SMSG_ACTION_BUTTONS`` packs ``action | (type << 24)``.  0 is a spell and
+# 128 a macro id.  The three default macros in ``playercreateinfo_action`` are
+# the standard Attack macros; this server has no macro storage, so they become
+# an ordinary Attack (6603) button.
+_ACTION_BUTTON_SPELL = 0
+_ACTION_BUTTON_MACRO = 128
+_STARTER_ATTACK_MACROS = frozenset((4604, 41751))
+
+
+def get_character_action_buttons(path: str, character_guid: int) -> dict:
+    """Return ``{button: (action, type)}`` for the initial action bar.
+
+    ``playercreateinfo_action`` is the authoritative source and matches the
+    real 3.3.5a client: button 0 is Attack, button 1 the class's first ability,
+    the next slots the racials, and 72+ the second bar page.  When that table
+    has no row for the character (an un-imported database), fall back to Attack
+    plus every known non-passive spell in spell-id order.
+    """
+    con = sqlite3.connect(path)
+    con.row_factory = sqlite3.Row
+    try:
+        char = con.execute(
+            "SELECT race, class FROM characters WHERE guid = ?",
+            (int(character_guid),),
+        ).fetchone()
+        rows = []
+        if char is not None:
+            try:
+                rows = con.execute(
+                    "SELECT button, action, type FROM playercreateinfo_action"
+                    " WHERE race = ? AND class = ? ORDER BY button",
+                    (int(char["race"]), int(char["class"])),
+                ).fetchall()
+            except sqlite3.Error:
+                rows = []
+    finally:
+        con.close()
+
+    buttons: dict = {}
+    for row in rows:
+        button = int(row["button"])
+        action = int(row["action"])
+        action_type = int(row["type"])
+        if action_type == _ACTION_BUTTON_MACRO:
+            if action in _STARTER_ATTACK_MACROS:
+                buttons[button] = (_AUTO_ATTACK_SPELL, _ACTION_BUTTON_SPELL)
+            continue
+        buttons[button] = (action, action_type)
+    if buttons:
+        return buttons
+
+    spells = get_character_action_spells(path, character_guid)
+    return {
+        index: (spell_id, _ACTION_BUTTON_SPELL)
+        for index, spell_id in enumerate(spells)
+    }

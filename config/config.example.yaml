@@ -19,6 +19,10 @@ worldserver:
   port: 8085
   realm_id: 1
   motd: "Welcome to ManaWoW (experimental)"
+  # Extracted client collision data. Populate it with
+  #   python tools/fetch_client_data.py --preset starter
+  # Leave empty to disable terrain/LOS/navmesh and use straight-line movement.
+  client_data: "./data/client"
 
 database:
   type: sqlite

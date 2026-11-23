@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from src.protocol.opcodes import Opcodes
 from src.world.worldsocket.auth import AuthMixin
+from src.world.worldsocket.auras import AurasMixin
 from src.world.worldsocket.base import SocketBase
 from src.world.worldsocket.characters import CharactersMixin
 from src.world.worldsocket.chat import ChatMixin
@@ -25,6 +26,7 @@ from src.world.worldsocket.constants import __all__ as _CONSTANT_NAMES
 from src.world.worldsocket.creature_ai import CreatureAIMixin
 from src.world.worldsocket.creature_movement import CreatureMovementMixin
 from src.world.worldsocket.creatures import CreaturesMixin
+from src.world.worldsocket.groups import GroupsMixin
 from src.world.worldsocket.inventory import InventoryMixin
 from src.world.worldsocket.loot import LootMixin
 from src.world.worldsocket.peers import PeersMixin
@@ -47,12 +49,14 @@ class WorldSocket(
     PlayerMovementMixin,
     ChatMixin,
     StatsMixin,
+    AurasMixin,
     RunesMixin,
     SpellsMixin,
     CombatMixin,
     CreaturesMixin,
     CreatureAIMixin,
     CreatureMovementMixin,
+    GroupsMixin,
     SummonsMixin,
     LootMixin,
     InventoryMixin,

@@ -156,11 +156,11 @@ async def main() -> None:
     assert searing is not None, "Searing Totem (3599) missing"
     assert_eq(searing.is_totem(), True, "totem spells carry SPELL_ATTR_TOTEM")
 
-    # An 18 s timed summon from the fallback table (the ``spell_duration``
-    # table is filled from SpellDuration.dbc by the world importer).
-    assert_eq(spells.summon_duration_ms(WORLD_DB, 18, 1), 18000,
+    # Timed summons from the fallback table (the ``spell_duration`` table is
+    # filled from SpellDuration.dbc by the world importer).
+    assert_eq(spells.summon_duration_ms(WORLD_DB, 18, 1), 20000,
               "fallback duration for index 18")
-    assert_eq(spells.summon_duration_ms(WORLD_DB, 22, 1), 30000,
+    assert_eq(spells.summon_duration_ms(WORLD_DB, 22, 1), 45000,
               "fallback duration for index 22")
 
     # A real ``spell_duration`` row: duration + per-level, capped by max.

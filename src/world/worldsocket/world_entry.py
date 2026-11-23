@@ -78,6 +78,8 @@ class WorldEntryMixin:
             del self._combat_state
         self._get_combat_state()
         self._apply_combat_stats()
+        if hasattr(self, "_restore_weapon_enchants"):
+            self._restore_weapon_enchants()
         # ``Player::InitRunes`` runs for death knights before the create block;
         # the authoritative cooldowns follow the login burst as
         # ``SMSG_RESYNC_RUNES``.
@@ -110,12 +112,12 @@ class WorldEntryMixin:
         known_spell_ids = [int(row["spell"]) for row in known_spells]
         # The cast handler refuses anything the character has not learned.
         self.known_spell_ids = set(known_spell_ids)
-        action_spell_ids = character_db.get_character_action_spells(
+        action_buttons = character_db.get_character_action_buttons(
             self.config.database.world_path, self.player_guid
         )
         for opcode, payload in login_packets.build_login_packets(
             self.character, self.config.worldserver.motd, creature_blocks,
-            known_spell_ids, action_spell_ids,
+            known_spell_ids, action_buttons,
         ):
             await self.send_packet(opcode, payload)
         if self._is_death_knight():
@@ -134,6 +136,8 @@ class WorldEntryMixin:
         self.world_entry_complete = True
         await self.send_peer_spawns()
         await self.announce_self_to_peers()
+        if hasattr(self, "_send_all_auras"):
+            await self._send_all_auras()
 
     async def handle_logout_request(self, data: bytes):
         if self.in_world:
@@ -144,6 +148,14 @@ class WorldEntryMixin:
             # Remove the character from other clients before local state is
             # cleared; despawn_for_peers() needs this session's map/guid.
             await self.despawn_for_peers()
+            if self.server is not None and getattr(
+                    self.server, "creature_combat", None) is not None:
+                self.server.creature_combat.detach_session(
+                    int(self.player_guid or 0))
+            if self.server is not None and getattr(
+                    self.server, "groups", None) is not None:
+                await self.server.groups.on_session_end(
+                    int(self.player_guid or 0))
             self.log.info(f"Returning '{self.account_name}' to character selection")
             self.in_world = False
             self.world_entry_complete = False
@@ -153,8 +165,15 @@ class WorldEntryMixin:
             self._visible_creatures = {}
             self._creature_spawn_cache = {}
             self._creature_scan_pos = None
-            self._get_combat_state()["idle"].clear()
-            self._get_combat_state()["idle_settle"].clear()
+            combat = self._get_combat_state()
+            combat["idle"].clear()
+            combat["idle_settle"].clear()
+            combat["dots"].clear()
+            combat.setdefault("area_effects", []).clear()
+            combat["auras"] = []
+            combat["creature_auras"] = {}
+            combat["aura_state"] = {}
+            combat["threat_redirect"] = None
         await self.send_packet(Opcodes.SMSG_LOGOUT_RESPONSE, struct.pack("<IB", 0, 0))
         await self.send_packet(Opcodes.SMSG_LOGOUT_COMPLETE, b"")
 
@@ -249,6 +268,11 @@ class WorldEntryMixin:
         combat["target_guid"] = 0
         combat["pending_cast"] = None
         combat["dots"] = []
+        combat.setdefault("area_effects", []).clear()
+        combat["auras"] = []
+        combat["creature_auras"] = {}
+        combat["aura_state"] = {}
+        combat["threat_redirect"] = None
         combat["aggro"].clear()
         # CMaNGOS resurrects with a full rune set; re-init and resync so the
         # client does not keep the cooldowns from before the death.

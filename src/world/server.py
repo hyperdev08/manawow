@@ -10,6 +10,9 @@ from src.common.logger import setup_logger
 from src.world.realmsocket import WorldSocket
 from src.world import character_db
 from src.world import creature
+from src.world import geometry
+from src.world.groups import GroupManager
+from src.world.world_combat import WorldCombatManager
 from src.network.packet_log import get_packet_log
 
 
@@ -19,15 +22,31 @@ class WorldServer:
         self.log = setup_logger("worldserver", config.logging.log_dir, config.logging.level, config.logging.console)
         self._server: Optional[asyncio.AbstractServer] = None
         self.sessions = []
+        # One shared aggro/threat/target/position state per engaged creature.
+        self.creature_combat = WorldCombatManager(self)
+        # Party/raid membership (session-scoped until persisted group support).
+        self.groups = GroupManager(self)
         self.packet_log = get_packet_log()
         self.packet_log.Initialize(config.logging.log_dir)
+        # Creature/spell tables (including the bundled 3.3.5a starter spells)
+        # come first so the character backfill can read them.
+        creature.init_creature_db(config.database.world_path)
         # Ensure the character schema exists and is up to date (adds the
         # orientation column to databases created before world entry existed).
         character_db.init_character_db(config.database.world_path)
-        # Creature/spell tables are created and migrated here as well, so a
-        # checkout that predates a schema addition (spell_duration, movement
-        # columns, ...) works without a manual re-import.
-        creature.init_creature_db(config.database.world_path)
+        world_geometry = geometry.get_geometry(config,
+                                               config.database.world_path)
+        if world_geometry is None:
+            self.log.info(
+                "Client collision data not configured; LOS is clear and "
+                "creatures use straight-line movement. Run "
+                "tools/fetch_client_data.py to enable terrain/VMaps/MMaps.")
+        else:
+            self.log.info(
+                f"Client collision data: terrain={world_geometry.terrain_ready}"
+                f" vmaps={world_geometry.vmaps_ready}"
+                f" mmaps={world_geometry.navmesh_ready}"
+                f" ({world_geometry.data.root})")
 
     async def handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
         peer = writer.get_extra_info("peername")
@@ -39,6 +58,12 @@ class WorldServer:
         except Exception as e:
             self.log.exception(f"World client error: {e}")
         finally:
+            try:
+                player_guid = int(getattr(session, "player_guid", 0) or 0)
+                self.creature_combat.detach_session(player_guid)
+                await self.groups.on_session_end(player_guid)
+            except Exception:
+                pass
             try:
                 if session in self.sessions:
                     self.sessions.remove(session)

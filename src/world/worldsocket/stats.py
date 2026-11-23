@@ -4,6 +4,7 @@ from __future__ import annotations
 import math
 import sqlite3
 import struct
+import time
 
 from src.protocol.opcodes import Opcodes
 from src.world import character_db
@@ -293,6 +294,24 @@ class StatsMixin:
         for key in ("str", "agi", "sta", "inte", "spi"):
             stats[key] = int(stats.get(key, 0) or 0) + int(
                 item_totals.get(key, 0) or 0)
+        # Aura stat modifiers (Arcane Intellect, Power Word: Fortitude, ...)
+        # are part of the final attribute values, exactly like item auras.
+        aura_mods = (self._player_aura_mods()
+                     if hasattr(self, "_player_aura_mods") else None)
+        if aura_mods:
+            for key in ("str", "agi", "sta", "inte", "spi"):
+                stats[key] = int(stats.get(key, 0) or 0) + int(
+                    aura_mods["stats"].get(key, 0) or 0)
+            # Percentage stat buffs (Blessing of Kings' total-stat percentage
+            # and the single-stat percent aura) are applied after all flat
+            # contributions, matching ``Unit::UpdateStats``.
+            total_pct = float(aura_mods.get("total_stat_pct", 0.0) or 0.0)
+            for key in ("str", "agi", "sta", "inte", "spi"):
+                pct = float(aura_mods["stats_pct"].get(key, 0.0) or 0.0)
+                if total_pct or pct:
+                    stats[key] = max(0, int(round(
+                        float(stats.get(key, 0) or 0)
+                        * (1.0 + (total_pct + pct) / 100.0))))
         self.character["stats"] = stats
 
         item_health = int(item_totals.get("health", 0) or 0)
@@ -307,6 +326,10 @@ class StatsMixin:
             # racial total-percent modifier (Tauren Endurance, 5%).
             health_value = (base_health + item_health
                             + self._health_bonus_from_stamina(stamina))
+            if aura_mods:
+                health_value += aura_mods["health"]
+                health_value *= 1.0 + float(
+                    aura_mods.get("health_pct", 0.0) or 0.0) / 100.0
             health_value *= self._RACE_HEALTH_PCT.get(race, 1.0)
             # ``std::round`` rounds halves away from zero; Python's round()
             # uses banker's rounding, so spell it out for exact parity.
@@ -334,11 +357,20 @@ class StatsMixin:
         old_max_power = int(self.character.get("max_power", 0) or 0)
         old_power = int(self.character.get("power", 0) or 0)
         max_power = self._max_power_for(char_class, level)
+        if char_class in self._ENERGY_CLASSES and aura_mods:
+            max_power += int(aura_mods["power"] or 0)
+            max_power = int(max_power * (
+                1.0 + float(aura_mods.get("power_pct", 0.0) or 0.0) / 100.0))
         if char_class not in self._RAGE_CLASSES \
                 and char_class not in self._ENERGY_CLASSES:
             intellect = max(0, int(stats.get("inte", 0) or 0))
             max_power += item_mana + int(math.floor(
                 self._mana_bonus_from_intellect(intellect) + 0.5))
+            if aura_mods:
+                max_power += int(aura_mods["power"] or 0)
+                max_power = int(max_power * (
+                    1.0 + float(aura_mods.get("power_pct", 0.0) or 0.0)
+                    / 100.0))
         self.character["max_power"] = max_power
         if "power" not in self.character:
             # Combat resources start empty; mana/energy classes start full.
@@ -352,22 +384,115 @@ class StatsMixin:
 
         # ``Player::UpdateArmor``: item armor plus twice the final agility.
         agility = int(stats.get("agi", 0) or 0)
-        self.character["armor"] = int(
-            item_totals.get("armor", 0) or 0) + agility * 2
+        armor = int(item_totals.get("armor", 0) or 0) + agility * 2
+        if aura_mods:
+            armor += int(aura_mods["armor"] or 0)
+            armor = int(armor * (
+                1.0 + float(aura_mods.get("armor_pct", 0.0) or 0.0) / 100.0))
+        self.character["armor"] = armor
         for school in ("holy", "fire", "nature", "frost", "shadow", "arcane"):
-            self.character["res_" + school] = int(
-                item_totals.get(school, 0) or 0)
+            value = int(item_totals.get(school, 0) or 0)
+            if aura_mods:
+                value += int(aura_mods["resistances"].get(school, 0) or 0)
+                value = int(value * (
+                    1.0 + float(
+                        aura_mods.get("resistances_pct", {}).get(school, 0.0)
+                        or 0.0) / 100.0))
+            self.character["res_" + school] = value
 
         # ``Player::UpdateAttackPowerAndDamage``: class/level/stat formula plus
         # flat item attack power.  Ranged AP uses its own class formula and the
         # ``ITEM_MOD_RANGED_ATTACK_POWER`` bonus.
         attack_power = int(self._base_attack_power(char_class, level, stats))
         attack_power += int(item_totals.get("attack_power", 0) or 0)
+        if aura_mods:
+            attack_power += int(aura_mods["attack_power"] or 0)
+            attack_power = int(attack_power * (
+                1.0 + float(aura_mods.get("attack_power_pct", 0.0) or 0.0)
+                / 100.0))
         self.character["attack_power"] = attack_power
         ranged_ap = int(self._base_ranged_attack_power(
             char_class, level, stats))
         ranged_ap += int(item_totals.get("ranged_attack_power", 0) or 0)
+        if aura_mods:
+            ranged_ap += int(aura_mods["ranged_attack_power"] or 0)
+            ranged_ap = int(ranged_ap * (
+                1.0 + float(
+                    aura_mods.get("ranged_attack_power_pct", 0.0) or 0.0)
+                / 100.0))
         self.character["ranged_attack_power"] = ranged_ap
+
+        # Combat ratings and derived chances.  Ratings are converted with a
+        # flat 15 points per percent (the level-60-ish ratio) because the full
+        # ``GtCombatRatings`` curve is not imported; the result is still a
+        # consistent, gear-driven table rather than fixed 5%/10%.
+        hit_rating = int(item_totals.get("hit_rating", 0) or 0)
+        crit_rating = int(item_totals.get("crit_rating", 0) or 0)
+        haste_rating = int(item_totals.get("haste_rating", 0) or 0)
+        self.character["hit_rating"] = hit_rating
+        self.character["crit_rating"] = crit_rating
+        self.character["haste_rating"] = haste_rating
+        self.character["resilience"] = int(item_totals.get("resilience", 0) or 0)
+        self.character["armor_penetration"] = int(
+            item_totals.get("armor_penetration", 0) or 0)
+        self.character["expertise"] = int(
+            item_totals.get("expertise", 0) or 0)
+        self.character["defense_rating"] = int(
+            item_totals.get("defense_rating", 0) or 0)
+        self.character["has_shield"] = bool(item_totals.get("shield", 0))
+        self.character["block_value"] = int(
+            item_totals.get("block_value", 0) or 0)
+        self.character["spell_power"] = int(
+            item_totals.get("spell_power", 0) or 0)
+        self.character["healing_power"] = int(
+            item_totals.get("healing_power", 0) or 0)
+        if aura_mods:
+            self.character["spell_power"] += int(
+                aura_mods.get("spell_power", 0) or 0)
+            self.character["healing_power"] += int(
+                aura_mods.get("healing", 0) or 0)
+            self.character["healing_pct"] = float(
+                aura_mods.get("healing_pct", 0.0) or 0.0)
+        else:
+            self.character["healing_power"] = 0
+            self.character["healing_pct"] = 0.0
+        agility = int(stats.get("agi", 0) or 0)
+        aura_hit = float(aura_mods.get("hit", 0.0)) if aura_mods else 0.0
+        aura_spell_hit = float(aura_mods.get("spell_hit", 0.0)) \
+            if aura_mods else 0.0
+        aura_crit = float(aura_mods.get("crit", 0.0)) if aura_mods else 0.0
+        aura_spell_crit = float(aura_mods.get("spell_crit", 0.0)) \
+            if aura_mods else 0.0
+        self.character["hit_chance"] = min(
+            100.0, 5.0 + hit_rating / 15.0 + aura_hit)
+        self.character["spell_hit_chance"] = min(
+            100.0, 5.0 + hit_rating / 15.0 + aura_spell_hit)
+        self.character["crit_chance"] = min(
+            75.0, 5.0 + crit_rating / 15.0 + agility * 0.005 + aura_crit)
+        self.character["spell_crit_chance"] = min(
+            75.0, 5.0 + crit_rating / 15.0 + aura_spell_crit)
+        self.character["dodge_chance"] = min(
+            75.0, 5.0 + int(item_totals.get("dodge_rating", 0) or 0) / 15.0
+            + agility * 0.002 + (float(aura_mods.get("dodge", 0.0))
+                                 if aura_mods else 0.0))
+        self.character["parry_chance"] = min(
+            75.0, 5.0 + int(item_totals.get("parry_rating", 0) or 0) / 15.0
+            + (float(aura_mods.get("parry", 0.0)) if aura_mods else 0.0))
+        self.character["block_chance"] = (
+            min(75.0, 5.0 + int(item_totals.get("block_rating", 0) or 0) / 15.0
+                + (float(aura_mods.get("block", 0.0)) if aura_mods else 0.0))
+            if self.character["has_shield"] else 0.0)
+        self.character["melee_haste"] = haste_rating / 15.0 + (
+            float(aura_mods.get("melee_haste", 0.0)) if aura_mods else 0.0)
+        self.character["ranged_haste"] = haste_rating / 15.0 + (
+            float(aura_mods.get("ranged_haste", 0.0)) if aura_mods else 0.0)
+        self.character["spell_haste"] = haste_rating / 15.0 + (
+            float(aura_mods.get("spell_haste", 0.0)) if aura_mods else 0.0)
+        self.character["spell_penetration"] = int(
+            item_totals.get("spell_penetration", 0) or 0) + int(
+            aura_mods.get("spell_penetration", 0) if aura_mods else 0)
+        self.character["health_regen_pct"] = float(
+            aura_mods.get("health_regen_pct", 0.0) if aura_mods else 0.0)
 
         self.character["next_level_xp"] = self._xp_to_level(level)
         self.character.setdefault("money", 0)
@@ -667,7 +792,8 @@ class StatsMixin:
         combat["combo_target"] = 0
         self.log.debug(f"combo points cleared (target {target_guid})")
 
-    async def _heal_player(self, amount: int) -> tuple[int, int]:
+    async def _heal_player(self, amount: int,
+                           healer_guid: int | None = None) -> tuple[int, int]:
         """Apply a heal; returns ``(effective, overheal)``."""
         current = int(self.character.get("health", self._max_health()))
         max_health = self._max_health()
@@ -675,7 +801,20 @@ class StatsMixin:
             return 0, max(0, int(amount))
         effective = min(max_health - current, max(0, int(amount)))
         await self._set_player_health(current + effective)
+        self._add_healing_threat(
+            effective, int(self.player_guid or 0),
+            int(healer_guid or self.player_guid or 0))
         return effective, int(amount) - effective
+
+    def _add_healing_threat(self, effective: int, target_guid: int,
+                            healer_guid: int) -> None:
+        """Credit half of effective healing to every mob fighting the target."""
+        manager = (self._creature_combat_manager()
+                   if hasattr(self, "_creature_combat_manager") else None)
+        if manager is None or effective <= 0:
+            return
+        manager.healing_threat(
+            int(healer_guid or 0), int(target_guid or 0), float(effective))
 
     async def _damage_player(self, damage: int, source: str,
                              physical: bool = False) -> None:
@@ -692,6 +831,24 @@ class StatsMixin:
         new_health = max(0, current - amount)
         self.character["health"] = new_health
         await self._send_player_fields({F.UNIT_FIELD_HEALTH: new_health})
+        combat = self._get_combat_state()
+        # Casting pushback: damage delays a normal cast (up to two hits) and
+        # shortens an active channel.  This is the 3.3.5 ``Spell::Delayed``
+        # behaviour without the per-spell interrupt flags table.
+        pending = combat.get("pending_cast")
+        if pending and not combat["dead"]:
+            pushbacks = int(pending.get("pushbacks") or 0)
+            if pushbacks < 2:
+                pending["pushbacks"] = pushbacks + 1
+                cast_time = max(0.0, float(pending["finish_at"])
+                                - time.monotonic())
+                pending["finish_at"] = float(pending["finish_at"]) + min(
+                    0.5, cast_time * 0.25)
+        channel = combat.get("channel")
+        if channel and not combat["dead"]:
+            channel["expires"] = max(
+                time.monotonic(),
+                float(channel.get("expires", 0.0)) - 0.5)
         if physical:
             self._gain_rage(amount, dealing=False)
         if new_health <= 0:
@@ -702,7 +859,16 @@ class StatsMixin:
         combat = self._get_combat_state()
         combat["dead"] = True
         combat["pending_cast"] = None
+        combat["channel"] = None
+        combat["school_lockout"] = {}
+        combat["threat_redirect"] = None
         combat["dots"] = []
+        combat.setdefault("area_effects", []).clear()
+        if hasattr(self, "_clear_player_auras"):
+            await self._clear_player_auras()
+        else:
+            combat["auras"] = []
+        combat["creature_auras"] = {}
         # ``CombatStop`` clears the dying rogue's combo points.
         await self._clear_combo_points()
         if combat["target_guid"]:
@@ -770,7 +936,18 @@ class StatsMixin:
         char_class = int(self.character.get("class", 1))
 
         if not in_fight and health < max_health:
-            await self._set_player_health(health + max(1, int(max_health * 0.04)))
+            # ``Player::Regenerate(POWER_HEALTH)``: out-of-combat health comes
+            # from spirit with a small level component and is carried as a
+            # fraction between ticks, so low-level characters still heal.
+            stats = self.character.get("stats") or {}
+            spirit = max(0.0, float(stats.get("spi", 0) or 0))
+            rate = spirit * 0.025 + max(1, int(self.character.get("level", 1))) * 0.05
+            if hasattr(self, "_player_aura_mods"):
+                rate *= 1.0 + float(
+                    self._player_aura_mods().get("health_regen_pct", 0.0)
+                    or 0.0) / 100.0
+            await self._regenerate_health_over_time(
+                combat, health, max_health, rate, now)
 
         if char_class == 6:
             # ``CLASS_DEATH_KNIGHT``: runes regenerate all the time, runic power
@@ -871,6 +1048,25 @@ class StatsMixin:
         combat[accum_key] = accum - whole
         if whole > 0:
             await self._set_player_power(min(max_power, power + whole))
+
+    async def _regenerate_health_over_time(self, combat: dict, health: int,
+                                           max_health: int, rate: float,
+                                           now: float) -> None:
+        """Add ``rate`` health per second, carrying fractional points."""
+        last = float(combat.get("last_health_gain") or 0.0)
+        if last <= 0.0:
+            combat["last_health_gain"] = now
+            return
+        elapsed = max(0.0, now - last)
+        combat["last_health_gain"] = now
+        if rate <= 0.0 or health >= max_health:
+            combat["health_regen_accum"] = 0.0
+            return
+        accum = float(combat.get("health_regen_accum") or 0.0) + rate * elapsed
+        whole = int(accum)
+        combat["health_regen_accum"] = accum - whole
+        if whole > 0:
+            await self._set_player_health(min(max_health, health + whole))
 
     def _gain_rage(self, damage: int, dealing: bool = True,
                    weapon_speed: float = 2.0, crit: bool = False) -> None:

@@ -132,6 +132,7 @@ TEMPLATE_COLUMNS = (
     "leader", "movement_info_id", "movement_type", "base_health", "flags", "visible",
     "kill_credit1", "kill_credit2", "quest_item1", "quest_item2", "quest_item3",
     "quest_item4", "quest_item5", "quest_item6", "loot_id",
+    "min_loot_gold", "max_loot_gold",
     # Combat / AI data the creature AI needs at runtime.
     "spell_list_id", "ai_name", "aggro_radius", "chase_distance",
     "speed_walk", "speed_run", "min_damage", "max_damage",
@@ -350,6 +351,16 @@ SPELL_TARGET_POSITION_MAP = (
     ("target_orientation", "target_orientation"),
 )
 
+PLAYERCREATEINFO_SPELL_MAP = (
+    ("race", "race"), ("class", "class"),
+    ("spell", "Spell"), ("note", "Note"),
+)
+
+PLAYERCREATEINFO_ACTION_MAP = (
+    ("race", "race"), ("class", "class"), ("button", "button"),
+    ("action", "action"), ("type", "type"),
+)
+
 
 def read_rune_cost_dbc(path: str) -> list[tuple[int, int, int, int, int]]:
     """Read ``SpellRuneCost.dbc`` (WDBC) into ``(id, blood, unholy, frost, rp)``.
@@ -451,6 +462,9 @@ def _item_template_column(dump_col: str) -> str:
             "categorycooldown": "spell_category_cooldown",
         }
         return words[match.group(1)] + match.group(2)
+    match = re.fullmatch(r"spellppmRate_(\d)", dump_col)
+    if match:
+        return f"spell_ppm_rate{match.group(1)}"
     return _snake_case(dump_col)
 
 
@@ -472,6 +486,7 @@ SPELL_TABLES = (
     "creature_loot_template", "creature_equip_template",
     "creature_immunities", "creature_cooldowns", "spell_cone",
     "spell_target_position", "spell_rune_cost", "spell_duration",
+    "playercreateinfo_spell", "playercreateinfo_action",
 )
 
 
@@ -646,6 +661,8 @@ def _template_row(template: dict) -> tuple:
         int(template.get("QuestItem5") or 0),
         int(template.get("QuestItem6") or 0),
         int(template.get("LootId") or 0),
+        int(template.get("MinLootGold") or 0),
+        int(template.get("MaxLootGold") or 0),
         # Combat / AI data.
         int(template.get("SpellList") or 0),
         _text_or_empty(template.get("AIName")),
@@ -695,6 +712,10 @@ def import_world(dump_path: str, db_path: str, clear: bool = True,
     _, raw_creature_cooldowns = wotlk_dump.rows(text, "creature_cooldowns")
     _, raw_spell_cone = wotlk_dump.rows(text, "spell_cone")
     _, raw_spell_target_position = wotlk_dump.rows(text, "spell_target_position")
+    _, raw_playercreateinfo_spell = wotlk_dump.rows(
+        text, "playercreateinfo_spell")
+    _, raw_playercreateinfo_action = wotlk_dump.rows(
+        text, "playercreateinfo_action")
     _, raw_creature_movement = wotlk_dump.rows(text, "creature_movement")
     _, raw_creature_movement_template = wotlk_dump.rows(
         text, "creature_movement_template")
@@ -971,6 +992,15 @@ def import_world(dump_path: str, db_path: str, clear: bool = True,
             ),
             "spell_rune_cost": _insert_rune_costs(con, rune_cost_rows),
             "spell_duration": _insert_spell_durations(con, duration_rows),
+            "playercreateinfo_spell": _insert_mapped(
+                con, "playercreateinfo_spell", PLAYERCREATEINFO_SPELL_MAP,
+                raw_playercreateinfo_spell,
+                text_columns=frozenset(("note",)),
+            ),
+            "playercreateinfo_action": _insert_mapped(
+                con, "playercreateinfo_action", PLAYERCREATEINFO_ACTION_MAP,
+                raw_playercreateinfo_action,
+            ),
             "item_templates": _insert_mapped(
                 con, "item_templates", item_map, raw_item_template,
                 float_columns=ITEM_TEMPLATE_FLOATS,
@@ -1018,6 +1048,8 @@ def import_world(dump_path: str, db_path: str, clear: bool = True,
         "spells": counts["spells"],
         "rune_costs": counts["spell_rune_cost"],
         "spell_durations": counts["spell_duration"],
+        "starter_spells": counts["playercreateinfo_spell"],
+        "starter_actions": counts["playercreateinfo_action"],
         "loot_rows": counts["creature_loot_template"],
         "reference_loot_rows": counts["reference_loot_template"],
         "items": counts["item_templates"],
@@ -1030,6 +1062,8 @@ def import_world(dump_path: str, db_path: str, clear: bool = True,
         f"{stats['npc_text']:,} NPC texts, {stats['spells']:,} spells, "
         f"{stats['rune_costs']:,} rune costs, "
         f"{stats['spell_durations']:,} spell durations, "
+        f"{stats['starter_spells']:,} starter spells, "
+        f"{stats['starter_actions']:,} starter actions, "
         f"{stats['loot_rows']:,} loot rows, {stats['items']:,} item templates "
         f"in {time.time() - started:.1f}s"
     )

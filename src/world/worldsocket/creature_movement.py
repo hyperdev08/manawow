@@ -45,8 +45,8 @@ class CreatureMovementMixin:
             return
         state["facing"] = angle
         state["face_until"] = now + 0.4
-        await self.send_packet(
-            Opcodes.SMSG_MONSTER_MOVE,
+        await self._send_creature_packet(
+            int(low_guid), Opcodes.SMSG_MONSTER_MOVE,
             object_update.build_monster_face(
                 self._creature_object_guid(int(low_guid), int(spawn["entry"])),
                 here[0], here[1], here[2], float(last), angle,
@@ -105,31 +105,39 @@ class CreatureMovementMixin:
         return "wander", []
 
     def _creature_idle_state(self, low_guid: int, spawn, now: float) -> dict:
-        """Return (and lazily build) the idle state for a visible creature."""
-        combat = self._get_combat_state()
-        idle = combat.setdefault("idle", {})
-        state = idle.get(int(low_guid))
-        if state is not None:
-            return state
-        kind, path = self._creature_movement_plan(spawn)
-        radius = float(spawn["spawndist"] or 0.0)
-        if radius <= 0.0:
-            radius = IDLE_WANDER_DEFAULT_RADIUS
-        state = {
-            "kind": kind,
-            "home": (float(spawn["x"]), float(spawn["y"]), float(spawn["z"])),
-            "pos": None,
-            "facing": float(spawn["o"] or 0.0),
-            "radius": max(0.5, radius),
-            "speed": max(0.5, float(spawn["speed_walk"] or 2.5)),
-            "next_move": now + random.uniform(0.0, 2.0),
-            "move_until": 0.0,
-            "moves_left": 1,
-            "path": path,
-            "path_index": 0,
-            "wait_until": 0.0,
-        }
-        idle[int(low_guid)] = state
+        """Return (and lazily build) the shared idle state for a creature."""
+        def build() -> dict:
+            kind, path = self._creature_movement_plan(spawn)
+            radius = float(spawn["spawndist"] or 0.0)
+            if radius <= 0.0:
+                radius = IDLE_WANDER_DEFAULT_RADIUS
+            return {
+                "kind": kind,
+                "home": (float(spawn["x"]), float(spawn["y"]),
+                         float(spawn["z"])),
+                "pos": None,
+                "facing": float(spawn["o"] or 0.0),
+                "radius": max(0.5, radius),
+                "speed": max(0.5, float(spawn["speed_walk"] or 2.5)),
+                "next_move": now + random.uniform(0.0, 2.0),
+                "move_until": 0.0,
+                "moves_left": 1,
+                "path": path,
+                "path_index": 0,
+                "wait_until": 0.0,
+            }
+
+        manager = (self._creature_combat_manager()
+                   if hasattr(self, "_creature_combat_manager") else None)
+        if manager is not None:
+            state = manager.idle_state(int(low_guid), build)
+        else:
+            idle = self._get_combat_state().setdefault("idle", {})
+            state = idle.get(int(low_guid))
+            if state is None:
+                state = build()
+                idle[int(low_guid)] = state
+        self._get_combat_state().setdefault("idle", {})[int(low_guid)] = state
         return state
 
     async def _send_creature_idle_move(self, low_guid: int, spawn, state: dict,
@@ -142,19 +150,50 @@ class CreatureMovementMixin:
         if distance < 0.1:
             return False
         speed = float(state["speed"]) or 2.5
-        duration_ms = int(distance / speed * 1000.0)
-        duration_ms = max(IDLE_MOVE_MIN_DURATION_MS,
-                          min(duration_ms, IDLE_MOVE_MAX_DURATION_MS))
-        facing = math.atan2(dy, dx)
-        state["pos"] = (float(dest[0]), float(dest[1]), float(dest[2]))
+        if hasattr(self, "_creature_speed_mult"):
+            speed *= max(0.1, self._creature_speed_mult(int(low_guid)))
+
+        # Idle movement (waypoints and wander) normally goes straight across
+        # open terrain.  Only pay for an A* query when the straight segment is
+        # actually obstructed, which keeps dozens of ambient NPCs cheap.
+        path = None
+        if distance > 2.0 and hasattr(self, "_find_world_path"):
+            eye_a = (here[0], here[1], here[2] + 0.9)
+            eye_b = (float(dest[0]), float(dest[1]), float(dest[2]) + 0.9)
+            if not self._has_line_of_sight(eye_a, eye_b):
+                path = self._find_world_path(here, dest)
+        if path and len(path) > 1:
+            max_travel = speed * IDLE_MOVE_MAX_DURATION_MS / 1000.0
+            points = self._path_prefix(here, path, max_travel)
+            if not points:
+                return False
+            travel = 0.0
+            cursor = here
+            for point in points:
+                travel += self._distance(cursor, point)
+                cursor = point
+            if travel < 0.1:
+                return False
+            duration_ms = int(travel / speed * 1000.0)
+            duration_ms = max(IDLE_MOVE_MIN_DURATION_MS,
+                              min(duration_ms, IDLE_MOVE_MAX_DURATION_MS))
+            target = points[-1]
+        else:
+            duration_ms = int(distance / speed * 1000.0)
+            duration_ms = max(IDLE_MOVE_MIN_DURATION_MS,
+                              min(duration_ms, IDLE_MOVE_MAX_DURATION_MS))
+            target = (float(dest[0]), float(dest[1]), float(dest[2]))
+            points = [target]
+
+        facing = math.atan2(target[1] - here[1], target[0] - here[0])
+        state["pos"] = (float(target[0]), float(target[1]), float(target[2]))
         state["facing"] = facing
         state["move_until"] = now + duration_ms / 1000.0
-        await self.send_packet(
-            Opcodes.SMSG_MONSTER_MOVE,
-            object_update.build_monster_move(
+        await self._send_creature_packet(
+            int(low_guid), Opcodes.SMSG_MONSTER_MOVE,
+            object_update.build_monster_move_path(
                 self._creature_object_guid(int(low_guid), int(spawn["entry"])),
-                here[0], here[1], here[2], facing,
-                float(dest[0]), float(dest[1]), float(dest[2]),
+                here[0], here[1], here[2], facing, points,
                 duration_ms=duration_ms,
                 move_id=self._next_move_id(),
             ),
@@ -191,8 +230,20 @@ class CreatureMovementMixin:
         """One movement tick for a creature that is not fighting this player."""
         if "summoned_by" in spawn.keys() and int(spawn["summoned_by"] or 0):
             return                       # pets follow their owner in _summon_tick
+        if hasattr(self, "_creature_aura_mods"):
+            mods = self._creature_aura_mods(int(low_guid))
+            if (mods["rooted"] or mods["stunned"] or mods["feared"]
+                    or mods["confused"] or mods["charmed"]):
+                return
         combat = self._get_combat_state()
         if int(low_guid) in combat["aggro"]:
+            return
+        manager = (self._creature_combat_manager()
+                   if hasattr(self, "_creature_combat_manager") else None)
+        if manager is not None and manager.is_engaged(int(low_guid)):
+            return
+        if manager is not None and not manager.claim_idle(
+                int(low_guid), int(self.player_guid or 0), now):
             return
         if int(spawn["dead_since"] or 0) > 0:
             combat["idle"].pop(int(low_guid), None)
@@ -223,19 +274,32 @@ class CreatureMovementMixin:
         home = state["home"]
         radius = float(state["radius"])
         dest = None
+        # Prefer a real navmesh point: it is reachable, lies on a walkable
+        # surface and already has the right height.  The random-circle fallback
+        # is only used before the client data cache is populated.
         for _ in range(6):
-            angle = random.uniform(0.0, 2.0 * math.pi)
-            distance = random.uniform(radius * 0.35, radius)
-            dx = math.cos(angle) * distance
-            dy = math.sin(angle) * distance
-            candidate = (home[0] + dx, home[1] + dy, home[2])
-            # ``ComputePathToRandomPoint`` picks a point around the respawn
-            # coordinate, not around the current position, so the creature
-            # never drifts outside ``spawndist``.
+            candidate = (self._random_world_point(home, radius)
+                         if hasattr(self, "_random_world_point") else None)
+            if candidate is None:
+                break
             if self._distance(here, candidate) < 0.5:
                 continue
             dest = candidate
             break
+        if dest is None:
+            for _ in range(6):
+                angle = random.uniform(0.0, 2.0 * math.pi)
+                distance = random.uniform(radius * 0.35, radius)
+                dx = math.cos(angle) * distance
+                dy = math.sin(angle) * distance
+                candidate = (home[0] + dx, home[1] + dy, home[2])
+                # ``ComputePathToRandomPoint`` picks a point around the respawn
+                # coordinate, not around the current position, so the creature
+                # never drifts outside ``spawndist``.
+                if self._distance(here, candidate) < 0.5:
+                    continue
+                dest = candidate
+                break
         if dest is None or not await self._send_creature_idle_move(
                 int(low_guid), spawn, state, here, dest, now):
             state["next_move"] = now + IDLE_WANDER_RETRY

@@ -1,6 +1,7 @@
 """Creature spell-list AI and cast resolution."""
 from __future__ import annotations
 
+import math
 import random
 import sqlite3
 import struct
@@ -9,12 +10,14 @@ import time
 from typing import List
 
 from src.protocol.opcodes import Opcodes
+from src.world import creature
 from src.world import spells
 from src.world import update_fields as F
 
 from .constants import (
     CREATURE_SPELL_GCD,
     CREATURE_SPELL_LIST_INTERVAL,
+    SPELL_FAILED_INTERRUPTED,
     SPELL_LIST_FLAG_CATEGORY_COOLDOWN,
     SPELL_LIST_FLAG_RANGED_ACTION,
     SPELL_LIST_FLAG_SUPPORT_ACTION,
@@ -189,11 +192,15 @@ class CreatureAIMixin:
             F.UNIT_FIELD_POWER1 + power_type: power,
             F.UNIT_FIELD_MAXPOWER1 + power_type: max_power,
         })
-        await self.send_packet(
-            Opcodes.SMSG_POWER_UPDATE,
-            spells.pack_guid(self._creature_object_guid(int(low_guid), ai["entry"]))
-            + struct.pack("<BI", power_type, power & 0xFFFFFFFF),
-        )
+        payload = (spells.pack_guid(
+            self._creature_object_guid(int(low_guid), ai["entry"]))
+            + struct.pack("<BI", power_type, power & 0xFFFFFFFF))
+        if hasattr(self, "_send_creature_packet"):
+            await self._send_creature_packet(int(low_guid),
+                                             Opcodes.SMSG_POWER_UPDATE,
+                                             payload)
+        else:
+            await self.send_packet(Opcodes.SMSG_POWER_UPDATE, payload)
 
     @staticmethod
     def _creature_spell_cost(template, max_mana: int) -> int:
@@ -267,6 +274,9 @@ class CreatureAIMixin:
         """One 1200 ms spell-list evaluation (CMaNGOS ``UpdateSpellLists``)."""
         if ai["cast"] is not None or now < ai["next_tick"]:
             return
+        if hasattr(self, "_creature_can_cast") \
+                and not self._creature_can_cast(int(low_guid)):
+            return
         ai["next_tick"] = now + CREATURE_SPELL_LIST_INTERVAL
         if now < ai["gcd_until"] or not ai["spells"]:
             return
@@ -293,12 +303,20 @@ class CreatureAIMixin:
                     and ranged_roll > ranged_chance):
                 continue
             template = entry["template"]
+            lockout = ai.get("school_lockout") or {}
+            if lockout and float(lockout.get("until", 0)) > now \
+                    and int(lockout.get("school", 0)) & (
+                        int(template.school) or 1):
+                continue
             cost = self._creature_spell_cost(template, ai["max_mana"])
             if cost > ai["mana"]:
                 continue
             ok, target_guid = self._resolve_creature_spell_target(
                 entry, low_guid, spawn, ai, player_guid)
             if not ok:
+                continue
+            if target_guid and not self._creature_has_line_of_sight(
+                    low_guid, target_guid):
                 continue
             if target_guid and not self._creature_spell_in_range(
                     template, spawn, low_guid, target_guid, distance):
@@ -352,6 +370,16 @@ class CreatureAIMixin:
                     other["next_ready"] = max(float(other["next_ready"]), until)
         ai["gcd_until"] = now + CREATURE_SPELL_GCD
 
+        # A casting creature turns towards its victim before the cast starts.
+        if target_guid and hasattr(self, "_face_creature_at_player"):
+            state = self._get_combat_state().get("aggro", {}).get(
+                int(low_guid))
+            if state is not None:
+                await self._face_creature_at_player(
+                    int(low_guid), state, spawn,
+                    self._creature_position(int(low_guid)),
+                    self._player_position(), now)
+
         cast_id = int(ai["cast_id"])
         ai["cast_id"] = (cast_id + 1) & 0xFF
         caster_guid = self._creature_object_guid(int(low_guid), ai["entry"])
@@ -367,10 +395,14 @@ class CreatureAIMixin:
             "finish_at": now + cast_time_ms / 1000.0,
             "cost": cost,
         }
-        await self.send_packet(
-            Opcodes.SMSG_SPELL_START,
-            spells.build_spell_start(cast, caster_guid, target_guid, cast_id),
-        )
+        payload = spells.build_spell_start(
+            cast, caster_guid, target_guid, cast_id)
+        if hasattr(self, "_send_creature_packet"):
+            await self._send_creature_packet(int(low_guid),
+                                             Opcodes.SMSG_SPELL_START,
+                                             payload)
+        else:
+            await self.send_packet(Opcodes.SMSG_SPELL_START, payload)
         if cast_time_ms <= 0:
             await self._finish_creature_cast(low_guid, spawn, ai)
         return True
@@ -394,14 +426,16 @@ class CreatureAIMixin:
 
         cast_obj = spells.SpellCast(caster_guid, template.id, target_guid)
         cast_obj.template = template
-        await self.send_packet(
-            Opcodes.SMSG_SPELL_GO,
-            spells.build_spell_go(
-                cast_obj, caster_guid, target_guid, cast["cast_id"],
-                timestamp_ms=self._server_tick_ms(),
-                off_gcd=template.start_recovery_time == 0,
-            ),
+        payload = spells.build_spell_go(
+            cast_obj, caster_guid, target_guid, cast["cast_id"],
+            timestamp_ms=self._server_tick_ms(),
+            off_gcd=template.start_recovery_time == 0,
         )
+        if hasattr(self, "_send_creature_packet"):
+            await self._send_creature_packet(int(low_guid),
+                                             Opcodes.SMSG_SPELL_GO, payload)
+        else:
+            await self.send_packet(Opcodes.SMSG_SPELL_GO, payload)
         await self._apply_creature_spell_effects(
             low_guid, spawn, ai, template, target_guid)
         self.log.debug(
@@ -441,20 +475,65 @@ class CreatureAIMixin:
         caster_guid = self._creature_object_guid(int(low_guid), ai["entry"])
         cast = spells.SpellCast(caster_guid, spell_id, target_guid)
         cast.template = template
-        await self.send_packet(
-            Opcodes.SMSG_SPELL_START,
-            spells.build_spell_start(cast, caster_guid, target_guid, 0),
+        start_payload = spells.build_spell_start(
+            cast, caster_guid, target_guid, 0)
+        go_payload = spells.build_spell_go(
+            cast, caster_guid, target_guid, 0,
+            timestamp_ms=self._server_tick_ms(),
+            off_gcd=template.start_recovery_time == 0,
         )
-        await self.send_packet(
-            Opcodes.SMSG_SPELL_GO,
-            spells.build_spell_go(
-                cast, caster_guid, target_guid, 0,
-                timestamp_ms=self._server_tick_ms(),
-                off_gcd=template.start_recovery_time == 0,
-            ),
-        )
+        if hasattr(self, "_send_creature_packet"):
+            await self._send_creature_packet(
+                int(low_guid), Opcodes.SMSG_SPELL_START, start_payload)
+            await self._send_creature_packet(
+                int(low_guid), Opcodes.SMSG_SPELL_GO, go_payload)
+        else:
+            await self.send_packet(Opcodes.SMSG_SPELL_START, start_payload)
+            await self.send_packet(Opcodes.SMSG_SPELL_GO, go_payload)
         await self._apply_creature_spell_effects(
             low_guid, spawn, ai, template, target_guid)
+
+    async def _creature_spell_lands(self, template, target_guid: int,
+                                    effect: dict | None = None,
+                                    caster_guid: int = 0) -> bool:
+        """Check immunities, reflect and line of sight for a creature spell.
+
+        Creatures always land their spells against an equal-level player in
+        this simulator; what matters for 3.3.5 feel is the immunity/reflect
+        layer, which is driven by auras.  Sending the miss packet is enough for
+        the client to show "Immune" or "Reflected".
+        """
+        if not target_guid:
+            return True
+        kind = self._spell_target_kind(target_guid)
+        if kind == "peer":
+            return True
+        if hasattr(self, "_spell_immune") and self._spell_immune(
+                kind, target_guid, template, effect):
+            await self._send_spell_miss_log(
+                target_guid, caster_guid or self.player_guid, template.id,
+                spells.SPELL_MISS_IMMUNE)
+            return False
+        if hasattr(self, "_spell_reflects") and self._spell_reflects(
+                target_guid):
+            await self._send_spell_miss_log(
+                target_guid, caster_guid or self.player_guid, template.id,
+                spells.SPELL_MISS_REFLECT, 0)
+            return False
+        return True
+
+
+    def _creature_has_line_of_sight(self, low_guid: int,
+                                    target_guid: int) -> bool:
+        if not hasattr(self, "_has_line_of_sight"):
+            return True
+        caster = self._creature_object_guid(int(low_guid))
+        try:
+            return self._has_line_of_sight(
+                self._unit_eye_position(caster),
+                self._unit_eye_position(int(target_guid)))
+        except Exception:
+            return True
 
     async def _apply_creature_spell_effects(self, low_guid: int, spawn,
                                             ai: dict, template,
@@ -463,10 +542,122 @@ class CreatureAIMixin:
         caster_guid = self._creature_object_guid(int(low_guid), ai["entry"])
         level = int(ai["level"])
         crit_chance = float(spawn["crit_chance"] or 0.0) if "crit_chance" in spawn.keys() else 0.0
+        ground_started = False
+        aura_patterns: set = set()
+
+        def area_center(effect: dict):
+            """Reference position for the creature's area/cone effect."""
+            a = int(effect.get("target_a") or 0)
+            b = int(effect.get("target_b") or 0)
+            if (a in (spells.TARGET_DEST_CASTER, spells.TARGET_SRC_CASTER)
+                    or b == spells.TARGET_UNIT_SRC_AREA_ENEMY):
+                return self._creature_position(int(low_guid))
+            if target_guid:
+                if self._is_player_guid(target_guid):
+                    return self._player_position()
+                return self._creature_position(
+                    creature.creature_low_guid(target_guid))
+            return self._creature_position(int(low_guid))
+
+        def area_hits_player(center, radius: float, kind: str) -> bool:
+            player = self._player_position()
+            if self._distance(center, player) > radius + 0.5:
+                return False
+            if kind == "cone":
+                facing = float(spawn["o"] or 0.0) if "o" in spawn.keys() else 0.0
+                angle = math.atan2(player[1] - center[1], player[0] - center[0])
+                delta = (angle - facing + math.pi) % (2.0 * math.pi) - math.pi
+                if abs(delta) > math.pi / 4.0:
+                    return False
+            return True
 
         for index, effect in enumerate(template.effects):
             etype = int(effect["effect"])
             if not etype:
+                continue
+            if (etype == spells.SPELL_EFFECT_PERSISTENT_AREA_AURA
+                    and template.is_ground_area(index)
+                    and not ground_started):
+                ground_started = True
+                self._start_ground_area(
+                    None, template, index, level,
+                    center=area_center(effect),
+                    caster_guid=caster_guid,
+                    hostile_to_player=True,
+                )
+                continue
+            area_kind = template.effect_area_kind(index)
+            if area_kind in ("enemy", "cone"):
+                radius = template.effect_radius(index)
+                if radius <= 0.0:
+                    radius = 10.0
+                center = area_center(effect)
+                if not area_hits_player(center, radius, area_kind):
+                    continue
+                if etype in (spells.SPELL_EFFECT_SCHOOL_DAMAGE,
+                             spells.SPELL_EFFECT_HEALTH_LEECH):
+                    amount = template.effect_value(index, level)
+                    if amount <= 0:
+                        continue
+                    lands = getattr(self, "_creature_spell_lands", None)
+                    if lands is not None and not await lands(
+                            template, int(self.player_guid), effect,
+                            caster_guid):
+                        continue
+                    critical = random.uniform(0.0, 100.0) < crit_chance
+                    if critical:
+                        amount *= 2
+                    await self._deal_spell_damage(
+                        int(self.player_guid), amount, template.school or 1,
+                        template, caster_guid, critical=critical)
+                    if etype == spells.SPELL_EFFECT_HEALTH_LEECH:
+                        await self._heal_creature(low_guid, spawn, amount,
+                                                  template, caster_guid)
+                elif etype in (spells.SPELL_EFFECT_WEAPON_DAMAGE,
+                               spells.SPELL_EFFECT_WEAPON_DAMAGE_NOSCHOOL,
+                               spells.SPELL_EFFECT_NORMALIZED_WEAPON_DMG,
+                               spells.SPELL_EFFECT_WEAPON_PERCENT_DAMAGE):
+                    amount = max(1, int(self._creature_damage(spawn))
+                                 + template.effect_value(index, level))
+                    await self._send_attacker_state_update(
+                        caster_guid, int(self.player_guid), amount)
+                    await self._damage_player(
+                        amount, f"{spawn['name']}'s {template.name}")
+                elif etype == spells.SPELL_EFFECT_APPLY_AURA:
+                    aura = int(effect["apply_aura"])
+                    if self._effect_is_harmful(template, effect):
+                        if not await self._creature_spell_lands(
+                                template, int(self.player_guid), effect,
+                                caster_guid):
+                            continue
+                    if aura == spells.SPELL_AURA_PERIODIC_DAMAGE:
+                        amount = template.effect_value(index, level)
+                        if amount <= 0:
+                            continue
+                        amplitude = max(
+                            1, int(effect["amplitude"] or 2000)) // 1000
+                        now = time.monotonic()
+                        duration_ms = spells.spell_duration_ms(
+                            self.config.database.world_path,
+                            template.duration_index, level)
+                        if duration_ms <= 0:
+                            duration_ms = 15000
+                        self._get_combat_state()["dots"].append({
+                            "target_guid": int(self.player_guid),
+                            "caster_guid": int(caster_guid),
+                            "spell_id": int(template.id),
+                            "amount": amount,
+                            "school": int(template.school),
+                            "interval": float(amplitude),
+                            "next_tick": now + float(amplitude),
+                            "expires": now + duration_ms / 1000.0,
+                            "is_heal": False,
+                            "leech": aura == spells.SPELL_AURA_PERIODIC_LEECH,
+                        })
+                    if hasattr(self, "_apply_aura_from_effect"):
+                        await self._apply_aura_from_effect(
+                            template, effect, index, caster_guid,
+                            self.player_guid, level, target_kind="player")
                 continue
             if etype in (spells.SPELL_EFFECT_SCHOOL_DAMAGE,
                          spells.SPELL_EFFECT_HEALTH_LEECH):
@@ -475,19 +666,16 @@ class CreatureAIMixin:
                 amount = template.effect_value(index, level)
                 if amount <= 0:
                     continue
+                lands = getattr(self, "_creature_spell_lands", None)
+                if lands is not None and not await lands(
+                        template, target_guid, effect, caster_guid):
+                    continue
                 critical = random.uniform(0.0, 100.0) < crit_chance
                 if critical:
                     amount *= 2
-                if self._is_player_guid(target_guid):
-                    await self._damage_player(
-                        amount, f"{spawn['name']}'s {template.name}")
-                else:
-                    await self._deal_damage_to_creature(
-                        target_guid, amount, caster_guid)
-                await self._send_spell_damage_log(
-                    target_guid, caster_guid, template.id, amount,
-                    template.school or 1, critical=1 if critical else 0,
-                )
+                await self._deal_spell_damage(
+                    target_guid, amount, template.school or 1, template,
+                    caster_guid, critical=critical)
                 if etype == spells.SPELL_EFFECT_HEALTH_LEECH:
                     await self._heal_creature(low_guid, spawn, amount,
                                               template, caster_guid)
@@ -517,12 +705,26 @@ class CreatureAIMixin:
                 if triggered:
                     await self._cast_creature_triggered(
                         low_guid, spawn, ai, triggered, target_guid)
+            elif etype == spells.SPELL_EFFECT_INTERRUPT_CAST:
+                if target_guid and self._is_player_guid(target_guid):
+                    combat = self._get_combat_state()
+                    mask = int(template.school) or 1
+                    combat.setdefault("school_lockout", {})[
+                        mask] = time.monotonic() + 4.0
+                    if hasattr(self, "_interrupt_player_cast"):
+                        await self._interrupt_player_cast(
+                            SPELL_FAILED_INTERRUPTED)
             elif etype == spells.SPELL_EFFECT_INSTAKILL:
                 if target_guid and self._is_player_guid(target_guid):
                     await self._damage_player(
                         1 << 24, f"{spawn['name']}'s {template.name}")
             elif etype == spells.SPELL_EFFECT_APPLY_AURA:
                 aura = int(effect["apply_aura"])
+                if target_guid and self._effect_is_harmful(template, effect):
+                    lands = getattr(self, "_creature_spell_lands", None)
+                    if lands is not None and not await lands(
+                            template, target_guid, effect, caster_guid):
+                        continue
                 if (aura == spells.SPELL_AURA_PERIODIC_DAMAGE
                         and target_guid):
                     amount = template.effect_value(index, level)
@@ -530,6 +732,11 @@ class CreatureAIMixin:
                         continue
                     amplitude = max(1, int(effect["amplitude"] or 2000)) // 1000
                     now = time.monotonic()
+                    duration_ms = spells.spell_duration_ms(
+                        self.config.database.world_path,
+                        template.duration_index, level)
+                    if duration_ms <= 0:
+                        duration_ms = 15000
                     self._get_combat_state()["dots"].append({
                         "target_guid": int(target_guid),
                         "caster_guid": int(caster_guid),
@@ -538,6 +745,22 @@ class CreatureAIMixin:
                         "school": int(template.school),
                         "interval": float(amplitude),
                         "next_tick": now + float(amplitude),
-                        "expires": now + 15.0,
+                        "expires": now + duration_ms / 1000.0,
                         "is_heal": False,
+                        "leech": aura == spells.SPELL_AURA_PERIODIC_LEECH,
                     })
+                if hasattr(self, "_apply_aura_from_effect"):
+                    target_a = int(effect.get("target_a") or 0)
+                    target_b = int(effect.get("target_b") or 0)
+                    if target_a in (1, 22) or target_b in (1, 22):
+                        target_kind = "creature"
+                        aura_target = caster_guid
+                    else:
+                        target_kind = None
+                        aura_target = target_guid
+                    pattern = (target_a, target_b)
+                    if pattern not in aura_patterns:
+                        aura_patterns.add(pattern)
+                        await self._apply_aura_from_effect(
+                            template, effect, index, caster_guid, aura_target,
+                            level, target_kind=target_kind)

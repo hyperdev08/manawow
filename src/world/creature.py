@@ -23,6 +23,7 @@ that the worldserver needs to put a creature in front of the client:
 """
 from __future__ import annotations
 
+import os
 import sqlite3
 from typing import List, Optional
 
@@ -138,6 +139,9 @@ CREATE TABLE IF NOT EXISTS creature_templates(
   -- and a few event NPCs share a loot pool, so the loot template has to be
   -- looked up by this id when it is set.
   loot_id INTEGER NOT NULL DEFAULT 0,
+  -- CMaNGOS creature_template.MinLootGold / MaxLootGold.
+  min_loot_gold INTEGER NOT NULL DEFAULT 0,
+  max_loot_gold INTEGER NOT NULL DEFAULT 0,
   -- Display
   display_id INTEGER NOT NULL DEFAULT 0,
   -- Spell list
@@ -175,7 +179,9 @@ CREATE TABLE IF NOT EXISTS creature_spawns(
   -- Respawn
   dead_since INTEGER NOT NULL DEFAULT 0,
   -- Loot (JSON: {"items": [[item_entry, count], ...], "money": copper})
-  loot_json TEXT NOT NULL DEFAULT ''
+  loot_json TEXT NOT NULL DEFAULT '',
+  -- Player guid with loot rights (0 = legacy/free loot).
+  loot_owner INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_creature_spawns_map ON creature_spawns(map);
 -- Visibility queries bound a square around the player before doing the exact
@@ -271,6 +277,7 @@ CREATE TABLE IF NOT EXISTS spell_templates(
   targets INTEGER NOT NULL DEFAULT 0,
   target_creature_type INTEGER NOT NULL DEFAULT 0,
   requires_spell_focus INTEGER NOT NULL DEFAULT 0,
+  facing_caster_flags INTEGER NOT NULL DEFAULT 0,
   caster_aura_state INTEGER NOT NULL DEFAULT 0,
   target_aura_state INTEGER NOT NULL DEFAULT 0,
   caster_aura_state_not INTEGER NOT NULL DEFAULT 0,
@@ -611,6 +618,59 @@ CREATE TABLE IF NOT EXISTS spell_duration(
   max_duration INTEGER NOT NULL DEFAULT 0
 );
 
+-- Optional static line-of-sight blockers (VMAP AABBs).  The table is empty in a
+-- fresh install because the client map files are not bundled; adding rows turns
+-- on real terrain/object LOS without code changes.
+CREATE TABLE IF NOT EXISTS sight_blockers(
+  map INTEGER NOT NULL DEFAULT 0,
+  min_x REAL NOT NULL DEFAULT 0.0,
+  max_x REAL NOT NULL DEFAULT 0.0,
+  min_y REAL NOT NULL DEFAULT 0.0,
+  max_y REAL NOT NULL DEFAULT 0.0,
+  min_z REAL NOT NULL DEFAULT 0.0,
+  max_z REAL NOT NULL DEFAULT 0.0
+);
+CREATE INDEX IF NOT EXISTS idx_sight_blockers_map ON sight_blockers(map);
+
+-- SpellItemEnchantment.dbc subset used for temporary weapon enchants/poisons.
+-- Effect 1 is "combat spell" and EffectArg is the proc spell id.
+CREATE TABLE IF NOT EXISTS spell_item_enchantment(
+  id INTEGER PRIMARY KEY,
+  charges INTEGER NOT NULL DEFAULT 0,
+  effect1 INTEGER NOT NULL DEFAULT 0,
+  effect2 INTEGER NOT NULL DEFAULT 0,
+  effect3 INTEGER NOT NULL DEFAULT 0,
+  effect_points_min1 INTEGER NOT NULL DEFAULT 0,
+  effect_points_min2 INTEGER NOT NULL DEFAULT 0,
+  effect_points_min3 INTEGER NOT NULL DEFAULT 0,
+  effect_arg1 INTEGER NOT NULL DEFAULT 0,
+  effect_arg2 INTEGER NOT NULL DEFAULT 0,
+  effect_arg3 INTEGER NOT NULL DEFAULT 0,
+  name TEXT NOT NULL DEFAULT ''
+);
+
+-- CMaNGOS ``playercreateinfo_spell``: the exact spells every race/class
+-- combination knows at creation, including racials, languages, armor and
+-- weapon proficiencies.  Seeded from playercreateinfo.sql on first open.
+CREATE TABLE IF NOT EXISTS playercreateinfo_spell(
+  race INTEGER NOT NULL DEFAULT 0,
+  class INTEGER NOT NULL DEFAULT 0,
+  spell INTEGER NOT NULL DEFAULT 0,
+  note TEXT NOT NULL DEFAULT '',
+  PRIMARY KEY(race, class, spell)
+);
+
+-- CMaNGOS ``playercreateinfo_action``: the default action bar per race/class.
+-- ``type`` is 0 for a spell and 128 for a macro button.
+CREATE TABLE IF NOT EXISTS playercreateinfo_action(
+  race INTEGER NOT NULL DEFAULT 0,
+  class INTEGER NOT NULL DEFAULT 0,
+  button INTEGER NOT NULL DEFAULT 0,
+  action INTEGER NOT NULL DEFAULT 0,
+  type INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY(race, class, button)
+);
+
 """
 
 # The demo population of Northshire Valley (map 0, zone 12).  Display ids are
@@ -731,6 +791,48 @@ _TEMPLATE_COLUMNS = _schema_columns(CREATE_CREATURE_SQL, "creature_templates")
 _SPAWN_COLUMNS = _schema_columns(CREATE_CREATURE_SQL, "creature_spawns")
 
 
+_PLAYERCREATEINFO_SQL = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "playercreateinfo.sql")
+_SPELL_ENCHANT_SQL = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "spell_item_enchantment.sql")
+
+
+def _seed_spell_item_enchantment(con: sqlite3.Connection) -> None:
+    """Load the bundled SpellItemEnchantment subset once.
+
+    It drives temporary weapon enchants and poisons (combat-spell effect arg is
+    the proc spell id) without requiring a client DBC import.
+    """
+    count = con.execute(
+        "SELECT COUNT(*) FROM spell_item_enchantment").fetchone()[0]
+    if count:
+        return
+    if not os.path.exists(_SPELL_ENCHANT_SQL):
+        return
+    with open(_SPELL_ENCHANT_SQL, encoding="utf-8") as handle:
+        con.executescript(handle.read())
+    con.commit()
+
+
+
+def _seed_playercreateinfo(con: sqlite3.Connection) -> None:
+    """Load the bundled 3.3.5a starter spell/action tables once.
+
+    ``playercreateinfo.sql`` is generated from the CMaNGOS WoTLKDB dump, so a
+    fresh database starts with the exact level-1 spellbook and action bar of
+    every race/class combination even before the world dump is imported.
+    """
+    count = con.execute(
+        "SELECT COUNT(*) FROM playercreateinfo_spell").fetchone()[0]
+    if count:
+        return
+    if not os.path.exists(_PLAYERCREATEINFO_SQL):
+        return
+    with open(_PLAYERCREATEINFO_SQL, encoding="utf-8") as handle:
+        con.executescript(handle.read())
+    con.commit()
+
+
 def init_creature_db(path: str) -> None:
     """Create/upgrade the creature tables.
 
@@ -748,6 +850,16 @@ def init_creature_db(path: str) -> None:
                 con.execute(
                     f"ALTER TABLE creature_templates ADD COLUMN {column} {declaration}"
                 )
+        # Migrate spell_templates (same schema lives in spell_tables.sql).
+        spell_columns = {
+            row[1] for row in con.execute("PRAGMA table_info(spell_templates)")
+        }
+        for column, declaration in _schema_columns(
+                CREATE_CREATURE_SQL, "spell_templates"):
+            if column not in spell_columns:
+                con.execute(
+                    f"ALTER TABLE spell_templates ADD COLUMN {column} {declaration}"
+                )
         # Migrate creature_spawns
         spawn_columns = {row[1] for row in con.execute("PRAGMA table_info(creature_spawns)")}
         for column, declaration in _SPAWN_COLUMNS:
@@ -755,6 +867,10 @@ def init_creature_db(path: str) -> None:
                 con.execute(
                     f"ALTER TABLE creature_spawns ADD COLUMN {column} {declaration}"
                 )
+        # Level-1 spells and action buttons have no connection to the spawn
+        # table, so seed them before the demo-population early return.
+        _seed_playercreateinfo(con)
+        _seed_spell_item_enchantment(con)
         if con.execute("SELECT COUNT(*) FROM creature_spawns").fetchone()[0]:
             con.commit()
             return
@@ -804,7 +920,7 @@ _SPAWN_SELECT = """
 SELECT s.guid, s.entry, s.map, s.zone, s.x, s.y, s.z, s.o,
        s.display_id AS spawn_display_id,
        s.current_health, s.current_power, s.combat_state,
-       s.target_guid, s.dead_since, s.loot_json,
+       s.target_guid, s.dead_since, s.loot_json, s.loot_owner,
        s.movement_type AS spawn_movement_type, s.spawndist,
        t.name, t.subname, t.gossip_menu_id, t.min_level, t.max_level,
        t.faction, t.npc_flags, t.unit_flags, t.unit_flags2, t.unit_class,
@@ -814,6 +930,7 @@ SELECT s.guid, s.entry, s.map, s.zone, s.x, s.y, s.z, s.o,
        t.movement_info_id, t.bounding_radius, t.combat_reach, t.base_health,
        t.movement_type AS template_movement_type,
        t.respawn_time, t.aggro_radius, t.loot_id,
+       t.min_loot_gold, t.max_loot_gold,
        t.spell_list_id, t.ai_name, t.chase_distance,
        t.speed_walk, t.speed_run, t.min_damage, t.max_damage,
        t.attack_power, t.ranged_attack_power, t.armor,

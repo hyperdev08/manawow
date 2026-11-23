@@ -29,6 +29,10 @@ class WorldConfig:
     port: int = 8085
     realm_id: int = 1
     motd: str = "ManaWoW"
+    # Optional extracted client collision data (maps/, vmaps/, mmaps/).
+    # An empty value disables terrain/LOS/navmesh; run
+    # tools/fetch_client_data.py to populate the default directory.
+    client_data: str = "./data/client"
 
 
 @dataclass
@@ -50,6 +54,14 @@ class Config:
     worldserver: WorldConfig
     database: DBConfig
     logging: LogConfig
+
+    def resolve_database_paths(self, base_dir: str) -> None:
+        """Make relative DB paths independent of the caller's CWD."""
+        for attribute in ("auth_path", "world_path"):
+            value = getattr(self.database, attribute)
+            if value and not os.path.isabs(value):
+                setattr(self.database, attribute,
+                        os.path.normpath(os.path.join(base_dir, value)))
 
     @classmethod
     def load(cls, path: str | os.PathLike[str]) -> "Config":
@@ -77,11 +89,15 @@ class Config:
             realm_build_min=int(get(raw, "authserver", "realm_build_min", default=12340)),
             realm_build_max=int(get(raw, "authserver", "realm_build_max", default=12340)),
         )
+        raw_client_data = get(raw, "worldserver", "client_data",
+                              default="./data/client")
         world = WorldConfig(
             host=get(raw, "worldserver", "host", default="127.0.0.1"),
             port=int(get(raw, "worldserver", "port", default=8085)),
             realm_id=int(get(raw, "worldserver", "realm_id", default=1)),
             motd=str(get(raw, "worldserver", "motd", default="ManaWoW")),
+            client_data=("" if raw_client_data is None
+                         else str(raw_client_data)),
         )
         db = DBConfig(
             auth_path=str(get(raw, "database", "auth_path", default="./data/auth.db")),

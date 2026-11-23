@@ -19,7 +19,10 @@ python tools/init_db.py
 # 4. Create a test account
 python tools/create_test_account.py TEST TEST
 
-# 5. Start the servers
+# 5. (Optional) Download extracted terrain/VMaps/MMaps for real LOS + pathfinding
+python tools/fetch_client_data.py --preset starter
+
+# 6. Start the servers
 python run_servers.py
 #    Or run auth and world separately:
 #    python run_auth.py
