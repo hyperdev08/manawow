@@ -158,6 +158,7 @@ CREATE TABLE IF NOT EXISTS item_templates(
   lock_id INTEGER NOT NULL DEFAULT 0,
   material INTEGER NOT NULL DEFAULT 0,
   sheath_type INTEGER NOT NULL DEFAULT 0,
+  buy_count INTEGER NOT NULL DEFAULT 1,
   random_property INTEGER NOT NULL DEFAULT 0,
   random_suffix INTEGER NOT NULL DEFAULT 0,
   block INTEGER NOT NULL DEFAULT 0,
@@ -413,6 +414,11 @@ def init_character_db(path: str) -> None:
                 con.execute(
                     f"ALTER TABLE item_templates ADD COLUMN {column}"
                     " REAL NOT NULL DEFAULT 0.0")
+        if "buy_count" not in item_columns:
+            # Vendors sell some items in fixed bundles (water x5, arrows x200).
+            con.execute(
+                "ALTER TABLE item_templates ADD COLUMN buy_count INTEGER NOT NULL DEFAULT 1"
+            )
         _migrate_start_positions(con)
         _seed_starter_items(con)
         _backfill_starter_spells(con)

@@ -347,6 +347,14 @@ class SocketBase:
                 await self.handle_loot_money(data)
             elif opcode == Opcodes.CMSG_AUTOSTORE_LOOT_ITEM:
                 await self.handle_autostore_loot_item(data)
+            elif opcode == Opcodes.CMSG_LIST_INVENTORY:
+                await self.handle_list_inventory(data)
+            elif opcode == Opcodes.CMSG_BUY_ITEM:
+                await self.handle_buy_item(data)
+            elif opcode == Opcodes.CMSG_BUY_ITEM_IN_SLOT:
+                await self.handle_buy_item(data, in_slot=True)
+            elif opcode == Opcodes.CMSG_SELL_ITEM:
+                await self.handle_sell_item(data)
             elif opcode == Opcodes.CMSG_REPOP_REQUEST:
                 await self.handle_repop_request(data)
             elif opcode == Opcodes.MSG_MOVE_WORLDPORT_ACK:

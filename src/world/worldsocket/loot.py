@@ -351,49 +351,9 @@ class LootMixin:
             # client's "inventory is full" error (EQUIP_ERR_INV_FULL = 50).
             await self._send_inventory_failure(self.INVENTORY_FULL)
             return
-        inventory = self.character.setdefault("inventory", {})
-        for change in changes:
-            slot = int(change["slot"])
-            if change["created"]:
-                item_guid = F.ITEM_HIGH_GUID | (int(change["id"]) & 0xFFFFFFFF)
-                item_dict = {
-                    "guid": item_guid,
-                    "id": change["id"],
-                    "item_entry": int(item_entry),
-                    "stack_count": change["stack_count"],
-                    "durability": change["durability"],
-                    "max_durability": change["max_durability"],
-                    "slot": slot,
-                    "owner_guid": int(self.player_guid),
-                    "enchantment_1": 0,
-                }
-                inventory[slot] = item_dict
-                # The client cannot show a bag item whose object does not
-                # exist, so the create block has to precede the field update
-                # that references it.
-                await self._send_item_create_block(item_dict)
-            else:
-                item_dict = inventory.get(slot)
-                if item_dict is not None:
-                    item_dict["stack_count"] = change["stack_count"]
-                    opcode, payload = object_update.build_item_values_update(
-                        item_dict,
-                        {F.ITEM_FIELD_STACK_COUNT: int(change["stack_count"])},
-                    )
-                    await self.send_packet(opcode, payload)
-            client_slot = self._internal_slot_to_client(slot)
-            await self.send_packet(
-                Opcodes.SMSG_ITEM_PUSH_RESULT,
-                login_packets.build_item_push_result(
-                    int(self.player_guid), int(item_entry), 255, client_slot,
-                    count=change["added"], total_count=change["stack_count"],
-                    received=change["added"], created=0, send_chat_message=1,
-                ),
-            )
+        await self._deliver_item_changes(int(item_entry), changes)
         combat["loot_taken"].append(list_id)
         await self.broadcast_equipment_update()
-        if hasattr(self, "_quest_items_changed"):
-            await self._quest_items_changed([int(item_entry)])
         await self.send_packet(Opcodes.SMSG_LOOT_REMOVED, struct.pack("<B", list_id))
         self._persist_loot(combat)
         await self._finish_loot_if_empty(combat)
