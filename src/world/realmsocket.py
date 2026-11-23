@@ -31,6 +31,7 @@ from src.world.worldsocket.inventory import InventoryMixin
 from src.world.worldsocket.loot import LootMixin
 from src.world.worldsocket.peers import PeersMixin
 from src.world.worldsocket.player_movement import PlayerMovementMixin
+from src.world.worldsocket.quests import QuestsMixin
 from src.world.worldsocket.runes import RunesMixin
 from src.world.worldsocket.spells import SpellsMixin
 from src.world.worldsocket.stats import StatsMixin
@@ -60,5 +61,6 @@ class WorldSocket(
     SummonsMixin,
     LootMixin,
     InventoryMixin,
+    QuestsMixin,
 ):
     """One connected 3.3.5a client; see the mixins for each subsystem."""

@@ -10,6 +10,9 @@ Usage::
 
     python tools/import_wotlk_db.py --dump C:\\path\\WoTLKDB.sql [--db data/world.db]
 
+``--quests-only`` refreshes just the quest tables (``quest_template`` and the
+creature/area-trigger quest relations) of an existing database.
+
 The import is idempotent: by default the creature/gossip/npc-text tables are
 cleared first, so running it again always produces the same data and never
 leaves the old nine-NPC demo population behind.  Character and account data are
@@ -721,6 +724,7 @@ def import_world(dump_path: str, db_path: str, clear: bool = True,
         text, "creature_movement_template")
     item_columns, raw_item_template = wotlk_dump.rows(text, "item_template")
     item_map = _item_template_map(item_columns)
+    quest_tables = read_quest_tables(text)
     del text
 
     rune_cost_rows = read_rune_cost_dbc(rune_cost_dbc) if rune_cost_dbc else []
@@ -1029,6 +1033,8 @@ def import_world(dump_path: str, db_path: str, clear: bool = True,
 
         _seed_starter_items(con)
 
+        counts.update(insert_quest_tables(con, quest_tables))
+
         con.commit()
         con.execute("PRAGMA optimize")
     finally:
@@ -1053,6 +1059,9 @@ def import_world(dump_path: str, db_path: str, clear: bool = True,
         "loot_rows": counts["creature_loot_template"],
         "reference_loot_rows": counts["reference_loot_template"],
         "items": counts["item_templates"],
+        "quests": counts["quest_templates"],
+        "quest_starters": counts["creature_quest_starters"],
+        "quest_enders": counts["creature_quest_enders"],
     }
     print(
         f"imported {stats['templates']:,} templates, {stats['spawns']:,} spawns, "
@@ -1064,7 +1073,8 @@ def import_world(dump_path: str, db_path: str, clear: bool = True,
         f"{stats['spell_durations']:,} spell durations, "
         f"{stats['starter_spells']:,} starter spells, "
         f"{stats['starter_actions']:,} starter actions, "
-        f"{stats['loot_rows']:,} loot rows, {stats['items']:,} item templates "
+        f"{stats['loot_rows']:,} loot rows, {stats['items']:,} item templates, "
+        f"{stats['quests']:,} quests "
         f"in {time.time() - started:.1f}s"
     )
     print(
@@ -1073,6 +1083,95 @@ def import_world(dump_path: str, db_path: str, clear: bool = True,
         "spawn-mask rows"
     )
     return stats
+
+
+QUEST_RELATION_TABLES = (
+    # (dump table, SQLite table, SQLite key column)
+    ("creature_questrelation", "creature_quest_starters", "entry"),
+    ("creature_involvedrelation", "creature_quest_enders", "entry"),
+    ("areatrigger_involvedrelation", "areatrigger_quests", "trigger_id"),
+)
+
+
+def read_quest_tables(text: str) -> dict:
+    """Pull ``quest_template`` and the quest relation tables out of a dump."""
+    _, raw_quests = wotlk_dump.rows(text, "quest_template")
+    tables = {"quest_template": raw_quests}
+    for dump_table, _table, _key in QUEST_RELATION_TABLES:
+        _, tables[dump_table] = wotlk_dump.rows(text, dump_table)
+    return tables
+
+
+def insert_quest_tables(con, tables: dict) -> dict[str, int]:
+    """Replace the quest tables with the rows from :func:`read_quest_tables`.
+
+    Only quests with a known template are linked to creatures, so a giver
+    never offers a quest the server cannot describe.
+    """
+    from src.world import quests
+
+    con.executescript(quests.CREATE_QUEST_SQL)
+    con.execute("DELETE FROM quest_templates")
+    for _dump_table, table, _key in QUEST_RELATION_TABLES:
+        con.execute(f"DELETE FROM {table}")
+
+    columns = quests.QUEST_COLUMNS
+    text_columns = {quests.column_name(c) for c in quests.TEXT_COLUMNS}
+    float_columns = {quests.column_name(c) for c in quests.FLOAT_COLUMNS}
+    rows = []
+    for raw in tables.get("quest_template") or []:
+        row = []
+        for dump_column, column in zip(quests.QUEST_DUMP_COLUMNS, columns):
+            value = raw.get(dump_column)
+            if column in text_columns:
+                row.append(_text_or_empty(value))
+            elif column in float_columns:
+                row.append(_sqlite_float(value))
+            else:
+                row.append(_sqlite_int(value))
+        rows.append(row)
+    con.executemany(
+        f"INSERT OR REPLACE INTO quest_templates({', '.join(columns)}) "
+        f"VALUES({', '.join('?' for _ in columns)})",
+        rows,
+    )
+    known = {row[0] for row in rows}
+
+    counts = {"quest_templates": len(rows)}
+    for dump_table, table, key in QUEST_RELATION_TABLES:
+        pairs = {
+            (int(raw.get("id") or 0), int(raw.get("quest") or 0))
+            for raw in tables.get(dump_table) or []
+        }
+        pairs = sorted((a, q) for a, q in pairs if a and q in known)
+        con.executemany(
+            f"INSERT OR REPLACE INTO {table}({key}, quest) VALUES(?, ?)", pairs)
+        counts[table] = len(pairs)
+    return counts
+
+
+def import_quests(dump_path: str, db_path: str) -> dict[str, int]:
+    """``--quests-only``: refresh just the quest tables of an existing DB."""
+    import sqlite3
+
+    started = time.time()
+    text = wotlk_dump.read_dump(dump_path)
+    tables = read_quest_tables(text)
+    del text
+    con = sqlite3.connect(db_path)
+    try:
+        counts = insert_quest_tables(con, tables)
+        con.commit()
+    finally:
+        con.close()
+    print(
+        f"imported {counts['quest_templates']:,} quests, "
+        f"{counts['creature_quest_starters']:,} quest starters, "
+        f"{counts['creature_quest_enders']:,} quest enders, "
+        f"{counts['areatrigger_quests']:,} exploration triggers "
+        f"in {time.time() - started:.1f}s"
+    )
+    return counts
 
 
 def report_start_zones(db_path: str, radius: float = 150.0) -> None:
@@ -1112,6 +1211,9 @@ def main() -> None:
                         help="path to the client's SpellDuration.dbc")
     parser.add_argument("--keep-existing", action="store_true",
                         help="do not clear the NPC tables before importing")
+    parser.add_argument("--quests-only", action="store_true",
+                        help="only (re)import quest_template and the quest "
+                             "relation tables into an existing database")
     args = parser.parse_args()
 
     db_path = args.db
@@ -1122,6 +1224,10 @@ def main() -> None:
         if not os.path.exists(config_path):
             config_path = os.path.join(root, "config", "config.example.yaml")
         db_path = Config.load(config_path).database.world_path
+
+    if args.quests_only:
+        import_quests(args.dump, db_path)
+        return
 
     import_world(args.dump, db_path, clear=not args.keep_existing,
                  rune_cost_dbc=args.rune_cost_dbc,

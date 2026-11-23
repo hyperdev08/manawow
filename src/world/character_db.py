@@ -642,6 +642,9 @@ def delete_character(path: str, account_id: int, guid: int) -> bool:
             "DELETE FROM characters WHERE guid = ? AND account_id = ?",
             (guid, account_id),
         )
+        if cur.rowcount > 0:
+            from src.world import quests
+            quests.delete_character_quests(con, guid)
         con.commit()
         return cur.rowcount > 0
     finally:
@@ -1313,7 +1316,7 @@ def add_item_to_inventory(path: str, character_guid: int, entry: int,
         remaining = max(1, int(count))
 
         rows = con.execute(
-            "SELECT id, slot, stack_count FROM character_items "
+            "SELECT id, slot, stack_count, item_entry FROM character_items "
             "WHERE character_guid = ?",
             (character_guid,),
         ).fetchall()
@@ -1321,7 +1324,10 @@ def add_item_to_inventory(path: str, character_guid: int, entry: int,
 
         changes: List[Dict] = []
         if stackable > 1:
-            for item_id, slot, stack_count in rows:
+            for item_id, slot, stack_count, row_entry in rows:
+                # Only a partial stack of the *same* item can take more.
+                if int(row_entry) != int(entry):
+                    continue
                 slot = int(slot)
                 if not (256 <= slot <= 271):
                     continue

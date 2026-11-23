@@ -7,10 +7,12 @@ from typing import Optional
 
 from src.common.config import Config
 from src.common.logger import setup_logger
+from src.common import sqlite_tuning
 from src.world.realmsocket import WorldSocket
 from src.world import character_db
 from src.world import creature
 from src.world import geometry
+from src.world import quests
 from src.world.groups import GroupManager
 from src.world.world_combat import WorldCombatManager
 from src.network.packet_log import get_packet_log
@@ -28,12 +30,16 @@ class WorldServer:
         self.groups = GroupManager(self)
         self.packet_log = get_packet_log()
         self.packet_log.Initialize(config.logging.log_dir)
+        # WAL + synchronous=NORMAL: rollback-journal commits blocked the event
+        # loop for seconds on Windows (see src/common/sqlite_tuning.py).
+        sqlite_tuning.install(config.database.world_path)
         # Creature/spell tables (including the bundled 3.3.5a starter spells)
         # come first so the character backfill can read them.
         creature.init_creature_db(config.database.world_path)
         # Ensure the character schema exists and is up to date (adds the
         # orientation column to databases created before world entry existed).
         character_db.init_character_db(config.database.world_path)
+        quests.init_quest_db(config.database.world_path)
         world_geometry = geometry.get_geometry(config,
                                                config.database.world_path)
         if world_geometry is None:
