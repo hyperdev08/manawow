@@ -8,6 +8,7 @@ import sys
 # Ensure src importable
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "src"))
 
+from src.common import db_io
 from src.common.config import Config
 from src.common.utils import ensure_dirs, pause_if_interactive
 from src.network.packet_log import get_packet_log
@@ -38,9 +39,11 @@ if __name__ == "__main__":
         asyncio.run(main())
     except SystemExit:
         get_packet_log().Close()
+        db_io.shutdown()
         pause_if_interactive()
         raise
     except KeyboardInterrupt:
         pass
     finally:
         get_packet_log().Close()
+        db_io.shutdown()

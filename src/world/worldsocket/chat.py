@@ -1,12 +1,11 @@
 """Chat messages, text emotes and stand/sheath state."""
 from __future__ import annotations
 
-import sqlite3
 import struct
 
+from src.common.db_io import execute_write, run_db_write
 from src.protocol.opcodes import Opcodes
 from src.world import character_db
-from src.world import databases
 from src.world import login_packets
 from src.world import object_update
 from src.world import update_fields as F
@@ -273,15 +272,11 @@ class ChatMixin:
         self.character["bytes1"] = new_bytes1
 
         # Persist to DB
-        con = databases.connect_character(self.config.database.world_path)
-        try:
-            con.execute(
-                "UPDATE characters SET bytes1 = ? WHERE guid = ?",
-                (new_bytes1, self.player_guid),
-            )
-            con.commit()
-        finally:
-            con.close()
+        await run_db_write(
+            execute_write, self.config.database.world_path,
+            "UPDATE characters SET bytes1 = ? WHERE guid = ?",
+            (new_bytes1, self.player_guid),
+        )
 
         # Send VALUES update to peers so they see the stand state change
         from src.world import object_update
@@ -359,15 +354,11 @@ class ChatMixin:
         self.character["bytes2"] = new_bytes2
 
         # Persist to DB
-        con = databases.connect_character(self.config.database.world_path)
-        try:
-            con.execute(
-                "UPDATE characters SET bytes2 = ? WHERE guid = ?",
-                (new_bytes2, self.player_guid),
-            )
-            con.commit()
-        finally:
-            con.close()
+        await run_db_write(
+            execute_write, self.config.database.world_path,
+            "UPDATE characters SET bytes2 = ? WHERE guid = ?",
+            (new_bytes2, self.player_guid),
+        )
 
         # Send VALUES update to peers so they see the weapon drawn/sheath change
         from src.world import object_update

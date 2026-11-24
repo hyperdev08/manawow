@@ -4,6 +4,7 @@ from __future__ import annotations
 import struct
 import time
 
+from src.common.db_io import run_db_write
 from src.protocol.opcodes import Opcodes
 from src.world import character_db
 from src.world import login_packets
@@ -30,7 +31,7 @@ class PlayerMovementMixin:
             f"'{self.character['name']}' entered zone {zone} "
             f"(map {self.character['map']})"
         )
-        self.persist_position(force=True)
+        await self.persist_position(force=True)
         # Keep the minimap/PvP pane in sync with the new zone.
         await self.send_packet(
             Opcodes.SMSG_INIT_WORLD_STATES,
@@ -115,7 +116,7 @@ class PlayerMovementMixin:
         else:
             self.log.info(message)
 
-        self.persist_position()
+        await self.persist_position()
 
         # Relay the same MSG_MOVE_* packet to the other players.  The client
         # expects a packed guid followed by the MovementInfo, exactly what it
@@ -130,7 +131,7 @@ class PlayerMovementMixin:
         # no-op for most heartbeats.
         await self.refresh_creature_visibility()
 
-    def persist_position(self, force: bool = False):
+    async def persist_position(self, force: bool = False):
         """Write the current position to the character row (throttled)."""
         if not self.character or not self.player_guid:
             return
@@ -139,7 +140,8 @@ class PlayerMovementMixin:
             return
         self._last_position_save = now
         try:
-            character_db.update_character_position(
+            await run_db_write(
+                character_db.update_character_position,
                 self.config.database.world_path,
                 int(self.player_guid),
                 float(self.character["x"]),

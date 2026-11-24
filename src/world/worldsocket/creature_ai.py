@@ -3,12 +3,12 @@ from __future__ import annotations
 
 import math
 import random
-import sqlite3
 import struct
 import time
 
 from typing import List
 
+from src.common.db_io import execute_write, submit_db_write
 from src.protocol.opcodes import Opcodes
 from src.world import creature
 from src.world import spells
@@ -173,15 +173,11 @@ class CreatureAIMixin:
 
     def _set_creature_power(self, low_guid: int, power: int) -> None:
         """Persist a creature's current power (mana)."""
-        con = sqlite3.connect(self.config.database.world_path)
-        try:
-            con.execute(
-                "UPDATE creature_spawns SET current_power = ? WHERE guid = ?",
-                (max(0, int(power)), int(low_guid)),
-            )
-            con.commit()
-        finally:
-            con.close()
+        submit_db_write(
+            execute_write, self.config.database.world_path,
+            "UPDATE creature_spawns SET current_power = ? WHERE guid = ?",
+            (max(0, int(power)), int(low_guid)),
+        )
 
     async def _send_creature_power(self, low_guid: int, ai: dict) -> None:
         """Mirror a creature's mana in its update fields and ``SMSG_POWER_UPDATE``."""

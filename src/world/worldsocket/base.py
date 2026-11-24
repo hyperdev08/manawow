@@ -8,6 +8,7 @@ import struct
 import time
 
 from src.common.config import Config
+from src.common.geometry_io import run_geometry
 from src.common.logger import setup_logger
 from src.crypto.world_crypt import WorldCrypt
 from src.network.packet_header import ClientPacketHeader
@@ -180,7 +181,9 @@ class SocketBase:
         finally:
             self.stop_combat_loop()
             try:
-                self.persist_position(force=True)
+                await self.persist_position(force=True)
+            except asyncio.CancelledError:
+                pass
             except Exception:
                 pass
             # Tell the other clients to remove this character before the
@@ -591,25 +594,28 @@ class SocketBase:
             self._current_map_id() if map_id is None else int(map_id),
             float(x), float(y))
 
-    def _find_world_path(self, start, end, max_tiles: int = 2):
+    async def _find_world_path(self, start, end, max_tiles: int = 2):
         """Navmesh waypoints for ``start`` -> ``end`` (``None`` when unavailable)."""
         world = self._get_geometry()
         if world is None:
             return None
-        return world.find_path(self._current_map_id(), start, end,
-                               max_tiles=max_tiles)
+        return await run_geometry(
+            world.find_path, self._current_map_id(), start, end,
+            max_tiles=max_tiles)
 
-    def _navmesh_point(self, point, max_distance: float = 8.0):
+    async def _navmesh_point(self, point, max_distance: float = 8.0):
         world = self._get_geometry()
         if world is None:
             return None
-        return world.point_on_mesh(self._current_map_id(), point)
+        return await run_geometry(
+            world.point_on_mesh, self._current_map_id(), point)
 
-    def _random_world_point(self, center, radius: float):
+    async def _random_world_point(self, center, radius: float):
         world = self._get_geometry()
         if world is None:
             return None
-        return world.random_point(self._current_map_id(), center, radius)
+        return await run_geometry(
+            world.random_point, self._current_map_id(), center, radius)
 
     @staticmethod
     def _path_prefix(start, path, travel: float, stop_distance: float = 0.0):

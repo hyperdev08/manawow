@@ -431,7 +431,7 @@ class GameObjectsMixin:
             await self.send_packet_to_peers(
                 Opcodes.MSG_MOVE_TELEPORT,
                 movement.build_movement_packet(int(self.player_guid), info))
-        self.persist_position(force=True)
+        await self.persist_position(force=True)
 
     async def handle_teleport_ack(self, data: bytes):
         """``MSG_MOVE_TELEPORT_ACK`` from the client: the near teleport is done."""

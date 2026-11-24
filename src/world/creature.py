@@ -27,6 +27,7 @@ import os
 import sqlite3
 from typing import List, Optional
 
+from src.common import sqlite_tuning
 from src.world.update_fields import CREATURE_HIGH_GUID
 
 
@@ -969,16 +970,12 @@ _NO_ACTIVE_EVENT = (
 
 
 def get_creature_spawns(path: str, map_id: int) -> List[sqlite3.Row]:
-    con = sqlite3.connect(path)
-    con.row_factory = sqlite3.Row
-    try:
-        return con.execute(
-            _SPAWN_SELECT + " WHERE s.map = ? AND t.visible <> 0"
-            + _NO_ACTIVE_EVENT + " ORDER BY s.guid",
-            (int(map_id),)
-        ).fetchall()
-    finally:
-        con.close()
+    con = sqlite_tuning.read_connection(path)
+    return con.execute(
+        _SPAWN_SELECT + " WHERE s.map = ? AND t.visible <> 0"
+        + _NO_ACTIVE_EVENT + " ORDER BY s.guid",
+        (int(map_id),)
+    ).fetchall()
 
 
 def get_creature_spawns_near(path: str, map_id: int, x: float, y: float,
@@ -1001,18 +998,14 @@ def get_creature_spawns_near(path: str, map_id: int, x: float, y: float,
     if radius <= 0.0:
         return []
     x, y, z = float(x), float(y), float(z)
-    con = sqlite3.connect(path)
-    con.row_factory = sqlite3.Row
-    try:
-        rows = con.execute(
-            _SPAWN_SELECT
-            + " WHERE s.map = ? AND t.visible <> 0"
-            " AND s.x BETWEEN ? AND ? AND s.y BETWEEN ? AND ?"
-            + _NO_ACTIVE_EVENT + " ORDER BY s.guid",
-            (int(map_id), x - radius, x + radius, y - radius, y + radius),
-        ).fetchall()
-    finally:
-        con.close()
+    con = sqlite_tuning.read_connection(path)
+    rows = con.execute(
+        _SPAWN_SELECT
+        + " WHERE s.map = ? AND t.visible <> 0"
+        " AND s.x BETWEEN ? AND ? AND s.y BETWEEN ? AND ?"
+        + _NO_ACTIVE_EVENT + " ORDER BY s.guid",
+        (int(map_id), x - radius, x + radius, y - radius, y + radius),
+    ).fetchall()
     limit = radius * radius
     near = []
     for row in rows:
@@ -1025,107 +1018,75 @@ def get_creature_spawns_near(path: str, map_id: int, x: float, y: float,
 
 
 def get_creature_spawn(path: str, guid: int) -> Optional[sqlite3.Row]:
-    con = sqlite3.connect(path)
-    con.row_factory = sqlite3.Row
-    try:
-        return con.execute(
-            _SPAWN_SELECT + " WHERE s.guid = ?", (int(guid),)
-        ).fetchone()
-    finally:
-        con.close()
+    con = sqlite_tuning.read_connection(path)
+    return con.execute(
+        _SPAWN_SELECT + " WHERE s.guid = ?", (int(guid),)
+    ).fetchone()
 
 
 def get_creature_template(path: str, entry: int) -> Optional[sqlite3.Row]:
-    con = sqlite3.connect(path)
-    con.row_factory = sqlite3.Row
-    try:
-        return con.execute(
-            "SELECT * FROM creature_templates WHERE entry = ?", (int(entry),)
-        ).fetchone()
-    finally:
-        con.close()
+    con = sqlite_tuning.read_connection(path)
+    return con.execute(
+        "SELECT * FROM creature_templates WHERE entry = ?", (int(entry),)
+    ).fetchone()
 
 
 def get_gossip_menu(path: str, menu_id: int) -> Optional[sqlite3.Row]:
-    con = sqlite3.connect(path)
-    con.row_factory = sqlite3.Row
-    try:
-        return con.execute(
-            "SELECT * FROM gossip_menus WHERE menu_id = ?", (int(menu_id),)
-        ).fetchone()
-    finally:
-        con.close()
+    con = sqlite_tuning.read_connection(path)
+    return con.execute(
+        "SELECT * FROM gossip_menus WHERE menu_id = ?", (int(menu_id),)
+    ).fetchone()
 
 
 def get_gossip_options(path: str, menu_id: int) -> List[sqlite3.Row]:
-    con = sqlite3.connect(path)
-    con.row_factory = sqlite3.Row
-    try:
-        return con.execute(
-            "SELECT * FROM gossip_options WHERE menu_id = ? ORDER BY option_index",
-            (int(menu_id),),
-        ).fetchall()
-    finally:
-        con.close()
+    con = sqlite_tuning.read_connection(path)
+    return con.execute(
+        "SELECT * FROM gossip_options WHERE menu_id = ? ORDER BY option_index",
+        (int(menu_id),),
+    ).fetchall()
 
 
 def get_gossip_option(path: str, menu_id: int, option_index: int) -> Optional[sqlite3.Row]:
-    con = sqlite3.connect(path)
-    con.row_factory = sqlite3.Row
-    try:
-        return con.execute(
-            "SELECT * FROM gossip_options WHERE menu_id = ? AND option_index = ?",
-            (int(menu_id), int(option_index)),
-        ).fetchone()
-    finally:
-        con.close()
+    con = sqlite_tuning.read_connection(path)
+    return con.execute(
+        "SELECT * FROM gossip_options WHERE menu_id = ? AND option_index = ?",
+        (int(menu_id), int(option_index)),
+    ).fetchone()
 
 
 def get_creature_movement(path: str, guid: int) -> List[sqlite3.Row]:
     """Return the per-spawn waypoint path for ``guid`` (``creature_movement``)."""
-    con = sqlite3.connect(path)
-    con.row_factory = sqlite3.Row
-    try:
-        return con.execute(
-            "SELECT point, position_x, position_y, position_z, orientation,"
-            " wait_time FROM creature_movement WHERE id = ? ORDER BY point",
-            (int(guid),),
-        ).fetchall()
-    finally:
-        con.close()
+    con = sqlite_tuning.read_connection(path)
+    return con.execute(
+        "SELECT point, position_x, position_y, position_z, orientation,"
+        " wait_time FROM creature_movement WHERE id = ? ORDER BY point",
+        (int(guid),),
+    ).fetchall()
 
 
 def get_creature_movement_template(path: str, entry: int,
                                    path_id: int = 0) -> List[sqlite3.Row]:
     """Return a shared waypoint path (``creature_movement_template``)."""
-    con = sqlite3.connect(path)
-    con.row_factory = sqlite3.Row
-    try:
+    con = sqlite_tuning.read_connection(path)
+    rows = con.execute(
+        "SELECT point, position_x, position_y, position_z, orientation,"
+        " wait_time FROM creature_movement_template"
+        " WHERE entry = ? AND path_id = ? ORDER BY point",
+        (int(entry), int(path_id)),
+    ).fetchall()
+    if not rows and int(path_id) != 0:
+        # Some dumps store the only path for an entry under path id 0.
         rows = con.execute(
             "SELECT point, position_x, position_y, position_z, orientation,"
             " wait_time FROM creature_movement_template"
-            " WHERE entry = ? AND path_id = ? ORDER BY point",
-            (int(entry), int(path_id)),
+            " WHERE entry = ? AND path_id = 0 ORDER BY point",
+            (int(entry),),
         ).fetchall()
-        if not rows and int(path_id) != 0:
-            # Some dumps store the only path for an entry under path id 0.
-            rows = con.execute(
-                "SELECT point, position_x, position_y, position_z, orientation,"
-                " wait_time FROM creature_movement_template"
-                " WHERE entry = ? AND path_id = 0 ORDER BY point",
-                (int(entry),),
-            ).fetchall()
-        return rows
-    finally:
-        con.close()
+    return rows
 
 
 def get_npc_text(path: str, text_id: int) -> Optional[sqlite3.Row]:
-    con = sqlite3.connect(path)
-    con.row_factory = sqlite3.Row
-    try:
-        return con.execute(
-            "SELECT * FROM npc_text WHERE id = ?", (int(text_id),)
-        ).fetchone()
-    finally:
-        con.close()
+    con = sqlite_tuning.read_connection(path)
+    return con.execute(
+        "SELECT * FROM npc_text WHERE id = ?", (int(text_id),)
+    ).fetchone()

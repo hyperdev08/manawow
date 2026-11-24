@@ -2,13 +2,12 @@
 from __future__ import annotations
 
 import asyncio
-import sqlite3
 import struct
 import time
 
+from src.common.db_io import run_db_write
 from src.protocol.opcodes import Opcodes
 from src.world import character_db
-from src.world import databases
 from src.world import creature
 from src.world import gameobject
 from src.world import login_packets
@@ -148,7 +147,7 @@ class WorldEntryMixin:
 
     async def handle_logout_request(self, data: bytes):
         if self.in_world:
-            self.persist_position(force=True)
+            await self.persist_position(force=True)
             # Remove pets/guardians while the session still has its map/guid so
             # peers receive the destroy packet.
             await self.dismiss_all_summons()
@@ -228,16 +227,11 @@ class WorldEntryMixin:
         self._apply_combat_stats()
         self.character["health"] = int(self.character["max_health"])
         self.character["power"] = self._power_after_reset()
-        con = databases.connect_character(self.config.database.world_path)
-        try:
-            con.execute(
-                "UPDATE characters SET map = ?, zone = ?, x = ?, y = ?, z = ?, o = ?"
-                " WHERE guid = ?",
-                (map_id, zone, x, y, z, o, int(self.player_guid)),
-            )
-            con.commit()
-        finally:
-            con.close()
+        await run_db_write(
+            character_db.update_character_position,
+            self.config.database.world_path, int(self.player_guid),
+            x, y, z, o, map_id=map_id, zone=zone,
+        )
 
         self._repop_pending = True
         self.movement_info = None

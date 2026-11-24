@@ -4,9 +4,10 @@ from __future__ import annotations
 import json
 import math
 import random
-import sqlite3
 import time
 
+from src.common import sqlite_tuning
+from src.common.db_io import execute_write, run_db_write, submit_db_write
 from src.protocol.opcodes import Opcodes
 from src.world import creature
 from src.world import login_packets
@@ -162,15 +163,11 @@ class CreaturesMixin:
         if summon is not None:
             summon["current_health"] = max(0, int(health))
             return
-        con = sqlite3.connect(self.config.database.world_path)
-        try:
-            con.execute(
-                "UPDATE creature_spawns SET current_health = ? WHERE guid = ?",
-                (max(0, int(health)), int(low_guid)),
-            )
-            con.commit()
-        finally:
-            con.close()
+        submit_db_write(
+            execute_write, self.config.database.world_path,
+            "UPDATE creature_spawns SET current_health = ? WHERE guid = ?",
+            (max(0, int(health)), int(low_guid)),
+        )
 
     def _get_creature_spawn(self, low_guid: int):
         """Get a creature spawn row (session summons first, then the DB)."""
@@ -264,16 +261,12 @@ class CreaturesMixin:
                     "last_power_update": now,
                 }
             self._call_for_help(int(low_guid))
-        con = sqlite3.connect(self.config.database.world_path)
-        try:
-            con.execute(
-                "UPDATE creature_spawns SET combat_state = 1, target_guid = ? "
-                "WHERE guid = ? AND dead_since = 0",
-                (int(self.player_guid or 0), int(low_guid)),
-            )
-            con.commit()
-        finally:
-            con.close()
+        submit_db_write(
+            execute_write, self.config.database.world_path,
+            "UPDATE creature_spawns SET combat_state = 1, target_guid = ? "
+            "WHERE guid = ? AND dead_since = 0",
+            (int(self.player_guid or 0), int(low_guid)),
+        )
 
     def _threat_source_guid(self, source_guid: int) -> int:
         """Attribute pet damage to the pet's owner, not the pet guid."""
@@ -422,17 +415,13 @@ class CreaturesMixin:
         loot_items = self._generate_loot(entry, loot_id or entry)
         loot_money = self._loot_money(spawn)
         loot_json = json.dumps({"items": loot_items, "money": loot_money})
-        con = sqlite3.connect(self.config.database.world_path)
-        try:
-            con.execute(
-                "UPDATE creature_spawns SET current_health = 0, dead_since = ?, "
-                "combat_state = 3, target_guid = 0, loot_json = ?, "
-                "loot_owner = ? WHERE guid = ?",
-                (int(time.time()), loot_json, int(tagger_guid), low_guid),
-            )
-            con.commit()
-        finally:
-            con.close()
+        await run_db_write(
+            execute_write, self.config.database.world_path,
+            "UPDATE creature_spawns SET current_health = 0, dead_since = ?, "
+            "combat_state = 3, target_guid = 0, loot_json = ?, "
+            "loot_owner = ? WHERE guid = ?",
+            (int(time.time()), loot_json, int(tagger_guid), low_guid),
+        )
         combat = self._get_combat_state()
         # ``Unit::ClearComboPointHolders``: a target's death drops every
         # player's combo points on it.  Only this session can hold points, so
@@ -711,7 +700,7 @@ class CreaturesMixin:
             eye_a = (here[0], here[1], here[2] + 0.9)
             eye_b = (player[0], player[1], player[2] + 0.9)
             if not self._has_line_of_sight(eye_a, eye_b):
-                path = self._find_world_path(here, player)
+                path = await self._find_world_path(here, player)
         points = None
         if path and len(path) > 1:
             points = self._path_prefix(here, path, travel,
@@ -759,8 +748,8 @@ class CreaturesMixin:
                 here[1] + dy / length * distance, here[2])
         # Snap the run-away point onto walkable ground; otherwise a flee can
         # pick the far side of a wall and the client receives an invalid spline.
-        snapped = (self._navmesh_point((dest[0], dest[1], here[2]),
-                                       max_distance=6.0)
+        snapped = (await self._navmesh_point((dest[0], dest[1], here[2]),
+                                             max_distance=6.0)
                    if hasattr(self, "_navmesh_point") else None)
         if snapped is not None:
             dest = snapped
@@ -769,7 +758,7 @@ class CreaturesMixin:
             if not self._has_line_of_sight(
                     (here[0], here[1], here[2] + 0.9),
                     (dest[0], dest[1], dest[2] + 0.9)):
-                path = self._find_world_path(here, dest)
+                path = await self._find_world_path(here, dest)
         points = None
         if path and len(path) > 1:
             points = self._path_prefix(here, path, 12.0)
@@ -821,16 +810,12 @@ class CreaturesMixin:
             self._set_creature_power(int(low_guid), ai["mana"])
             await self._send_creature_power(int(low_guid), ai)
         home = (float(spawn["x"]), float(spawn["y"]), float(spawn["z"]))
-        con = sqlite3.connect(self.config.database.world_path)
-        try:
-            con.execute(
-                "UPDATE creature_spawns SET combat_state = 0, target_guid = 0 "
-                "WHERE guid = ?",
-                (int(low_guid),),
-            )
-            con.commit()
-        finally:
-            con.close()
+        await run_db_write(
+            execute_write, self.config.database.world_path,
+            "UPDATE creature_spawns SET combat_state = 0, target_guid = 0 "
+            "WHERE guid = ?",
+            (int(low_guid),),
+        )
         distance = self._distance(home, here)
         settle_until = time.monotonic()
         if distance > 1.0:
@@ -839,7 +824,7 @@ class CreaturesMixin:
                 if not self._has_line_of_sight(
                         (here[0], here[1], here[2] + 0.9),
                         (home[0], home[1], home[2] + 0.9)):
-                    path = self._find_world_path(here, home)
+                    path = await self._find_world_path(here, home)
             points = None
             if path and len(path) > 1:
                 points = self._path_prefix(here, path, 7.0 * 6.0)
@@ -873,36 +858,29 @@ class CreaturesMixin:
         if not self._visible_creatures:
             return
         rows = []
-        con = sqlite3.connect(self.config.database.world_path)
-        try:
-            for low_guid in list(self._visible_creatures):
-                row = con.execute(
-                    "SELECT s.dead_since, t.respawn_time, s.map "
-                    "FROM creature_spawns s "
-                    "JOIN creature_templates t ON t.entry = s.entry "
-                    "WHERE s.guid = ?",
-                    (int(low_guid),),
-                ).fetchone()
-                if row is None or int(row[0] or 0) <= 0:
-                    continue
-                delay = max(5, int(row[1] or 0))
-                if int(row[0]) + delay <= int(time.time()):
-                    rows.append(int(low_guid))
-        finally:
-            con.close()
+        con = sqlite_tuning.read_connection(self.config.database.world_path)
+        for low_guid in list(self._visible_creatures):
+            row = con.execute(
+                "SELECT s.dead_since, t.respawn_time, s.map "
+                "FROM creature_spawns s "
+                "JOIN creature_templates t ON t.entry = s.entry "
+                "WHERE s.guid = ?",
+                (int(low_guid),),
+            ).fetchone()
+            if row is None or int(row[0] or 0) <= 0:
+                continue
+            delay = max(5, int(row[1] or 0))
+            if int(row[0]) + delay <= int(time.time()):
+                rows.append(int(low_guid))
         for low_guid in rows:
-            con = sqlite3.connect(self.config.database.world_path)
-            try:
-                con.execute(
-                    "UPDATE creature_spawns SET dead_since = 0, combat_state = 0, "
-                    "target_guid = 0, current_health = 0, current_power = 0, "
-                    "loot_json = '', loot_owner = 0 "
-                    "WHERE guid = ?",
-                    (int(low_guid),),
-                )
-                con.commit()
-            finally:
-                con.close()
+            await run_db_write(
+                execute_write, self.config.database.world_path,
+                "UPDATE creature_spawns SET dead_since = 0, combat_state = 0, "
+                "target_guid = 0, current_health = 0, current_power = 0, "
+                "loot_json = '', loot_owner = 0 "
+                "WHERE guid = ?",
+                (int(low_guid),),
+            )
             manager = self._creature_combat_manager()
             if manager is not None:
                 manager.forget(int(low_guid))

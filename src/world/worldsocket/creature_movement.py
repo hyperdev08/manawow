@@ -161,7 +161,7 @@ class CreatureMovementMixin:
             eye_a = (here[0], here[1], here[2] + 0.9)
             eye_b = (float(dest[0]), float(dest[1]), float(dest[2]) + 0.9)
             if not self._has_line_of_sight(eye_a, eye_b):
-                path = self._find_world_path(here, dest)
+                path = await self._find_world_path(here, dest)
         if path and len(path) > 1:
             max_travel = speed * IDLE_MOVE_MAX_DURATION_MS / 1000.0
             points = self._path_prefix(here, path, max_travel)
@@ -278,7 +278,7 @@ class CreatureMovementMixin:
         # surface and already has the right height.  The random-circle fallback
         # is only used before the client data cache is populated.
         for _ in range(6):
-            candidate = (self._random_world_point(home, radius)
+            candidate = (await self._random_world_point(home, radius)
                          if hasattr(self, "_random_world_point") else None)
             if candidate is None:
                 break

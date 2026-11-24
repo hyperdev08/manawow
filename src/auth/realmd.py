@@ -6,6 +6,7 @@ import sqlite3
 import struct
 
 from src.common.config import Config
+from src.common.db_io import execute_write, run_db_write
 from src.common.logger import setup_logger
 from src.crypto.srp6 import SRP6
 from src.auth.realm_list import Realm, build_realm_list
@@ -103,18 +104,14 @@ class AuthSession:
             self.log.error(f"Database error while loading account: {exc}")
             return None
 
-    def store_session_key(self, account_id: int, session_key: bytes, ip: str):
+    async def store_session_key(self, account_id: int, session_key: bytes, ip: str):
         try:
-            con = sqlite3.connect(self.config.database.auth_path)
-            try:
-                con.execute(
-                    "UPDATE account SET session_key = ?, last_login = CURRENT_TIMESTAMP, "
-                    "last_ip = ?, failed_logins = 0 WHERE id = ?",
-                    (session_key, ip, account_id),
-                )
-                con.commit()
-            finally:
-                con.close()
+            await run_db_write(
+                execute_write, self.config.database.auth_path,
+                "UPDATE account SET session_key = ?, last_login = CURRENT_TIMESTAMP, "
+                "last_ip = ?, failed_logins = 0 WHERE id = ?",
+                (session_key, ip, account_id),
+            )
         except Exception as exc:
             self.log.error(f"Failed to store session key: {exc}")
 
@@ -250,7 +247,7 @@ class AuthSession:
 
             peer = self.writer.get_extra_info("peername")
             ip = peer[0] if peer else "127.0.0.1"
-            self.store_session_key(self.account_id, session_key, ip)
+            await self.store_session_key(self.account_id, session_key, ip)
 
             response = bytearray()
             response.append(CMD_AUTH_LOGON_PROOF)

@@ -404,7 +404,7 @@ class SummonsMixin:
             if not self._has_line_of_sight(
                     (here[0], here[1], here[2] + 0.9),
                     (dest[0], dest[1], dest[2] + 0.9)):
-                path = self._find_world_path(here, dest)
+                path = await self._find_world_path(here, dest)
         points = None
         if path and len(path) > 1:
             points = self._path_prefix(here, path,

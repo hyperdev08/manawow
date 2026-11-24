@@ -15,6 +15,7 @@ from __future__ import annotations
 import struct
 from typing import Dict, Iterable, List, Optional, Tuple
 
+from src.common.db_io import run_db_write
 from src.protocol.opcodes import Opcodes
 from src.world import character_db
 from src.world import creature
@@ -76,9 +77,10 @@ class QuestsMixin:
         if hasattr(self, "refresh_gameobject_quest_flags"):
             await self.refresh_gameobject_quest_flags()
 
-    def _save_quest(self, quest_id: int, entry: dict) -> None:
-        Q.save_quest(self.config.database.world_path, int(self.player_guid),
-                     quest_id, entry)
+    async def _save_quest(self, quest_id: int, entry: dict) -> None:
+        await run_db_write(
+            Q.save_quest, self.config.database.world_path,
+            int(self.player_guid), quest_id, entry)
 
     # ------------------------------------------------------------------
     # Quest giver lookup
@@ -313,10 +315,13 @@ class QuestsMixin:
             await self.send_packet(Opcodes.SMSG_GOSSIP_COMPLETE, b"")
             return
         accepted = await self._accept_quest(quest)
+        if accepted and self._giver_kind(spawn) == Q.GIVER_ITEM:
+            # Consume the starting item before the client is told the gossip is
+            # complete, so the persisted inventory is already consistent when
+            # the next request (or a relog) arrives.
+            await self._consume_quest_starter(spawn, quest)
         await self.send_packet(Opcodes.SMSG_GOSSIP_COMPLETE, b"")
         if self._giver_kind(spawn) == Q.GIVER_ITEM:
-            if accepted:
-                await self._consume_quest_starter(spawn, quest)
             return
         await self.send_packet(
             Opcodes.SMSG_QUESTGIVER_STATUS,
@@ -396,7 +401,7 @@ class QuestsMixin:
         log[quest_id] = entry
         if Q.objectives_complete(quest, entry, self._quest_item_counts()):
             entry["status"] = Q.QUEST_STATUS_COMPLETE
-        self._save_quest(quest_id, entry)
+        await self._save_quest(quest_id, entry)
         await self._send_quest_slot(quest_id, entry)
         if entry["status"] == Q.QUEST_STATUS_COMPLETE:
             await self.send_packet(Opcodes.SMSG_QUESTUPDATE_COMPLETE,
@@ -415,7 +420,9 @@ class QuestsMixin:
         if not quest_id:
             return
         del log[quest_id]
-        Q.delete_quest(self.config.database.world_path, int(self.player_guid), quest_id)
+        await run_db_write(
+            Q.delete_quest, self.config.database.world_path,
+            int(self.player_guid), quest_id)
         await self._send_quest_slot(quest_id, None, slot=slot)
         quest = Q.get_quest_template(self.config.database.world_path, quest_id)
         if quest is not None and int(quest.get("src_item_id") or 0):
@@ -516,7 +523,8 @@ class QuestsMixin:
 
         entry = self._quest_log_map().pop(quest_id)
         self._quest_rewarded.add(quest_id)
-        Q.reward_quest(path, int(self.player_guid), quest_id)
+        await run_db_write(
+            Q.reward_quest, path, int(self.player_guid), quest_id)
         await self._send_quest_slot(quest_id, None, slot=int(entry["slot"]))
 
         if money:
@@ -620,7 +628,7 @@ class QuestsMixin:
             state["status"] = Q.QUEST_STATUS_COMPLETE
         elif not complete and was_complete:
             state["status"] = Q.QUEST_STATUS_INCOMPLETE
-        self._save_quest(quest_id, state)
+        await self._save_quest(quest_id, state)
         await self._send_quest_slot(quest_id, state)
         if complete and not was_complete:
             await self.send_packet(Opcodes.SMSG_QUESTUPDATE_COMPLETE,
@@ -691,7 +699,8 @@ class QuestsMixin:
 
     async def _quest_give_item(self, item_entry: int, count: int) -> bool:
         """Put ``count`` of an item in the backpack and tell the client."""
-        changes = character_db.add_item_to_inventory(
+        changes = await run_db_write(
+            character_db.add_item_to_inventory,
             self.config.database.world_path, int(self.player_guid),
             int(item_entry), int(count),
         )

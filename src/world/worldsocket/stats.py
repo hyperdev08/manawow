@@ -6,9 +6,9 @@ import sqlite3
 import struct
 import time
 
+from src.common.db_io import execute_write, run_db_write
 from src.protocol.opcodes import Opcodes
 from src.world import character_db
-from src.world import databases
 from src.world import login_packets
 from src.world import object_update
 from src.world import spells
@@ -701,15 +701,11 @@ class StatsMixin:
             self.character["health"] = new_max
             self.character["power"] = self._power_after_reset()
             await self._send_level_up_packet(new_max - old_max)
-        con = databases.connect_character(self.config.database.world_path)
-        try:
-            con.execute(
-                "UPDATE characters SET level = ?, xp = ? WHERE guid = ?",
-                (level, total_xp, self.player_guid),
-            )
-            con.commit()
-        finally:
-            con.close()
+        await run_db_write(
+            execute_write, self.config.database.world_path,
+            "UPDATE characters SET level = ?, xp = ? WHERE guid = ?",
+            (level, total_xp, self.player_guid),
+        )
         fields = {
             F.PLAYER_XP: total_xp,
             F.PLAYER_NEXT_LEVEL_XP: threshold,

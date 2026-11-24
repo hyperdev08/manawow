@@ -7,6 +7,7 @@ import sqlite3
 import struct
 import time
 
+from src.common.db_io import execute_write, run_db_write
 from src.protocol.opcodes import Opcodes
 from src.world import creature
 from src.world import databases
@@ -1030,16 +1031,12 @@ class SpellsMixin:
             "expires": now + duration_ms / 1000.0,
             "max_duration": duration_ms / 1000.0,
         }
-        con = databases.connect_character(path)
-        try:
-            con.execute(
-                "UPDATE character_items SET enchantment_2 = ?"
-                " WHERE character_guid = ? AND slot = ? AND slot IN (15,16)",
-                (enchant_id, int(self.player_guid or 0), slot),
-            )
-            con.commit()
-        finally:
-            con.close()
+        await run_db_write(
+            execute_write, path,
+            "UPDATE character_items SET enchantment_2 = ?"
+            " WHERE character_guid = ? AND slot = ? AND slot IN (15,16)",
+            (enchant_id, int(self.player_guid or 0), slot),
+        )
         inventory = getattr(self, "character", {}).get("inventory") or {}
         item = inventory.get(int(slot))
         if item is not None:
@@ -2392,16 +2389,12 @@ class SpellsMixin:
         entry = combat.setdefault("weapon_enchants", {}).pop(slot, None)
         if entry is None:
             return
-        con = databases.connect_character(self.config.database.world_path)
-        try:
-            con.execute(
-                "UPDATE character_items SET enchantment_2 = 0"
-                " WHERE character_guid = ? AND slot = ?",
-                (int(self.player_guid or 0), int(slot)),
-            )
-            con.commit()
-        finally:
-            con.close()
+        await run_db_write(
+            execute_write, self.config.database.world_path,
+            "UPDATE character_items SET enchantment_2 = 0"
+            " WHERE character_guid = ? AND slot = ?",
+            (int(self.player_guid or 0), int(slot)),
+        )
         inventory = getattr(self, "character", {}).get("inventory") or {}
         item = inventory.get(int(slot))
         if item is not None:

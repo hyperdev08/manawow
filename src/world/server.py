@@ -58,6 +58,12 @@ class WorldServer:
             character_db.init_character_db(world_path)
             quests.init_quest_db(world_path)
         gameobject.init_gameobject_db(world_path)
+        # Open the shared read connections before players connect: the first
+        # connect on a cold Windows disk can take seconds (Defender scans the
+        # Python process and database), and it must not happen on the loop
+        # while a session is waiting for a query result.
+        sqlite_tuning.warm_read(world_path)
+        sqlite_tuning.warm_read(databases.character_path(world_path))
         self.log.info(
             f"World database: {world_path}; character database: "
             f"{databases.character_path(world_path)}")

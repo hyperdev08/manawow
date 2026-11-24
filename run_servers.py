@@ -16,7 +16,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from src.common import stall_watchdog
+from src.common import db_io, geometry_io, stall_watchdog
 from src.common.config import Config
 from src.common.utils import ensure_dirs, pause_if_interactive
 from src.network.packet_log import get_packet_log
@@ -56,9 +56,13 @@ if __name__ == "__main__":
         asyncio.run(main(args.watchdog))
     except SystemExit:
         get_packet_log().Close()
+        db_io.shutdown()
+        geometry_io.shutdown()
         pause_if_interactive()
         raise
     except KeyboardInterrupt:
         pass
     finally:
         get_packet_log().Close()
+        db_io.shutdown()
+        geometry_io.shutdown()

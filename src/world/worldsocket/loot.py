@@ -8,10 +8,10 @@ import struct
 
 from typing import Dict, List, Tuple
 
+from src.common.db_io import execute_write, run_db_write
 from src.protocol.opcodes import Opcodes
 from src.world import character_db
 from src.world import creature
-from src.world import databases
 from src.world import gameobject
 from src.world import login_packets
 from src.world import object_update
@@ -69,7 +69,7 @@ class LootMixin:
         items = self._filter_loot_items(items)
         empty = not items and money <= 0
         if empty:
-            self._set_loot_json(low_guid, "")
+            await self._set_loot_json(low_guid, "")
         combat["loot_target"] = target_guid
         combat["loot_items"] = list(items)
         combat["loot_taken"] = []
@@ -253,16 +253,12 @@ class LootMixin:
         count = random.randint(mincount, max(mincount, maxcount))
         out.append((item_entry, count))
 
-    def _set_loot_json(self, low_guid: int, payload: str) -> None:
-        con = sqlite3.connect(self.config.database.world_path)
-        try:
-            con.execute(
-                "UPDATE creature_spawns SET loot_json = ? WHERE guid = ?",
-                (payload, int(low_guid)),
-            )
-            con.commit()
-        finally:
-            con.close()
+    async def _set_loot_json(self, low_guid: int, payload: str) -> None:
+        await run_db_write(
+            execute_write, self.config.database.world_path,
+            "UPDATE creature_spawns SET loot_json = ? WHERE guid = ?",
+            (payload, int(low_guid)),
+        )
 
     @staticmethod
     def _remaining_loot(combat) -> List[Tuple[int, int]]:
@@ -273,7 +269,7 @@ class LootMixin:
             if index not in taken
         ]
 
-    def _persist_loot(self, combat) -> None:
+    async def _persist_loot(self, combat) -> None:
         """Write the still-unlooted items/money back to the corpse row."""
         target = int(combat.get("loot_target") or 0)
         if not target:
@@ -287,7 +283,7 @@ class LootMixin:
             payload = json.dumps({"items": remaining, "money": money})
         else:
             payload = ""                   # fully looted: corpse stays empty
-        self._set_loot_json(creature.creature_low_guid(target), payload)
+        await self._set_loot_json(creature.creature_low_guid(target), payload)
 
     @staticmethod
     def _loot_money(spawn) -> int:
@@ -354,7 +350,8 @@ class LootMixin:
         if list_id in (combat.get("loot_taken") or []):
             return
         item_entry, count = combat["loot_items"][list_id]
-        changes = character_db.add_item_to_inventory(
+        changes = await run_db_write(
+            character_db.add_item_to_inventory,
             self.config.database.world_path, int(self.player_guid),
             int(item_entry), int(count),
         )
@@ -367,7 +364,7 @@ class LootMixin:
         combat["loot_taken"].append(list_id)
         await self.broadcast_equipment_update()
         await self.send_packet(Opcodes.SMSG_LOOT_REMOVED, struct.pack("<B", list_id))
-        self._persist_loot(combat)
+        await self._persist_loot(combat)
         await self._finish_loot_if_empty(combat)
 
     async def _close_loot(self) -> None:
@@ -418,19 +415,17 @@ class LootMixin:
         combat["loot_money"] = 0
         total = int(self.character.get("money", 0)) + money
         self.character["money"] = total
-        con = databases.connect_character(self.config.database.world_path)
-        try:
-            con.execute("UPDATE characters SET money = ? WHERE guid = ?",
-                        (total, int(self.player_guid)))
-            con.commit()
-        finally:
-            con.close()
+        await run_db_write(
+            execute_write, self.config.database.world_path,
+            "UPDATE characters SET money = ? WHERE guid = ?",
+            (total, int(self.player_guid)),
+        )
         await self._send_player_fields({F.PLAYER_FIELD_COINAGE: total & 0xFFFFFFFF})
         await self.send_packet(
             Opcodes.SMSG_LOOT_MONEY_NOTIFY,
             struct.pack("<IB", money & 0xFFFFFFFF, 1),
         )
-        self._persist_loot(combat)
+        await self._persist_loot(combat)
         await self._finish_loot_if_empty(combat)
 
     async def _finish_loot_if_empty(self, combat) -> bool:
