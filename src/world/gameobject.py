@@ -23,9 +23,11 @@ cost independent of disk speed.
 from __future__ import annotations
 
 import math
+import random
 import sqlite3
 import struct
 import threading
+import time
 import zlib
 from typing import Dict, Iterable, List, Mapping, Optional, Tuple
 
@@ -73,7 +75,11 @@ GAMEOBJECT_TYPE_QUESTGIVER = 2
 GAMEOBJECT_TYPE_CHEST = 3
 GAMEOBJECT_TYPE_GENERIC = 5
 GAMEOBJECT_TYPE_TRAP = 6
+GAMEOBJECT_TYPE_CHAIR = 7
+GAMEOBJECT_TYPE_TEXT = 9
 GAMEOBJECT_TYPE_GOOBER = 10
+GAMEOBJECT_TYPE_CAMERA = 13
+GAMEOBJECT_TYPE_MAILBOX = 19
 GAMEOBJECT_TYPE_TRANSPORT = 11
 GAMEOBJECT_TYPE_MO_TRANSPORT = 15
 GAMEOBJECT_TYPE_DUEL_ARBITER = 16
@@ -92,6 +98,17 @@ GO_STATE_ACTIVE_ALTERNATIVE = 2
 
 # CMaNGOS ``GO_ANIMPROGRESS_DEFAULT``: used when a spawn has no addon row.
 GO_ANIMPROGRESS_DEFAULT = 0xFF
+
+# ``GAMEOBJECT_DYNAMIC`` low word.  A quest chest/goober is only clickable for
+# a player who needs it (ACTIVATE) and glitters for them (SPARKLE).
+GO_DYNFLAG_LO_ACTIVATE = 0x01
+GO_DYNFLAG_LO_SPARKLE = 0x08
+
+# Distance at which an object can be used (TrinityCore INTERACTION_DISTANCE is
+# 5 yards; the client's position lags a little behind the click).
+GAMEOBJECT_USE_DISTANCE = 8.0
+# Floor for respawn delays: a 0 in the dump still needs a timer.
+MIN_RESPAWN_DELAY = 5
 
 TYPEID_GAMEOBJECT = 5
 UPDATETYPE_CREATE_OBJECT = 2
@@ -158,6 +175,46 @@ CREATE TABLE IF NOT EXISTS gameobject_spawns(
   state INTEGER NOT NULL DEFAULT -1
 );
 CREATE INDEX IF NOT EXISTS idx_gameobject_spawns_map ON gameobject_spawns(map);
+
+-- Same layout as ``creature_loot_template``: chest, herb and ore loot.
+CREATE TABLE IF NOT EXISTS gameobject_loot_template(
+  entry INTEGER NOT NULL,
+  item INTEGER NOT NULL DEFAULT 0,
+  chance_or_quest_chance REAL NOT NULL DEFAULT 0.0,
+  group_id INTEGER NOT NULL DEFAULT 0,
+  mincount_or_ref INTEGER NOT NULL DEFAULT 1,
+  maxcount INTEGER NOT NULL DEFAULT 1,
+  condition_id INTEGER NOT NULL DEFAULT 0,
+  comments TEXT NOT NULL DEFAULT '',
+  PRIMARY KEY(entry, item, group_id)
+);
+
+-- CMaNGOS pools: of the spawns in a pool only ``max_limit`` exist at a time
+-- (rare chests, herbs and ore that share spawn points).  Pools can nest:
+-- ``pool_pools`` makes a pool a member of a mother pool.
+CREATE TABLE IF NOT EXISTS gameobject_pool_members(
+  guid INTEGER PRIMARY KEY,
+  pool INTEGER NOT NULL,
+  chance REAL NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS pool_templates(
+  entry INTEGER PRIMARY KEY,
+  max_limit INTEGER NOT NULL DEFAULT 0,
+  description TEXT NOT NULL DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS pool_pools(
+  pool_id INTEGER PRIMARY KEY,
+  mother_pool INTEGER NOT NULL,
+  chance REAL NOT NULL DEFAULT 0
+);
+
+-- Book and plaque pages (also readable items): one row per page, chained
+-- through ``next_page``.
+CREATE TABLE IF NOT EXISTS page_text(
+  entry INTEGER PRIMARY KEY,
+  text TEXT NOT NULL DEFAULT '',
+  next_page INTEGER NOT NULL DEFAULT 0
+);
 
 -- CMaNGOS ``game_event_gameobject``: a positive event spawns the object only
 -- while that world event (Winter Veil, Hallow's End...) runs, a negative one
@@ -234,6 +291,7 @@ def clear_cache() -> None:
     with _LOCK:
         _GRIDS.clear()
         _TEMPLATES.clear()
+        _QUEST_LOOT.clear()
 
 
 def _connect(path: str) -> sqlite3.Connection:
@@ -268,8 +326,9 @@ def load_map(path: str, map_id: int) -> _MapGrid:
     Each spawn dict carries the template fields the create block needs, and
     the templates are cached for ``CMSG_GAMEOBJECT_QUERY`` at the same time.
     Spawns outside the default phase (``phase_mask & 1``), without a model,
-    of an unsupported type, or that belong to a world event are dropped here
-    once instead of on every scan.
+    of an unsupported type, that belong to a world event, or with a negative
+    respawn time (CMaNGOS: "only spawned by a script") are dropped here once
+    instead of on every scan.
     """
     key = (path, int(map_id))
     with _LOCK:
@@ -280,11 +339,10 @@ def load_map(path: str, map_id: int) -> _MapGrid:
     try:
         try:
             rows = con.execute(
-                "SELECT s.*, t.type, t.display_id, t.flags, t.faction, t.size,"
-                " t.data0 FROM gameobject_spawns s"
+                "SELECT t.*, s.* FROM gameobject_spawns s"
                 " JOIN gameobject_templates t ON t.entry = s.entry"
                 " WHERE s.map = ? AND (s.phase_mask & 1) <> 0"
-                " AND t.display_id <> 0"
+                " AND t.display_id <> 0 AND s.spawn_time_min >= 0"
                 " AND NOT EXISTS (SELECT 1 FROM gameobject_events e"
                 " WHERE e.guid = s.guid AND e.event > 0)",
                 (int(map_id),),
@@ -391,8 +449,13 @@ def _pack_guid(guid: int) -> bytes:
     return bytes([mask]) + bytes(out)
 
 
-def build_gameobject_values(spawn: Mapping) -> Dict[int, int]:
-    """``{field_index: uint32}`` for a spawn joined with its template."""
+def build_gameobject_values(spawn: Mapping, state: Optional[int] = None,
+                            dynamic: int = 0) -> Dict[int, int]:
+    """``{field_index: uint32}`` for a spawn joined with its template.
+
+    ``state`` overrides the spawn's start state (an opened door); ``dynamic``
+    is the per-player ``GAMEOBJECT_DYNAMIC`` value (quest sparkle).
+    """
     entry = int(spawn["entry"])
     guid = gameobject_guid(int(spawn["guid"]), entry)
     values: Dict[int, int] = {
@@ -405,9 +468,10 @@ def build_gameobject_values(spawn: Mapping) -> Dict[int, int]:
         F.GAMEOBJECT_FLAGS: int(spawn["flags"]) & 0xFFFFFFFF,
         # Parent rotation is the identity unless the object rides a transport.
         F.GAMEOBJECT_PARENTROTATION + 3: _float_bits(1.0),
+        F.GAMEOBJECT_DYNAMIC: int(dynamic) & 0xFFFFFFFF,
         F.GAMEOBJECT_FACTION: int(spawn["faction"]),
         F.GAMEOBJECT_BYTES_1: (
-            (initial_state(spawn) & 0xFF)
+            ((initial_state(spawn) if state is None else int(state)) & 0xFF)
             | ((int(spawn["type"]) & 0xFF) << 8)
             | ((int(spawn["anim_progress"]) & 0xFF) << 24)
         ),
@@ -425,11 +489,12 @@ def _update_type(spawn: Mapping) -> int:
     return UPDATETYPE_CREATE_OBJECT
 
 
-def build_gameobject_create_block(spawn: Mapping) -> bytes:
+def build_gameobject_create_block(spawn: Mapping, state: Optional[int] = None,
+                                  dynamic: int = 0) -> bytes:
     """One create block: stationary position, low guid and packed rotation."""
     low_guid = int(spawn["guid"])
     guid = gameobject_guid(low_guid, int(spawn["entry"]))
-    values = build_gameobject_values(spawn)
+    values = build_gameobject_values(spawn, state, dynamic)
 
     mask_blocks = (F.GAMEOBJECT_END + 31) // 32
     mask = bytearray(mask_blocks * 4)
@@ -452,9 +517,21 @@ def build_gameobject_create_block(spawn: Mapping) -> bytes:
     return bytes(block)
 
 
-def build_gameobject_update(spawns: Iterable[Mapping]) -> Optional[Tuple[int, bytes]]:
-    """``(opcode, payload)`` creating ``spawns``, or ``None`` if empty."""
-    blocks = [build_gameobject_create_block(spawn) for spawn in spawns]
+def build_gameobject_update(spawns: Iterable[Mapping], state_of=None,
+                            dynamic_of=None) -> Optional[Tuple[int, bytes]]:
+    """``(opcode, payload)`` creating ``spawns``, or ``None`` if empty.
+
+    ``state_of`` / ``dynamic_of`` map a spawn to its current state and
+    per-player dynamic flags.
+    """
+    blocks = [
+        build_gameobject_create_block(
+            spawn,
+            state_of(spawn) if state_of else None,
+            dynamic_of(spawn) if dynamic_of else 0,
+        )
+        for spawn in spawns
+    ]
     if not blocks:
         return None
     body = struct.pack("<I", len(blocks)) + b"".join(blocks)
@@ -490,3 +567,373 @@ def build_gameobject_query_response(entry: int, template: Optional[Mapping]) -> 
     for i in range(1, MAX_GAMEOBJECT_QUEST_ITEMS + 1):
         out += struct.pack("<I", int(template[f"quest_item{i}"] or 0))
     return bytes(out)
+
+
+# ---------------------------------------------------------------------------
+# Type-specific template data (CMaNGOS ``GameObjectInfo`` unions)
+# ---------------------------------------------------------------------------
+def _data(template: Mapping, index: int) -> int:
+    return int(template[f"data{index}"] or 0)
+
+
+def lock_id(template: Mapping) -> int:
+    """``Lock.dbc`` id; a locked object is opened by a spell, not by a click."""
+    go_type = int(template["type"])
+    if go_type in (GAMEOBJECT_TYPE_DOOR, GAMEOBJECT_TYPE_BUTTON):
+        return _data(template, 1)
+    if go_type in (GAMEOBJECT_TYPE_CHEST, GAMEOBJECT_TYPE_GOOBER,
+                   GAMEOBJECT_TYPE_QUESTGIVER):
+        return _data(template, 0)
+    return 0
+
+
+def loot_id(template: Mapping) -> int:
+    """``gameobject_loot_template.entry`` of a chest (``chest.lootId``)."""
+    if int(template["type"]) == GAMEOBJECT_TYPE_CHEST:
+        return _data(template, 1)
+    return 0
+
+
+def chest_quest_id(template: Mapping) -> int:
+    """``chest.questId``: the chest only opens while that quest is active."""
+    if int(template["type"]) == GAMEOBJECT_TYPE_CHEST:
+        return _data(template, 8)
+    return 0
+
+
+def is_consumable(template: Mapping) -> bool:
+    """``chest.consumable``: the object despawns once it has been looted."""
+    return int(template["type"]) == GAMEOBJECT_TYPE_CHEST and bool(_data(template, 3))
+
+
+def restock_seconds(template: Mapping) -> int:
+    """``chest.chestRestockTime``: a reusable chest refills after this long."""
+    if int(template["type"]) == GAMEOBJECT_TYPE_CHEST:
+        return _data(template, 2)
+    return 0
+
+
+def auto_close_seconds(template: Mapping) -> float:
+    """``door.autoCloseTime`` / ``button.autoCloseTime`` (milliseconds)."""
+    if int(template["type"]) in (GAMEOBJECT_TYPE_DOOR, GAMEOBJECT_TYPE_BUTTON):
+        return _data(template, 2) / 1000.0
+    return 0.0
+
+
+# ``UNIT_STAND_STATE_SIT_LOW_CHAIR``; medium and high chairs follow (+1, +2).
+UNIT_STAND_STATE_SIT_LOW_CHAIR = 4
+
+
+def chair_stand_state(template: Mapping) -> int:
+    """Stand state for ``chair.height`` (0 low, 1 medium, 2 high)."""
+    return UNIT_STAND_STATE_SIT_LOW_CHAIR + max(0, min(2, _data(template, 1)))
+
+
+def chair_seat(spawn: Mapping, x: float, y: float) -> Tuple[float, float]:
+    """The free seat of a bench closest to ``(x, y)`` (``GameObject::Use`` CHAIR).
+
+    The ``chair.slots`` seats sit on a line through the object's centre,
+    perpendicular to its facing, ``size`` yards apart.
+    """
+    slots = max(1, _data(spawn, 0))
+    size = float(spawn["size"] or 1.0)
+    across = float(spawn["o"] or 0.0) + math.pi / 2.0
+    best = None
+    for slot in range(slots):
+        offset = size * slot - size * (slots - 1) / 2.0
+        sx = float(spawn["x"]) + offset * math.cos(across)
+        sy = float(spawn["y"]) + offset * math.sin(across)
+        dist = (sx - x) ** 2 + (sy - y) ** 2
+        if best is None or dist < best[0]:
+            best = (dist, sx, sy)
+    return best[1], best[2]
+
+
+def text_page(template: Mapping) -> int:
+    """First ``page_text`` entry of a book/plaque (``text.pageID``)."""
+    return _data(template, 0) if int(template["type"]) == GAMEOBJECT_TYPE_TEXT else 0
+
+
+def camera_cinematic(template: Mapping) -> int:
+    """``camera.cinematicId`` of a camera object (``CinematicSequences.dbc``)."""
+    return _data(template, 1) if int(template["type"]) == GAMEOBJECT_TYPE_CAMERA else 0
+
+
+MAX_PAGE_CHAIN = 64
+PAGE_MISSING_TEXT = "Item page missing."
+
+
+def build_page_text_responses(path: str, page_id: int) -> List[bytes]:
+    """One ``SMSG_PAGE_TEXT_QUERY_RESPONSE`` per page of the chain.
+
+    ``WorldSession::HandlePageTextQueryOpcode``: ``uint32 pageID, string
+    text, uint32 nextPage``; a missing page ends the chain with a fixed text.
+    """
+    out = []
+    con = sqlite3.connect(path)
+    try:
+        seen = set()
+        while page_id and page_id not in seen and len(out) < MAX_PAGE_CHAIN:
+            seen.add(page_id)
+            try:
+                row = con.execute("SELECT text, next_page FROM page_text WHERE entry = ?",
+                                  (int(page_id),)).fetchone()
+            except sqlite3.OperationalError:
+                row = None
+            text, next_page = (row[0], int(row[1] or 0)) if row else (PAGE_MISSING_TEXT, 0)
+            out.append(struct.pack("<I", int(page_id)) + _cstring(text)
+                       + struct.pack("<I", next_page))
+            page_id = next_page
+    finally:
+        con.close()
+    return out
+
+
+def respawn_delay(spawn: Mapping) -> int:
+    """Seconds until a despawned object returns (``spawntimesecsmin/max``)."""
+    low = max(0, int(spawn["spawn_time_min"] or 0))
+    high = max(low, int(spawn["spawn_time_max"] or 0))
+    return max(MIN_RESPAWN_DELAY, random.randint(low, high) if high > low else low)
+
+
+_QUEST_LOOT: Dict[Tuple[str, int], frozenset] = {}
+
+
+def quest_loot_items(path: str, loot: int) -> frozenset:
+    """Items a loot entry only drops for players on a quest (negative chance).
+
+    References (negative ``mincount_or_ref``) are followed, like
+    ``LootTemplate::HasQuestDropForPlayer``.
+    """
+    key = (path, int(loot))
+    with _LOCK:
+        if key in _QUEST_LOOT:
+            return _QUEST_LOOT[key]
+    items = set()
+    con = sqlite3.connect(path)
+    try:
+        pending = [("gameobject_loot_template", int(loot))]
+        seen = set()
+        while pending and len(seen) < 64:
+            table, entry = pending.pop()
+            if (table, entry) in seen:
+                continue
+            seen.add((table, entry))
+            try:
+                rows = con.execute(
+                    f"SELECT item, chance_or_quest_chance, mincount_or_ref FROM {table}"
+                    " WHERE entry = ?", (entry,)).fetchall()
+            except sqlite3.OperationalError:
+                rows = []
+            for item, chance, mincount_or_ref in rows:
+                if int(mincount_or_ref or 0) < 0:
+                    pending.append(("reference_loot_template", -int(mincount_or_ref)))
+                elif float(chance or 0.0) < 0.0:
+                    items.add(int(item))
+    finally:
+        con.close()
+    result = frozenset(items)
+    with _LOCK:
+        _QUEST_LOOT[key] = result
+    return result
+
+
+def is_quest_object(template: Mapping, path: str) -> bool:
+    """True for objects whose use depends on the player's quests."""
+    if int(template["type"]) != GAMEOBJECT_TYPE_CHEST:
+        return False
+    return bool(chest_quest_id(template) or quest_loot_items(path, loot_id(template)))
+
+
+# ---------------------------------------------------------------------------
+# Pools
+# ---------------------------------------------------------------------------
+def _roll_member(candidates: List[Tuple[int, float]]) -> Optional[int]:
+    """One member, CMaNGOS ``PoolGroup::RollOne``: explicit chances first,
+    then an equal-chance pick among the members without one."""
+    if not candidates:
+        return None
+    explicit = [(m, c) for m, c in candidates if c > 0]
+    if explicit:
+        roll = random.random() * 100.0
+        for member, chance in explicit:
+            roll -= chance
+            if roll < 0:
+                return member
+    equal = [m for m, c in candidates if c <= 0]
+    return random.choice(equal or [m for m, _ in candidates])
+
+
+class GameObjectPools:
+    """Which pooled spawns currently exist (CMaNGOS ``PoolManager``)."""
+
+    def __init__(self, members=(), limits=None, children=()):
+        self.member_pool: Dict[int, int] = {}
+        self.members: Dict[int, List[Tuple[int, float]]] = {}
+        for guid, pool, chance in members:
+            self.member_pool[int(guid)] = int(pool)
+            self.members.setdefault(int(pool), []).append((int(guid), float(chance or 0)))
+        self.limits: Dict[int, int] = {int(k): int(v) for k, v in (limits or {}).items()}
+        self.children: Dict[int, List[Tuple[int, float]]] = {}
+        self.parent: Dict[int, int] = {}
+        for child, mother, chance in children:
+            self.children.setdefault(int(mother), []).append((int(child), float(chance or 0)))
+            self.parent[int(child)] = int(mother)
+        self.active: set = set()
+        self.pending: List[Tuple[float, int]] = []      # (when, pool) re-rolls
+        for pool in sorted(set(self.members) | set(self.children)):
+            if pool not in self.parent:
+                self._spawn_pool(pool, self.limits.get(pool, 0))
+
+    @classmethod
+    def load(cls, path: str) -> "GameObjectPools":
+        con = sqlite3.connect(path)
+        try:
+            try:
+                members = con.execute(
+                    "SELECT guid, pool, chance FROM gameobject_pool_members").fetchall()
+                limits = dict(con.execute("SELECT entry, max_limit FROM pool_templates"))
+                children = con.execute(
+                    "SELECT pool_id, mother_pool, chance FROM pool_pools").fetchall()
+            except sqlite3.OperationalError:
+                members, limits, children = [], {}, []
+        finally:
+            con.close()
+        # Only keep the pool tree above pools that hold game objects.
+        used = {pool for _guid, pool, _chance in members}
+        while True:
+            grown = used | {mother for child, mother, _c in children if child in used}
+            if grown == used:
+                break
+            used = grown
+        children = [row for row in children if row[0] in used]
+        return cls(members, limits, children)
+
+    def _spawn_pool(self, pool: int, count: int) -> None:
+        """Activate ``count`` members (0 = all) of ``pool`` or of its child pools."""
+        if pool in self.children:
+            options = list(self.children[pool])
+            picks = len(options) if count <= 0 else min(count, len(options))
+            for _ in range(picks):
+                child = _roll_member(options)
+                options = [o for o in options if o[0] != child]
+                self._spawn_pool(child, self.limits.get(child, 0))
+            return
+        options = [m for m in self.members.get(pool, []) if m[0] not in self.active]
+        picks = len(options) if count <= 0 else min(count, len(options))
+        for _ in range(picks):
+            guid = _roll_member(options)
+            options = [o for o in options if o[0] != guid]
+            self.active.add(guid)
+
+    def is_hidden(self, guid: int) -> bool:
+        return int(guid) in self.member_pool and int(guid) not in self.active
+
+    def on_despawn(self, guid: int, respawn_at: float) -> None:
+        """A pooled object was used up; its pool picks a member again later."""
+        guid = int(guid)
+        if guid not in self.member_pool:
+            return
+        self.active.discard(guid)
+        self.pending.append((respawn_at, self.member_pool[guid]))
+
+    def due(self, now: float) -> List[int]:
+        """Re-roll pools whose respawn time came; returns the new members."""
+        ready = [p for p in self.pending if p[0] <= now]
+        if not ready:
+            return []
+        self.pending = [p for p in self.pending if p[0] > now]
+        spawned = []
+        for _when, pool in ready:
+            options = [m for m in self.members.get(pool, []) if m[0] not in self.active]
+            guid = _roll_member(options)
+            if guid is not None:
+                self.active.add(guid)
+                spawned.append(guid)
+        return spawned
+
+
+# ---------------------------------------------------------------------------
+# Runtime state shared by every session
+# ---------------------------------------------------------------------------
+class GameObjectRuntime:
+    """What changed since the spawns were loaded: despawns, states, loot.
+
+    One instance lives on the world server; all times are ``time.monotonic``.
+    """
+
+    def __init__(self) -> None:
+        self.despawned: Dict[int, float] = {}        # guid -> respawn time
+        self.states: Dict[int, Tuple[int, float]] = {}  # guid -> (state, reset at; 0 = never)
+        self.loot: Dict[int, dict] = {}             # guid -> {"items": [...], "money": int}
+        self.restock: Dict[int, float] = {}         # guid -> loot regenerates at
+        self.looter: Dict[int, int] = {}            # guid -> player guid
+        self.pools: Optional[GameObjectPools] = None  # loaded on first use
+
+    # -- spawn ---------------------------------------------------------
+    def is_spawned(self, guid: int, now: Optional[float] = None) -> bool:
+        if self.pools is not None and self.pools.is_hidden(guid):
+            return False
+        respawn_at = self.despawned.get(int(guid))
+        if respawn_at is None:
+            return True
+        if (time.monotonic() if now is None else now) >= respawn_at:
+            del self.despawned[int(guid)]
+            return True
+        return False
+
+    def despawn(self, guid: int, delay: float, now: Optional[float] = None) -> None:
+        guid = int(guid)
+        respawn_at = (time.monotonic() if now is None else now) + float(delay)
+        self.despawned[guid] = respawn_at
+        if self.pools is not None:
+            self.pools.on_despawn(guid, respawn_at)
+        self.states.pop(guid, None)
+        self.loot.pop(guid, None)
+        self.restock.pop(guid, None)
+        self.looter.pop(guid, None)
+
+    # -- state ---------------------------------------------------------
+    def state(self, guid: int) -> Optional[int]:
+        entry = self.states.get(int(guid))
+        return entry[0] if entry is not None else None
+
+    def set_state(self, guid: int, state: int, reset_after: float = 0.0,
+                  now: Optional[float] = None) -> None:
+        now = time.monotonic() if now is None else now
+        self.states[int(guid)] = (int(state), now + reset_after if reset_after > 0 else 0.0)
+
+    def expired_states(self, now: Optional[float] = None) -> list:
+        """Guids whose temporary state (an opened door) has run out."""
+        now = time.monotonic() if now is None else now
+        expired = [guid for guid, (_state, reset_at) in self.states.items()
+                   if reset_at and now >= reset_at]
+        for guid in expired:
+            del self.states[guid]
+        return expired
+
+    # -- loot ----------------------------------------------------------
+    def stored_loot(self, guid: int, now: Optional[float] = None) -> Optional[dict]:
+        guid = int(guid)
+        restock_at = self.restock.get(guid)
+        if restock_at is not None and (time.monotonic() if now is None else now) >= restock_at:
+            del self.restock[guid]
+            self.loot.pop(guid, None)
+        return self.loot.get(guid)
+
+    def respawn_pools(self, now: Optional[float] = None) -> List[int]:
+        """Activate the pool members whose turn came; they are spawned now."""
+        if self.pools is None:
+            return []
+        spawned = self.pools.due(time.monotonic() if now is None else now)
+        for guid in spawned:
+            self.despawned.pop(guid, None)
+        return spawned
+
+    def clear(self) -> None:
+        self.pools = None
+        self.despawned.clear()
+        self.states.clear()
+        self.loot.clear()
+        self.restock.clear()
+        self.looter.clear()

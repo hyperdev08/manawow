@@ -172,6 +172,7 @@ A real 3.3.5a client can now log in, pick a character and **enter the world**:
 - Corpse money uses the real `creature_template.MinLootGold` / `MaxLootGold` values imported from CMaNGOS (no synthetic level-based coins)
 - `CMSG_LOOT`, `CMSG_AUTOSTORE_LOOT_ITEM`, `CMSG_LOOT_MONEY`, `CMSG_LOOT_RELEASE`
 - Quest items (negative `ChanceOrQuestChance`) only drop for a player with an active, unfinished quest that needs them
+- Drop chances are stored as floats (`0.5`, `6.4011`...); refresh the loot tables of an older `world.db` with `python tools/import_wotlk_db.py --dump WoTLKDB.sql --loot-only`
 
 ### Quests
 - `quest_templates` (9,086 quests), `creature_quest_starters` / `creature_quest_enders` (from `creature_questrelation` / `creature_involvedrelation`) and `areatrigger_quests` (from `areatrigger_involvedrelation`) imported from CMaNGOS; an existing `world.db` gets them with `python tools/import_wotlk_db.py --dump WoTLKDB.sql --quests-only`
@@ -203,7 +204,13 @@ A real 3.3.5a client can now log in, pick a character and **enter the world**:
 - `0xF110` object guids with the entry in bits 24-47; create blocks with stationary position, low guid and the packed int64 world rotation (TrinityCore `GameObject::UpdatePackedRotation`); doors and buttons with `startOpen` start open
 - `CMSG_GAMEOBJECT_QUERY` -> `SMSG_GAMEOBJECT_QUERY_RESPONSE` (name, icon, cast-bar caption, the 24 data fields, size, quest items)
 - Objects within 150 yards come with the login burst and are created/destroyed as the player moves; each map's spawns are read once, off the event loop, into an in-memory 64-yard grid, so visibility scans never query SQLite
-- Not shown yet: transports (elevators, boats); using objects (doors, chests, herbs, quest objects) is not implemented yet (#12)
+- `CMSG_GAMEOBJ_USE`: doors and buttons open/close for every player (with their auto-close timer); chests open their loot; chairs and benches seat the player on the nearest slot (same-map teleport + sit stand state); books and plaques open their pages (`SMSG_GAMEOBJECT_PAGETEXT` + `CMSG_PAGE_TEXT_QUERY`, 1,879 `page_text` rows); cameras start their cinematic; mailboxes open empty (no mail system yet)
+- Locked objects are opened by the client's spell (Opening, Herb Gathering, Mining...): `SPELL_EFFECT_OPEN_LOCK` on a game object target; the client checks the lock's skill against its own `Lock.dbc`
+- Object loot comes from `gameobject_loot_template` (15,862 rows) plus the template's min/max gold; consumable chests, herbs and ore despawn when emptied and respawn after `spawntimesecs`, reusable chests refill after their restock time
+- Quest chests are clickable and sparkle (`GAMEOBJECT_DYNAMIC`) only for players who need them
+- CMaNGOS pools (`pool_gameobject`, `pool_gameobject_template`, `pool_template`, `pool_pool`): only `max_limit` members of a pool exist at a time, and a used one is replaced by a new roll after its respawn time (29,763 pooled spawns)
+- Not shown: transports (elevators, boats) and spawns with a negative respawn time (script-only)
+- Not usable yet: quest givers, goobers (quest objects), traps, spell casters, meeting stones, fishing (#12 phase 3+)
 - Upgrade an existing `world.db` with `python tools/import_wotlk_db.py --dump WoTLKDB.sql --gameobjects-only`
 
 ### World events

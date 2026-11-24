@@ -77,6 +77,8 @@ class SocketBase:
         # (map, x, y, z) of the last visibility scan.
         self._visible_gameobjects: dict[int, int] = {}
         self._gameobject_scan_pos: tuple[int, float, float, float] | None = None
+        self._gameobject_spawn_cache: dict[int, dict] = {}
+        self._gameobject_dynamic: dict[int, int] = {}
         # Spawn rows for the visible creatures, kept so the idle-movement tick
         # does not hit SQLite for every creature every 250 ms.
         self._creature_spawn_cache: dict[int, object] = {}
@@ -246,6 +248,18 @@ class SocketBase:
                 await self.handle_creature_query(data)
             elif opcode == Opcodes.CMSG_GAMEOBJECT_QUERY:
                 await self.handle_gameobject_query(data)
+            elif opcode == Opcodes.CMSG_GAMEOBJ_USE:
+                await self.handle_gameobject_use(data)
+            elif opcode == Opcodes.CMSG_GAMEOBJ_REPORT_USE:
+                pass                      # achievement criteria only
+            elif opcode == Opcodes.CMSG_PAGE_TEXT_QUERY:
+                await self.handle_page_text_query(data)
+            elif opcode == Opcodes.CMSG_GET_MAIL_LIST:
+                await self.handle_get_mail_list(data)
+            elif opcode == Opcodes.MSG_QUERY_NEXT_MAIL_TIME:
+                await self.handle_query_next_mail_time(data)
+            elif opcode == Opcodes.MSG_MOVE_TELEPORT_ACK:
+                await self.handle_teleport_ack(data)
             elif opcode == Opcodes.CMSG_GOSSIP_HELLO:
                 await self.handle_gossip_hello(data)
             elif opcode == Opcodes.CMSG_GOSSIP_SELECT_OPTION:
