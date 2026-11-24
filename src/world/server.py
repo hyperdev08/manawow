@@ -31,6 +31,8 @@ class WorldServer:
         self.groups = GroupManager(self)
         # Runtime state of game objects (opened doors, looted chests).
         self.gameobjects = gameobject.GameObjectRuntime()
+        # Which pooled creatures exist (rare spawns); loaded on first use.
+        self.creature_pools = None
         self.packet_log = get_packet_log()
         self.packet_log.Initialize(config.logging.log_dir)
         # WAL + synchronous=NORMAL: rollback-journal commits blocked the event

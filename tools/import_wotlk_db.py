@@ -13,6 +13,7 @@ Usage::
     python tools/import_wotlk_db.py --dump WoTLKDB.sql --gameobjects-only
     python tools/import_wotlk_db.py --dump WoTLKDB.sql --events-only
     python tools/import_wotlk_db.py --dump WoTLKDB.sql --loot-only
+    python tools/import_wotlk_db.py --dump WoTLKDB.sql --pools-only
 
 ``--quests-only`` refreshes just the quest tables (``quest_template`` and the
 creature/area-trigger quest relations) of an existing database.
@@ -880,6 +881,8 @@ def import_world(dump_path: str, db_path: str, clear: bool = True,
     _, raw_npc_vendor_template = wotlk_dump.rows(text, "npc_vendor_template")
     gameobject_tables = read_gameobject_tables(text)
     _, raw_game_event_creature = wotlk_dump.rows(text, "game_event_creature")
+    creature_pool_tables = {t: wotlk_dump.rows(text, t)[1] for t in (
+        "pool_creature", "pool_creature_template", *SPAWN_GROUP_TABLES)}
     del text
 
     rune_cost_rows = read_rune_cost_dbc(rune_cost_dbc) if rune_cost_dbc else []
@@ -1202,6 +1205,9 @@ def import_world(dump_path: str, db_path: str, clear: bool = True,
             con, build_gameobject_pool_rows(gameobject_tables, go_spawns))
         counts["page_text"] = insert_page_text_rows(
             con, gameobject_tables.get("page_text"))
+        # After the game object pools, which rewrite pool_templates.
+        counts["creature_pool_members"] = insert_creature_pool_rows(
+            con, *build_creature_pool_rows(creature_pool_tables, spawn_rows))
 
         con.commit()
         con.execute("PRAGMA optimize")
@@ -1260,11 +1266,12 @@ def import_world(dump_path: str, db_path: str, clear: bool = True,
     return stats
 
 
+SPAWN_GROUP_TABLES = ("spawn_group", "spawn_group_spawn")
 GAMEOBJECT_DUMP_TABLES = ("gameobject_template", "gameobject", "gameobject_addon",
                           "gameobject_spawn_entry", "game_event_gameobject",
                           "gameobject_loot_template", "pool_gameobject",
                           "pool_gameobject_template", "pool_template", "pool_pool",
-                          "page_text")
+                          "page_text", *SPAWN_GROUP_TABLES)
 
 # CMaNGOS gameobject_template column -> server column.
 _GO_TEMPLATE_DUMP = {
@@ -1341,37 +1348,138 @@ def import_events(dump_path: str, db_path: str) -> dict[str, int]:
     return counts
 
 
-def build_gameobject_pool_rows(tables: dict, spawn_rows) -> dict[str, list[tuple]]:
-    """Pool membership for the kept spawns, plus the pool tree.
+# CMaNGOS ``spawn_group`` (the newer grouping): ``MaxCount`` spawns of a group
+# exist at a time, like a pool.  They become pools with ids above this base so
+# they never collide with ``pool_template`` entries.
+SPAWN_GROUP_POOL_BASE = 10_000_000
+SPAWN_GROUP_CREATURE = 0
+SPAWN_GROUP_GAMEOBJECT = 1
 
-    ``pool_gameobject`` names spawns directly; ``pool_gameobject_template``
-    puts every spawn of a template into a pool (a direct row wins).
+
+def build_spawn_group_pools(tables: dict, kind: int, spawn_rows) -> tuple[list, list]:
+    """``(members, pool_templates)`` for the ``spawn_group`` rows of one kind.
+
+    Only groups with a ``MaxCount`` limit and no ``WorldState`` condition are
+    converted: groups gated by a world state (day/night RP, battleground
+    holidays) need a world-state system and keep spawning as before.
+    """
+    kept = {row[0] for row in spawn_rows}
+    groups = {}
+    for r in tables.get("spawn_group") or []:
+        if (_sqlite_int(r.get("Type")) == kind and _sqlite_int(r.get("MaxCount")) > 0
+                and not _sqlite_int(r.get("WorldState"))):
+            groups[_sqlite_int(r.get("Id"))] = r
+    members = []
+    used = set()
+    for r in tables.get("spawn_group_spawn") or []:
+        group, guid = _sqlite_int(r.get("Id")), _sqlite_int(r.get("Guid"))
+        if group in groups and guid in kept:
+            members.append((guid, SPAWN_GROUP_POOL_BASE + group, _sqlite_float(r.get("Chance"))))
+            used.add(group)
+    templates = [(SPAWN_GROUP_POOL_BASE + g, _sqlite_int(groups[g].get("MaxCount")),
+                  _text_or_empty(groups[g].get("Name"))) for g in sorted(used)]
+    return sorted(members), templates
+
+
+def merge_pool_members(primary, extra) -> list[tuple]:
+    """``pool_*`` membership wins over a ``spawn_group`` for the same guid."""
+    taken = {row[0] for row in primary}
+    return sorted(list(primary) + [row for row in extra if row[0] not in taken])
+
+
+def build_pool_members(direct_rows, template_rows, spawn_rows) -> list[tuple]:
+    """``(guid, pool, chance)`` for the kept spawns.
+
+    ``pool_<kind>`` names spawns directly; ``pool_<kind>_template`` puts every
+    spawn of a template into a pool (a direct row wins).
     """
     entry_of = {row[0]: row[1] for row in spawn_rows}
     members: dict[int, tuple] = {}
     by_template: dict[int, tuple[int, float]] = {}
-    for r in tables.get("pool_gameobject_template") or []:
+    for r in template_rows or []:
         by_template[_sqlite_int(r.get("id"))] = (
             _sqlite_int(r.get("pool_entry")), _sqlite_float(r.get("chance")))
     for guid, entry in entry_of.items():
         if entry in by_template:
             pool, chance = by_template[entry]
             members[guid] = (guid, pool, chance)
-    for r in tables.get("pool_gameobject") or []:
+    for r in direct_rows or []:
         guid = _sqlite_int(r.get("guid"))
         if guid in entry_of:
             members[guid] = (guid, _sqlite_int(r.get("pool_entry")),
                              _sqlite_float(r.get("chance")))
+    return sorted(members.values())
+
+
+def build_gameobject_pool_rows(tables: dict, spawn_rows) -> dict[str, list[tuple]]:
+    """Game object pool membership for the kept spawns, plus the pool tree."""
+    members = build_pool_members(tables.get("pool_gameobject"),
+                                 tables.get("pool_gameobject_template"), spawn_rows)
+    group_members, group_templates = build_spawn_group_pools(
+        tables, SPAWN_GROUP_GAMEOBJECT, spawn_rows)
+    members = merge_pool_members(members, group_members)
     templates = sorted({
         (_sqlite_int(r.get("entry")), _sqlite_int(r.get("max_limit")),
          _text_or_empty(r.get("description")))
-        for r in tables.get("pool_template") or []})
+        for r in tables.get("pool_template") or []} | set(group_templates))
     pools = sorted({
         (_sqlite_int(r.get("pool_id")), _sqlite_int(r.get("mother_pool")),
          _sqlite_float(r.get("chance")))
         for r in tables.get("pool_pool") or []})
-    return {"gameobject_pool_members": sorted(members.values()),
+    return {"gameobject_pool_members": members,
             "pool_templates": templates, "pool_pools": pools}
+
+
+def build_creature_pool_rows(tables: dict, spawn_rows) -> tuple[list, list]:
+    """``(members, pool_templates)`` for creatures: pools plus spawn groups."""
+    members = build_pool_members(tables.get("pool_creature"),
+                                 tables.get("pool_creature_template"), spawn_rows)
+    group_members, group_templates = build_spawn_group_pools(
+        tables, SPAWN_GROUP_CREATURE, spawn_rows)
+    return merge_pool_members(members, group_members), group_templates
+
+
+def insert_creature_pool_rows(con, rows, templates=()) -> int:
+    from src.world import gameobject
+
+    con.executescript(gameobject.CREATE_GAMEOBJECT_SQL)
+    con.execute("DELETE FROM creature_pool_members")
+    con.executemany("INSERT OR REPLACE INTO creature_pool_members(guid, pool, chance) "
+                    "VALUES(?, ?, ?)", rows)
+    con.executemany("INSERT OR REPLACE INTO pool_templates(entry, max_limit, description) "
+                    "VALUES(?, ?, ?)", templates)
+    return len(rows)
+
+
+def import_pools(dump_path: str, db_path: str) -> dict[str, int]:
+    """``--pools-only``: refresh creature and game object pools from the dump."""
+    import sqlite3
+
+    from src.world import gameobject
+
+    started = time.time()
+    text = wotlk_dump.read_dump(dump_path)
+    tables = {t: wotlk_dump.rows(text, t)[1] for t in (
+        "pool_creature", "pool_creature_template", "pool_gameobject",
+        "pool_gameobject_template", "pool_template", "pool_pool", *SPAWN_GROUP_TABLES)}
+    del text
+    con = sqlite3.connect(db_path)
+    try:
+        con.executescript(gameobject.CREATE_GAMEOBJECT_SQL)
+        creatures = con.execute("SELECT guid, entry FROM creature_spawns").fetchall()
+        objects = con.execute("SELECT guid, entry FROM gameobject_spawns").fetchall()
+        # Game objects first: their insert replaces pool_templates as a whole.
+        counts = {"gameobject_pool_members": insert_gameobject_pool_rows(
+            con, build_gameobject_pool_rows(tables, objects))}
+        counts["creature_pool_members"] = insert_creature_pool_rows(
+            con, *build_creature_pool_rows(tables, creatures))
+        con.commit()
+    finally:
+        con.close()
+    print(f"imported {counts['creature_pool_members']:,} pooled creatures and "
+          f"{counts['gameobject_pool_members']:,} pooled game objects "
+          f"in {time.time() - started:.1f}s")
+    return counts
 
 
 def insert_page_text_rows(con, raw_rows) -> int:
@@ -1388,7 +1496,14 @@ def insert_gameobject_pool_rows(con, rows: dict) -> int:
     for table, columns in (("gameobject_pool_members", "guid, pool, chance"),
                            ("pool_templates", "entry, max_limit, description"),
                            ("pool_pools", "pool_id, mother_pool, chance")):
-        con.execute(f"DELETE FROM {table}")
+        if table == "pool_templates":
+            # Keep the limits of creature spawn groups (written with the
+            # creature pools); everything else is rewritten from the dump.
+            con.execute("DELETE FROM pool_templates WHERE entry NOT IN "
+                        "(SELECT pool FROM creature_pool_members WHERE pool >= ?)",
+                        (SPAWN_GROUP_POOL_BASE,))
+        else:
+            con.execute(f"DELETE FROM {table}")
         con.executemany(f"INSERT OR REPLACE INTO {table}({columns}) VALUES(?, ?, ?)",
                         rows.get(table, ()))
     return len(rows.get("gameobject_pool_members", ()))
@@ -1525,6 +1640,8 @@ QUEST_RELATION_TABLES = (
     # (dump table, SQLite table, SQLite key column)
     ("creature_questrelation", "creature_quest_starters", "entry"),
     ("creature_involvedrelation", "creature_quest_enders", "entry"),
+    ("gameobject_questrelation", "gameobject_quest_starters", "entry"),
+    ("gameobject_involvedrelation", "gameobject_quest_enders", "entry"),
     ("areatrigger_involvedrelation", "areatrigger_quests", "trigger_id"),
 )
 
@@ -1590,13 +1707,21 @@ def import_quests(dump_path: str, db_path: str) -> dict[str, int]:
     """``--quests-only``: refresh just the quest tables of an existing DB."""
     import sqlite3
 
+    from src.world.character_db import init_character_db
+
     started = time.time()
     text = wotlk_dump.read_dump(dump_path)
     tables = read_quest_tables(text)
+    _, raw_items = wotlk_dump.rows(text, "item_template")
     del text
+    init_character_db(db_path)            # adds item_templates.start_quest
     con = sqlite3.connect(db_path)
     try:
         counts = insert_quest_tables(con, tables)
+        starters = [(_sqlite_int(r.get("startquest")), _sqlite_int(r.get("entry")))
+                    for r in raw_items]
+        con.executemany("UPDATE item_templates SET start_quest = ? WHERE entry = ?", starters)
+        counts["quest_items"] = sum(1 for quest, _ in starters if quest)
         con.commit()
     finally:
         con.close()
@@ -1604,6 +1729,9 @@ def import_quests(dump_path: str, db_path: str) -> dict[str, int]:
         f"imported {counts['quest_templates']:,} quests, "
         f"{counts['creature_quest_starters']:,} quest starters, "
         f"{counts['creature_quest_enders']:,} quest enders, "
+        f"{counts['gameobject_quest_starters']:,} object quest starters, "
+        f"{counts['gameobject_quest_enders']:,} object quest enders, "
+        f"{counts['quest_items']:,} quest-starting items, "
         f"{counts['areatrigger_quests']:,} exploration triggers "
         f"in {time.time() - started:.1f}s"
     )
@@ -1656,6 +1784,8 @@ def main() -> None:
                         help="only refresh npc_vendor and item buy counts")
     parser.add_argument("--gameobjects-only", action="store_true",
                         help="only (re)import the game object templates and spawns")
+    parser.add_argument("--pools-only", action="store_true",
+                        help="only refresh the creature and game object pools")
     parser.add_argument("--loot-only", action="store_true",
                         help="only re-import the creature/reference/game object "
                              "loot tables")
@@ -1687,6 +1817,9 @@ def main() -> None:
         return
     if args.loot_only:
         import_loot(args.dump, db_path)
+        return
+    if args.pools_only:
+        import_pools(args.dump, db_path)
         return
 
     import_world(args.dump, db_path, clear=not args.keep_existing,

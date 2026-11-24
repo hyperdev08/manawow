@@ -45,20 +45,40 @@ class GameObjectsMixin:
         return gameobject.initial_state(spawn) if state is None else state
 
     def _go_dynamic(self, spawn) -> int:
-        """Per-player ``GAMEOBJECT_DYNAMIC``: quest chests light up for those who need them.
+        """Per-player ``GAMEOBJECT_DYNAMIC`` (TrinityCore ``BuildValuesUpdate``).
 
-        TrinityCore ``GameObject::ActivateToQuest`` for chests: the chest's
-        quest is in the log and unfinished, or its loot has a quest drop the
-        player still needs.
+        Quest chests and goobers become clickable and sparkle for players who
+        need them; a generic quest object only sparkles.
         """
         path = self.config.database.world_path
         if not gameobject.is_quest_object(spawn, path):
             return 0
-        if self._go_activates_for_quest(spawn):
-            return gameobject.GO_DYNFLAG_LO_ACTIVATE | gameobject.GO_DYNFLAG_LO_SPARKLE
-        return 0
+        if not self._go_activates_for_quest(spawn):
+            return 0
+        go_type = int(spawn["type"])
+        if go_type == gameobject.GAMEOBJECT_TYPE_GENERIC:
+            return gameobject.GO_DYNFLAG_LO_SPARKLE
+        if go_type == gameobject.GAMEOBJECT_TYPE_QUESTGIVER:
+            # Wanted posters carry GO_FLAG_INTERACT_COND: clickable only while
+            # they have something for the player (no sparkle).
+            return gameobject.GO_DYNFLAG_LO_ACTIVATE
+        return gameobject.GO_DYNFLAG_LO_ACTIVATE | gameobject.GO_DYNFLAG_LO_SPARKLE
+
+    def _quest_incomplete(self, quest_id: int) -> bool:
+        if not quest_id or not hasattr(self, "_quest_log_map"):
+            return False
+        state = self._quest_log_map().get(int(quest_id))
+        return state is not None and int(state["status"]) == Q.QUEST_STATUS_INCOMPLETE
 
     def _go_activates_for_quest(self, spawn) -> bool:
+        """``GameObject::ActivateToQuest``."""
+        go_type = int(spawn["type"])
+        if go_type == gameobject.GAMEOBJECT_TYPE_QUESTGIVER:
+            # Available, in progress or ready to hand in (above the grey "!").
+            return self._questgiver_status(
+                int(spawn["entry"]), Q.GIVER_GAMEOBJECT) > Q.DIALOG_STATUS_UNAVAILABLE
+        if go_type in (gameobject.GAMEOBJECT_TYPE_GOOBER, gameobject.GAMEOBJECT_TYPE_GENERIC):
+            return self._quest_incomplete(gameobject.object_quest_id(spawn))
         quest_id = gameobject.chest_quest_id(spawn)
         if quest_id and hasattr(self, "_quest_log_map"):
             state = self._quest_log_map().get(quest_id)
@@ -326,6 +346,10 @@ class GameObjectsMixin:
                                        struct.pack("<I", cinematic))
         elif go_type == gameobject.GAMEOBJECT_TYPE_MAILBOX:
             pass                        # the client opens the frame itself
+        elif go_type == gameobject.GAMEOBJECT_TYPE_QUESTGIVER:
+            await self._open_quest_object(guid, spawn)
+        elif go_type == gameobject.GAMEOBJECT_TYPE_GOOBER:
+            await self._use_goober(guid, spawn)
         else:
             self.log.debug(f"Using game object type {go_type} ({spawn['name']}) "
                            "is not implemented yet")
@@ -342,6 +366,42 @@ class GameObjectsMixin:
         else:
             runtime.set_state(low_guid, new_state, gameobject.auto_close_seconds(spawn))
         await self._broadcast_gameobject_state(spawn, new_state)
+
+    async def _open_quest_object(self, guid: int, spawn) -> None:
+        """A wanted poster or quest book: its quest list (``SendPreparedQuest``)."""
+        giver = dict(spawn, giver_kind=Q.GIVER_GAMEOBJECT)
+        if not await self._send_quest_menu(guid, giver):
+            await self.send_packet(Opcodes.SMSG_GOSSIP_COMPLETE, b"")
+
+    async def _use_goober(self, guid: int, spawn) -> None:
+        """``GameObject::Use`` for GOOBER: pages, quest credit, animation, spell."""
+        page = gameobject.goober_page(spawn)
+        if page:
+            await self.send_packet(Opcodes.SMSG_GAMEOBJECT_PAGETEXT, struct.pack("<Q", int(guid)))
+        quest_id = gameobject.object_quest_id(spawn)
+        if quest_id and not self._quest_incomplete(quest_id):
+            return                       # the object only works for its quest
+        if hasattr(self, "_quest_on_gameobject_used"):
+            await self._quest_on_gameobject_used(int(guid), int(spawn["entry"]))
+        low_guid = int(spawn["guid"])
+        anim = gameobject.goober_custom_anim(spawn)
+        if anim:
+            for session in self._go_sessions(low_guid):
+                await session.send_packet(
+                    Opcodes.SMSG_GAMEOBJECT_CUSTOM_ANIM,
+                    struct.pack("<QI", int(guid), anim))
+        else:
+            self._go_runtime().set_state(low_guid, gameobject.GO_STATE_ACTIVE,
+                                         gameobject.goober_reset_seconds(spawn))
+            await self._broadcast_gameobject_state(spawn, gameobject.GO_STATE_ACTIVE)
+        spell = gameobject.goober_spell(spawn)
+        if spell and hasattr(self, "_cast_triggered"):
+            try:
+                await self._cast_triggered(spell, int(self.player_guid))
+            except Exception as exc:          # unsupported effects must not break use
+                self.log.warning(f"Goober {spawn['name']} spell {spell} failed: {exc}")
+        if gameobject.goober_consumable(spawn):
+            await self._despawn_gameobject(spawn)
 
     async def _sit_on_chair(self, spawn) -> None:
         """Move onto the nearest seat and sit (``GameObject::Use`` CHAIR)."""

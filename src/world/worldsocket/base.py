@@ -252,6 +252,8 @@ class SocketBase:
                 await self.handle_gameobject_use(data)
             elif opcode == Opcodes.CMSG_GAMEOBJ_REPORT_USE:
                 pass                      # achievement criteria only
+            elif opcode == Opcodes.CMSG_USE_ITEM:
+                await self.handle_use_item(data)
             elif opcode == Opcodes.CMSG_PAGE_TEXT_QUERY:
                 await self.handle_page_text_query(data)
             elif opcode == Opcodes.CMSG_GET_MAIL_LIST:

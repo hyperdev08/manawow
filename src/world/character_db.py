@@ -414,6 +414,11 @@ def init_character_db(path: str) -> None:
                 con.execute(
                     f"ALTER TABLE item_templates ADD COLUMN {column}"
                     " REAL NOT NULL DEFAULT 0.0")
+        if "start_quest" not in item_columns:
+            # item_template.startquest: using the item opens that quest.
+            con.execute(
+                "ALTER TABLE item_templates ADD COLUMN start_quest INTEGER NOT NULL DEFAULT 0"
+            )
         if "buy_count" not in item_columns:
             # Vendors sell some items in fixed bundles (water x5, arrows x200).
             con.execute(
