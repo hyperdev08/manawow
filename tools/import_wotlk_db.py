@@ -10,6 +10,8 @@ Usage::
 
     python tools/import_wotlk_db.py --dump C:\\path\\WoTLKDB.sql [--db data/world.db]
     python tools/import_wotlk_db.py --dump WoTLKDB.sql --vendors-only
+    python tools/import_wotlk_db.py --dump WoTLKDB.sql --gameobjects-only
+    python tools/import_wotlk_db.py --dump WoTLKDB.sql --events-only
 
 ``--quests-only`` refreshes just the quest tables (``quest_template`` and the
 creature/area-trigger quest relations) of an existing database.
@@ -831,6 +833,8 @@ def import_world(dump_path: str, db_path: str, clear: bool = True,
     quest_tables = read_quest_tables(text)
     _, raw_npc_vendor = wotlk_dump.rows(text, "npc_vendor")
     _, raw_npc_vendor_template = wotlk_dump.rows(text, "npc_vendor_template")
+    gameobject_tables = read_gameobject_tables(text)
+    _, raw_game_event_creature = wotlk_dump.rows(text, "game_event_creature")
     del text
 
     rune_cost_rows = read_rune_cost_dbc(rune_cost_dbc) if rune_cost_dbc else []
@@ -1145,6 +1149,13 @@ def import_world(dump_path: str, db_path: str, clear: bool = True,
         _seed_starter_items(con)
 
         counts.update(insert_quest_tables(con, quest_tables))
+        counts["creature_events"] = insert_creature_event_rows(
+            con, build_event_rows(raw_game_event_creature,
+                                  (row[0] for row in spawn_rows)))
+        go_templates, go_spawns, _go_skipped = build_gameobject_rows(gameobject_tables)
+        counts.update(insert_gameobject_rows(
+            con, go_templates, go_spawns,
+            build_gameobject_event_rows(gameobject_tables, go_spawns)))
 
         con.commit()
         con.execute("PRAGMA optimize")
@@ -1174,6 +1185,9 @@ def import_world(dump_path: str, db_path: str, clear: bool = True,
         "quest_starters": counts["creature_quest_starters"],
         "quest_enders": counts["creature_quest_enders"],
         "vendor_items": counts["npc_vendor"],
+        "gameobject_templates": counts["gameobject_templates"],
+        "gameobject_spawns": counts["gameobject_spawns"],
+        "creature_events": counts["creature_events"],
     }
     print(
         f"imported {stats['templates']:,} templates, {stats['spawns']:,} spawns, "
@@ -1186,7 +1200,10 @@ def import_world(dump_path: str, db_path: str, clear: bool = True,
         f"{stats['starter_spells']:,} starter spells, "
         f"{stats['starter_actions']:,} starter actions, "
         f"{stats['loot_rows']:,} loot rows, {stats['items']:,} item templates, "
-        f"{stats['quests']:,} quests, {stats['vendor_items']:,} vendor items "
+        f"{stats['quests']:,} quests, {stats['vendor_items']:,} vendor items, "
+        f"{stats['gameobject_templates']:,} game object templates, "
+        f"{stats['gameobject_spawns']:,} game object spawns, "
+        f"{stats['creature_events']:,} world-event creatures "
         f"in {time.time() - started:.1f}s"
     )
     print(
@@ -1195,6 +1212,202 @@ def import_world(dump_path: str, db_path: str, clear: bool = True,
         "spawn-mask rows"
     )
     return stats
+
+
+GAMEOBJECT_DUMP_TABLES = ("gameobject_template", "gameobject", "gameobject_addon",
+                          "gameobject_spawn_entry", "game_event_gameobject")
+
+# CMaNGOS gameobject_template column -> server column.
+_GO_TEMPLATE_DUMP = {
+    "entry": "entry", "type": "type", "display_id": "displayId", "name": "name",
+    "icon_name": "IconName", "cast_bar_caption": "castBarCaption", "unk1": "unk1",
+    "faction": "faction", "flags": "flags", "extra_flags": "ExtraFlags",
+    "size": "size", "min_gold": "mingold", "max_gold": "maxgold",
+    "script_name": "ScriptName",
+    **{f"quest_item{i}": f"questItem{i}" for i in range(1, 7)},
+    **{f"data{i}": f"data{i}" for i in range(24)},
+}
+_GO_TEXT_COLUMNS = {"name", "icon_name", "cast_bar_caption", "unk1", "script_name"}
+
+
+def read_gameobject_tables(text: str) -> dict:
+    return {table: wotlk_dump.rows(text, table)[1] for table in GAMEOBJECT_DUMP_TABLES}
+
+
+def build_event_rows(raw_rows, kept_guids) -> list[tuple]:
+    """``(guid, event)`` pairs from a ``game_event_*`` table for kept spawns."""
+    kept = set(kept_guids)
+    pairs = {
+        (_sqlite_int(r.get("guid")), _sqlite_int(r.get("event")))
+        for r in raw_rows or []
+    }
+    return sorted((guid, event) for guid, event in pairs if guid in kept and event)
+
+
+def build_gameobject_event_rows(tables: dict, spawn_rows) -> list[tuple]:
+    """``(guid, event)`` pairs from ``game_event_gameobject`` for kept spawns."""
+    return build_event_rows(tables.get("game_event_gameobject"),
+                            (row[0] for row in spawn_rows))
+
+
+def insert_creature_event_rows(con, rows) -> int:
+    """Replace ``creature_events`` with ``rows``."""
+    from src.world import creature
+
+    con.executescript(creature.CREATE_CREATURE_EVENTS_SQL)
+    con.execute("DELETE FROM creature_events")
+    con.executemany("INSERT INTO creature_events(guid, event) VALUES(?, ?)", list(rows))
+    return len(rows)
+
+
+def import_events(dump_path: str, db_path: str) -> dict[str, int]:
+    """``--events-only``: refresh which creature/object spawns belong to events."""
+    import sqlite3
+
+    started = time.time()
+    text = wotlk_dump.read_dump(dump_path)
+    _, raw_creature = wotlk_dump.rows(text, "game_event_creature")
+    _, raw_gameobject = wotlk_dump.rows(text, "game_event_gameobject")
+    del text
+    from src.world import gameobject
+
+    con = sqlite3.connect(db_path)
+    try:
+        con.executescript(gameobject.CREATE_GAMEOBJECT_SQL)
+        creature_rows = build_event_rows(
+            raw_creature, (g for (g,) in con.execute("SELECT guid FROM creature_spawns")))
+        gameobject_rows = build_event_rows(
+            raw_gameobject, (g for (g,) in con.execute("SELECT guid FROM gameobject_spawns")))
+        counts = {"creature_events": insert_creature_event_rows(con, creature_rows)}
+        con.execute("DELETE FROM gameobject_events")
+        con.executemany("INSERT INTO gameobject_events(guid, event) VALUES(?, ?)",
+                        gameobject_rows)
+        counts["gameobject_events"] = len(gameobject_rows)
+        con.commit()
+    finally:
+        con.close()
+    print(f"imported {counts['creature_events']:,} creature and "
+          f"{counts['gameobject_events']:,} game object world-event links "
+          f"in {time.time() - started:.1f}s")
+    return counts
+
+
+def build_gameobject_rows(tables: dict) -> tuple[list[tuple], list[tuple], dict]:
+    """Turn the CMaNGOS game object tables into template and spawn rows.
+
+    * ``gameobject_addon`` supplies the per-spawn animation progress and
+      start state (``-1`` = the template default).
+    * A spawn with ``id = 0`` takes its entry from ``gameobject_spawn_entry``
+      (CMaNGOS picks one of the listed entries at random each spawn); the
+      lowest entry is used so the import stays reproducible.
+    * Like creatures, only normal-difficulty (``spawnMask & 1``) spawns are
+      kept; spawns that are not in the default phase are kept too when
+      ``phaseMask`` includes phase 1.
+    """
+    from src.world import gameobject
+
+    template_rows = []
+    known = set()
+    for raw in tables.get("gameobject_template") or []:
+        row = []
+        for column in gameobject.TEMPLATE_COLUMNS:
+            value = raw.get(_GO_TEMPLATE_DUMP[column])
+            if column in _GO_TEXT_COLUMNS:
+                row.append(_text_or_empty(value))
+            elif column == "size":
+                row.append(_sqlite_float(value) or 1.0)
+            else:
+                row.append(_sqlite_int(value))
+        template_rows.append(tuple(row))
+        known.add(row[0])
+
+    addon = {_sqlite_int(r.get("guid")): r for r in tables.get("gameobject_addon") or []}
+    spawn_entry: dict[int, int] = {}
+    for r in tables.get("gameobject_spawn_entry") or []:
+        guid, entry = _sqlite_int(r.get("guid")), _sqlite_int(r.get("entry"))
+        if entry in known and (guid not in spawn_entry or entry < spawn_entry[guid]):
+            spawn_entry[guid] = entry
+
+    spawn_rows = []
+    skipped = {"missing_template": 0, "phase": 0, "spawn_mask": 0}
+    for raw in tables.get("gameobject") or []:
+        guid = _sqlite_int(raw.get("guid"))
+        entry = _sqlite_int(raw.get("id")) or spawn_entry.get(guid, 0)
+        if entry not in known:
+            skipped["missing_template"] += 1
+            continue
+        if _sqlite_int(raw.get("spawnMask")) & 1 == 0:
+            skipped["spawn_mask"] += 1
+            continue
+        phase = _sqlite_int(raw.get("phaseMask"))
+        if phase & 1 == 0:
+            skipped["phase"] += 1
+            continue
+        extra = addon.get(guid) or {}
+        spawn_rows.append((
+            guid, entry, _sqlite_int(raw.get("map")), phase,
+            _sqlite_float(raw.get("position_x")), _sqlite_float(raw.get("position_y")),
+            _sqlite_float(raw.get("position_z")), _sqlite_float(raw.get("orientation")),
+            *(_sqlite_float(raw.get(f"rotation{i}")) for i in range(4)),
+            _sqlite_int(raw.get("spawntimesecsmin")),
+            _sqlite_int(raw.get("spawntimesecsmax")),
+            _sqlite_int(extra.get("animprogress"))
+            if extra else gameobject.GO_ANIMPROGRESS_DEFAULT,
+            _sqlite_int(extra.get("state")) if extra else -1,
+        ))
+    return template_rows, spawn_rows, skipped
+
+
+def insert_gameobject_rows(con, template_rows, spawn_rows,
+                           event_rows=()) -> dict[str, int]:
+    """Replace the game object tables with the given rows."""
+    from src.world import gameobject
+
+    con.executescript(gameobject.CREATE_GAMEOBJECT_SQL)
+    con.execute("DELETE FROM gameobject_templates")
+    con.execute("DELETE FROM gameobject_spawns")
+    con.execute("DELETE FROM gameobject_events")
+    con.executemany("INSERT INTO gameobject_events(guid, event) VALUES(?, ?)",
+                    list(event_rows))
+    for table, columns, rows in (
+        ("gameobject_templates", gameobject.TEMPLATE_COLUMNS, template_rows),
+        ("gameobject_spawns", gameobject.SPAWN_COLUMNS, spawn_rows),
+    ):
+        con.executemany(
+            f"INSERT INTO {table}({', '.join(columns)}) "
+            f"VALUES({', '.join('?' for _ in columns)})",
+            rows,
+        )
+    return {"gameobject_templates": len(template_rows),
+            "gameobject_spawns": len(spawn_rows),
+            "gameobject_events": len(event_rows)}
+
+
+def import_gameobjects(dump_path: str, db_path: str) -> dict[str, int]:
+    """``--gameobjects-only``: refresh just the game object tables."""
+    import sqlite3
+
+    started = time.time()
+    text = wotlk_dump.read_dump(dump_path)
+    tables = read_gameobject_tables(text)
+    del text
+    template_rows, spawn_rows, skipped = build_gameobject_rows(tables)
+    event_rows = build_gameobject_event_rows(tables, spawn_rows)
+    con = sqlite3.connect(db_path)
+    try:
+        counts = insert_gameobject_rows(con, template_rows, spawn_rows, event_rows)
+        con.commit()
+    finally:
+        con.close()
+    print(
+        f"imported {counts['gameobject_templates']:,} game object templates and "
+        f"{counts['gameobject_spawns']:,} spawns ({counts['gameobject_events']:,} "
+        f"tied to world events) in {time.time() - started:.1f}s "
+        f"(skipped {skipped['missing_template']:,} without a template, "
+        f"{skipped['spawn_mask']:,} non-normal spawn mask, "
+        f"{skipped['phase']:,} outside phase 1)"
+    )
+    return {**counts, **{f"skipped_{k}": v for k, v in skipped.items()}}
 
 
 QUEST_RELATION_TABLES = (
@@ -1303,7 +1516,9 @@ def report_start_zones(db_path: str, radius: float = 150.0) -> None:
                 "SELECT s.x, s.y, s.z FROM creature_spawns s"
                 " JOIN creature_templates t ON t.entry = s.entry"
                 " WHERE s.map = ? AND t.visible <> 0"
-                " AND s.x BETWEEN ? AND ? AND s.y BETWEEN ? AND ?",
+                " AND s.x BETWEEN ? AND ? AND s.y BETWEEN ? AND ?"
+                " AND NOT EXISTS (SELECT 1 FROM creature_events e"
+                " WHERE e.guid = s.guid AND e.event > 0)",
                 (map_id, x - radius, x + radius, y - radius, y + radius),
             ):
                 if (sx - x) ** 2 + (sy - y) ** 2 + (sz - z) ** 2 <= radius * radius:
@@ -1328,6 +1543,11 @@ def main() -> None:
                              "relation tables into an existing database")
     parser.add_argument("--vendors-only", action="store_true",
                         help="only refresh npc_vendor and item buy counts")
+    parser.add_argument("--gameobjects-only", action="store_true",
+                        help="only (re)import the game object templates and spawns")
+    parser.add_argument("--events-only", action="store_true",
+                        help="only refresh which creature/object spawns belong "
+                             "to world events")
     args = parser.parse_args()
 
     db_path = args.db
@@ -1344,6 +1564,12 @@ def main() -> None:
         return
     if args.vendors_only:
         import_vendors(args.dump, db_path)
+        return
+    if args.gameobjects_only:
+        import_gameobjects(args.dump, db_path)
+        return
+    if args.events_only:
+        import_events(args.dump, db_path)
         return
 
     import_world(args.dump, db_path, clear=not args.keep_existing,

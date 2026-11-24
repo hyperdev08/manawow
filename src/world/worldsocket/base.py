@@ -73,6 +73,10 @@ class SocketBase:
         # when the player walks into a new part of the zone.
         self._visible_creatures: dict[int, int] = {}
         self._creature_scan_pos: tuple[float, float, float] | None = None
+        # Game objects on the client: spawn guid -> full object guid, and the
+        # (map, x, y, z) of the last visibility scan.
+        self._visible_gameobjects: dict[int, int] = {}
+        self._gameobject_scan_pos: tuple[int, float, float, float] | None = None
         # Spawn rows for the visible creatures, kept so the idle-movement tick
         # does not hit SQLite for every creature every 250 ms.
         self._creature_spawn_cache: dict[int, object] = {}
@@ -240,6 +244,8 @@ class SocketBase:
                 await self.handle_item_query(data)
             elif opcode == Opcodes.CMSG_CREATURE_QUERY:
                 await self.handle_creature_query(data)
+            elif opcode == Opcodes.CMSG_GAMEOBJECT_QUERY:
+                await self.handle_gameobject_query(data)
             elif opcode == Opcodes.CMSG_GOSSIP_HELLO:
                 await self.handle_gossip_hello(data)
             elif opcode == Opcodes.CMSG_GOSSIP_SELECT_OPTION:
