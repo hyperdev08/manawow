@@ -1,4 +1,4 @@
-"""Summoned creatures: pets and guardians created by spells.
+﻿"""Summoned creatures: pets and guardians created by spells.
 
 The world database only describes static spawns, so a summon is a session-local
 ``creature_spawns``-shaped row.  The guid allocator uses the top of the 24-bit
@@ -401,10 +401,15 @@ class SummonsMixin:
 
         path = None
         if hasattr(self, "_find_world_path") and distance > 2.0:
-            if not self._has_line_of_sight(
+            if not await self._has_line_of_sight(
                     (here[0], here[1], here[2] + 0.9),
                     (dest[0], dest[1], dest[2] + 0.9)):
                 path = await self._find_world_path(here, dest)
+                if path is None and hasattr(self, "_has_navmesh_at") \
+                        and self._has_navmesh_at(here) \
+                        and self._has_navmesh_at(dest):
+                    state["moving_until"] = now + 0.5
+                    return
         points = None
         if path and len(path) > 1:
             points = self._path_prefix(here, path,

@@ -20,8 +20,8 @@ import os
 from typing import Optional
 
 from . import los
-from .client_data import ClientData, get_client_data
-from .navmesh import NavMeshMap, navmesh_available
+from .client_data import ClientData, get_client_data, grid_coord
+from .navmesh import NAV_GROUND_FLAGS, NavMeshMap, navmesh_available
 from .terrain import TerrainMap, terrain_available
 from .vmap import VMapMap, vmaps_available
 
@@ -45,6 +45,22 @@ class WorldGeometry:
         self.terrain_ready = terrain_available(data)
         self.vmaps_ready = vmaps_available(data)
         self.navmesh_ready = navmesh_available(data)
+        # Cached set of generated mmap tiles.  Checking whether a creature is
+        # standing on a map/area with real navmesh data must not stat/parse a
+        # tile on the event loop during every chase tick.
+        self.navmesh_tiles: set[tuple[int, int, int]] = set()
+        if self.navmesh_ready:
+            try:
+                for name in os.listdir(self.data.mmaps_dir):
+                    if not name.endswith(".mmtile"):
+                        continue
+                    stem = name[:-7]
+                    if len(stem) >= 7 and stem[:3].isdigit() \
+                            and stem[3:5].isdigit() and stem[5:7].isdigit():
+                        self.navmesh_tiles.add(
+                            (int(stem[:3]), int(stem[3:5]), int(stem[5:7])))
+            except OSError:
+                pass
 
     # -- object caches -------------------------------------------------
     def terrain(self, map_id: int) -> TerrainMap:
@@ -92,25 +108,39 @@ class WorldGeometry:
                 return height
         if self.navmesh_ready:
             snapped = self.navmesh(map_id).point_on_mesh(
-                (x, y, 0.0), max_distance=8.0, use_z=False)
+                (x, y, 0.0), max_distance=8.0, use_z=False,
+                include_flags=NAV_GROUND_FLAGS)
             if snapped is not None:
                 return snapped[2]
         return None
 
-    def find_path(self, map_id: int, start, end, max_tiles: int = 2):
+    def find_path(self, map_id: int, start, end, max_tiles: int = 2,
+                  include_flags: int = NAV_GROUND_FLAGS):
         if not self.navmesh_ready:
             return None
-        return self.navmesh(map_id).find_path(start, end, max_tiles=max_tiles)
+        return self.navmesh(map_id).find_path(
+            start, end, max_tiles=max_tiles, include_flags=include_flags)
 
-    def point_on_mesh(self, map_id: int, point):
+    def point_on_mesh(self, map_id: int, point,
+                      include_flags: int = NAV_GROUND_FLAGS):
         if not self.navmesh_ready:
             return None
-        return self.navmesh(map_id).point_on_mesh(point)
+        return self.navmesh(map_id).point_on_mesh(
+            point, include_flags=include_flags)
 
-    def random_point(self, map_id: int, center, radius: float):
+    def has_navmesh_at(self, map_id: int, point) -> bool:
+        """True when the map has a generated navmesh tile at ``point``."""
+        if not self.navmesh_ready:
+            return False
+        return (int(map_id), grid_coord(float(point[0])),
+                grid_coord(float(point[1]))) in self.navmesh_tiles
+
+    def random_point(self, map_id: int, center, radius: float,
+                     include_flags: int = NAV_GROUND_FLAGS):
         if not self.navmesh_ready:
             return None
-        return self.navmesh(map_id).random_point(center, radius)
+        return self.navmesh(map_id).random_point(
+            center, radius, include_flags=include_flags)
 
 
 _geometry_cache: dict[tuple[str, Optional[str]], WorldGeometry] = {}

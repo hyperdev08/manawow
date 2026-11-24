@@ -159,8 +159,11 @@ class AuthMixin:
         # entry when this version differs from the one stored in that file.
         # Hash the item templates instead of sending a constant, otherwise item
         # edits (and fixes like a weapon's sheath type) never reach the client.
-        cache_version = character_db.client_cache_version(
-            self.config.database.world_path
+        # The version is an aggregate over every item template (~100 ms on
+        # Windows).  It cannot change while the server runs, so compute it
+        # once off the event loop and cache it for later logins.
+        cache_version = await asyncio.to_thread(
+            character_db.client_cache_version, self.config.database.world_path
         )
         await self.send_packet(
             Opcodes.SMSG_CLIENTCACHE_VERSION, struct.pack("<I", cache_version)

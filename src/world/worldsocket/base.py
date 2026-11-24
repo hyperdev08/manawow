@@ -597,7 +597,14 @@ class SocketBase:
     def _current_map_id(self) -> int:
         return int((getattr(self, "character", None) or {}).get("map", 0) or 0)
 
-    def _has_line_of_sight(self, start, end, map_id: int | None = None) -> bool:
+    async def _has_line_of_sight(self, start, end,
+                                 map_id: int | None = None) -> bool:
+        """Line-of-sight check, run on the geometry worker.
+
+        VMap WMO parsing and ray tests are CPU-heavy; doing them on the
+        asyncio thread blocked combat for hundreds of milliseconds.  The
+        geometry worker also serialises access to the lazy terrain/VMap caches.
+        """
         if not getattr(self, "character", None):
             return True
         if map_id is None:
@@ -609,7 +616,8 @@ class SocketBase:
         world = (self._get_geometry()
                  if hasattr(self, "_get_geometry") else None)
         if world is not None:
-            return world.has_line_of_sight(int(map_id), start, end)
+            return await run_geometry(
+                world.has_line_of_sight, int(map_id), start, end)
         return los.has_los(
             self.config.database.world_path, int(map_id), start, end)
 
@@ -631,12 +639,43 @@ class SocketBase:
             world.find_path, self._current_map_id(), start, end,
             max_tiles=max_tiles)
 
+    async def _prewarm_local_geometry(self) -> None:
+        """Load the player's terrain/VMap tile off the event loop.
+
+        The first line-of-sight query in an area reads and parses map files.
+        Doing that in the background when the player enters the world avoids a
+        multi-hundred-millisecond freeze on the first combat swing.
+        """
+        if not self.character:
+            return
+        world = self._get_geometry()
+        if world is None:
+            return
+        try:
+            x = float(self.character.get("x", 0.0) or 0.0)
+            y = float(self.character.get("y", 0.0) or 0.0)
+            z = float(self.character.get("z", 0.0) or 0.0)
+            map_id = self._current_map_id()
+            await run_geometry(
+                world.has_line_of_sight, map_id,
+                (x, y, z + 1.5), (x + 8.0, y + 4.0, z + 1.5))
+            await run_geometry(world.ground_height, map_id, x, y)
+        except Exception:
+            pass
+
     async def _navmesh_point(self, point, max_distance: float = 8.0):
         world = self._get_geometry()
         if world is None:
             return None
         return await run_geometry(
             world.point_on_mesh, self._current_map_id(), point)
+
+    def _has_navmesh_at(self, point) -> bool:
+        """Whether a generated navmesh tile exists at ``point``."""
+        world = self._get_geometry()
+        if world is None:
+            return False
+        return world.has_navmesh_at(self._current_map_id(), point)
 
     async def _random_world_point(self, center, radius: float):
         world = self._get_geometry()

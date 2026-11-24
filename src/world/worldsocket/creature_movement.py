@@ -1,4 +1,4 @@
-"""Creature wander and waypoint movement generators."""
+﻿"""Creature wander and waypoint movement generators."""
 from __future__ import annotations
 
 import math
@@ -10,6 +10,7 @@ from src.world import creature
 from src.world import object_update
 
 from .constants import (
+    IDLE_GEOMETRY_MOVES_PER_TICK,
     IDLE_MOVE_MAX_DURATION_MS,
     IDLE_MOVE_MIN_DURATION_MS,
     IDLE_WANDER_DEFAULT_RADIUS,
@@ -140,6 +141,20 @@ class CreatureMovementMixin:
         self._get_combat_state().setdefault("idle", {})[int(low_guid)] = state
         return state
 
+    def _idle_geometry_available(self) -> bool:
+        """Consume one slot from this tick's ambient pathfinding budget.
+
+        The budget is ``None`` outside ``_creature_idle_tick_all`` so other
+        movement callers keep their previous behaviour.
+        """
+        budget = getattr(self, "_idle_move_budget", None)
+        if budget is None:
+            return True
+        if budget <= 0:
+            return False
+        self._idle_move_budget = budget - 1
+        return True
+
     async def _send_creature_idle_move(self, low_guid: int, spawn, state: dict,
                                        here, dest, now: float) -> bool:
         """Send one walk spline for idle movement.  Returns False if too short."""
@@ -160,8 +175,12 @@ class CreatureMovementMixin:
         if distance > 2.0 and hasattr(self, "_find_world_path"):
             eye_a = (here[0], here[1], here[2] + 0.9)
             eye_b = (float(dest[0]), float(dest[1]), float(dest[2]) + 0.9)
-            if not self._has_line_of_sight(eye_a, eye_b):
+            if not await self._has_line_of_sight(eye_a, eye_b):
                 path = await self._find_world_path(here, dest)
+                if path is None and hasattr(self, "_has_navmesh_at") \
+                        and self._has_navmesh_at(here) \
+                        and self._has_navmesh_at(dest):
+                    return False
         if path and len(path) > 1:
             max_travel = speed * IDLE_MOVE_MAX_DURATION_MS / 1000.0
             points = self._path_prefix(here, path, max_travel)
@@ -222,6 +241,8 @@ class CreatureMovementMixin:
             state["wait_until"] = now + wait_ms / 1000.0
             state["path_index"] = (index + 1) % len(path)
             return
+        if not self._idle_geometry_available():
+            return
         if not await self._send_creature_idle_move(
                 low_guid, spawn, state, here, dest, now):
             state["wait_until"] = now + IDLE_WANDER_RETRY
@@ -273,6 +294,8 @@ class CreatureMovementMixin:
         here = tuple(state["pos"])
         home = state["home"]
         radius = float(state["radius"])
+        if not self._idle_geometry_available():
+            return
         dest = None
         # Prefer a real navmesh point: it is reachable, lies on a walkable
         # surface and already has the right height.  The random-circle fallback
@@ -313,15 +336,41 @@ class CreatureMovementMixin:
                 IDLE_WANDER_DELAY_MIN, IDLE_WANDER_DELAY_MAX)
 
     async def _creature_idle_tick_all(self, now: float) -> None:
-        """Advance idle movement for every visible creature."""
+        """Advance idle movement for every visible creature.
+
+        Ambient movement is spread over ticks: each tick may spend a bounded
+        number of navmesh/LOS queries, then the cursor resumes at the next
+        creature.  A single creature failing (bad spawn row, transient DB
+        error) is isolated so the rest of the combat tick still runs.
+        """
         cache = getattr(self, "_creature_spawn_cache", {})
         if not cache:
             return
         aggro = self._get_combat_state()["aggro"]
-        for low_guid in list(cache):
-            if low_guid in aggro:
-                continue
-            spawn = cache.get(low_guid)
-            if spawn is None:
-                continue
-            await self._creature_idle_tick(low_guid, spawn, now)
+        guids = list(cache)
+        start = int(getattr(self, "_idle_geometry_cursor", 0) or 0) % len(guids)
+        self._idle_move_budget = IDLE_GEOMETRY_MOVES_PER_TICK
+        processed = 0
+        try:
+            for offset in range(len(guids)):
+                low_guid = guids[(start + offset) % len(guids)]
+                if low_guid in aggro:
+                    processed += 1
+                    continue
+                spawn = cache.get(low_guid)
+                if spawn is None:
+                    processed += 1
+                    continue
+                try:
+                    await self._creature_idle_tick(low_guid, spawn, now)
+                except Exception as exc:
+                    log = getattr(self, "log", None)
+                    if log is not None:
+                        log.debug("Idle movement tick failed for creature "
+                                  f"{low_guid}: {exc}")
+                processed += 1
+                if self._idle_move_budget <= 0:
+                    break
+        finally:
+            self._idle_move_budget = None
+            self._idle_geometry_cursor = (start + processed) % len(guids)

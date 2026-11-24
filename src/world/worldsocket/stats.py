@@ -273,6 +273,12 @@ class StatsMixin:
         ``GetCreateMana`` values, so ``UNIT_FIELD_BASE_HEALTH`` stays the raw
         ``basehp`` (20 for a level-1 warrior) rather than the finished pool.
         """
+        # Equipment or level changed: the next swing must reread the weapon
+        # rows instead of using the session's cached values.
+        for attribute in ("_weapon_stats_cache", "_weapon_proc_cache"):
+            cache = getattr(self, attribute, None)
+            if cache is not None:
+                cache.clear()
         if not self.character:
             return
         level = max(1, int(self.character.get("level", 1)))
@@ -920,6 +926,8 @@ class StatsMixin:
         mana.  Fractional power is carried between ticks, otherwise a low-level
         character's sub-1-mana-per-tick regen would round down to nothing.
         """
+        if not self.character:
+            return
         combat = self._get_combat_state()
         if combat["dead"]:
             return

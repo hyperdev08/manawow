@@ -311,7 +311,7 @@ class CreatureAIMixin:
                 entry, low_guid, spawn, ai, player_guid)
             if not ok:
                 continue
-            if target_guid and not self._creature_has_line_of_sight(
+            if target_guid and not await self._creature_has_line_of_sight(
                     low_guid, target_guid):
                 continue
             if target_guid and not self._creature_spell_in_range(
@@ -519,13 +519,13 @@ class CreatureAIMixin:
         return True
 
 
-    def _creature_has_line_of_sight(self, low_guid: int,
-                                    target_guid: int) -> bool:
+    async def _creature_has_line_of_sight(self, low_guid: int,
+                                          target_guid: int) -> bool:
         if not hasattr(self, "_has_line_of_sight"):
             return True
         caster = self._creature_object_guid(int(low_guid))
         try:
-            return self._has_line_of_sight(
+            return await self._has_line_of_sight(
                 self._unit_eye_position(caster),
                 self._unit_eye_position(int(target_guid)))
         except Exception:

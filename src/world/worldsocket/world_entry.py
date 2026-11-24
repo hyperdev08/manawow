@@ -110,8 +110,12 @@ class WorldEntryMixin:
         # inventory we attached above, and a sqlite3.Row has no ``get``.
         # Static creatures are added to the same update packet so the client
         # receives the whole visible world in one atomic create update.
-        creature_blocks = await self.send_npc_spawns()
-        creature_blocks += await self.send_gameobject_spawns()
+        # The two scans touch independent caches and databases.  Running them
+        # together overlaps the creature query with the first game-object map
+        # load instead of serializing both on the client's loading screen.
+        creature_blocks, gameobject_blocks = await asyncio.gather(
+            self.send_npc_spawns(), self.send_gameobject_spawns())
+        creature_blocks += gameobject_blocks
         # Fetch known spells for this character
         known_spells = character_db.get_character_spells(
             self.config.database.world_path, self.player_guid
@@ -141,6 +145,9 @@ class WorldEntryMixin:
         # burst complete first also lets a peer that logged in at the same
         # time deliver its own block instead of being skipped.
         self.world_entry_complete = True
+        if hasattr(self, "_prewarm_local_geometry"):
+            self._prewarm_task = asyncio.ensure_future(
+                self._prewarm_local_geometry())
         await self.send_peer_spawns()
         await self.announce_self_to_peers()
         if hasattr(self, "_send_all_auras"):
@@ -358,7 +365,8 @@ class WorldEntryMixin:
 
     async def _creature_spawns_near(self, x: float, y: float, z: float) -> list:
         """Static creatures in range, without the pool members that are not up."""
-        spawns = creature.get_creature_spawns_near(
+        spawns = await asyncio.to_thread(
+            creature.get_creature_spawns_near,
             self.config.database.world_path,
             int(self.character["map"]),
             x, y, z,

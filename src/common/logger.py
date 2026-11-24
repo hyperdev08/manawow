@@ -18,6 +18,16 @@ def setup_logger(name: str, log_dir: str = "./logs", level: str = "INFO", consol
     fh.setFormatter(fmt)
     logger.addHandler(fh)
 
+    # asyncio's transport/proactor logger has no handler of its own.  Without
+    # this it falls through to logging.lastResort, which writes to the console
+    # synchronously; a socket send warning was measured blocking the event loop
+    # for almost half a second on Windows.
+    asyncio_logger = logging.getLogger("asyncio")
+    if not asyncio_logger.handlers:
+        asyncio_logger.addHandler(fh)
+        asyncio_logger.setLevel(logging.WARNING)
+        asyncio_logger.propagate = False
+
     if console:
         sh = logging.StreamHandler()
         sh.setFormatter(fmt)

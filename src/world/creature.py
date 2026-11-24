@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import os
 import sqlite3
-from typing import List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from src.common import sqlite_tuning
 from src.world.update_fields import CREATURE_HIGH_GUID
@@ -1015,6 +1015,36 @@ def get_creature_spawns_near(path: str, map_id: int, x: float, y: float,
         if dx * dx + dy * dy + dz * dz <= limit:
             near.append(row)
     return near
+
+
+def get_creature_respawn_statuses(
+        path: str, guids) -> Dict[int, Tuple[int, int]]:
+    """Return ``{guid: (dead_since, respawn_time)}`` for dead visible spawns.
+
+    The respawn scan used to run one ``SELECT`` per visible creature every two
+    seconds.  A single indexed ``IN`` query keeps the scan off the event loop
+    and removes the periodic hitch it caused while running through a zone.
+    """
+    wanted = [int(guid) for guid in guids]
+    if not wanted:
+        return {}
+    con = sqlite_tuning.read_connection(path)
+    statuses: Dict[int, Tuple[int, int]] = {}
+    # Stay below SQLite's default SQLITE_MAX_VARIABLE_NUMBER (999).
+    for start in range(0, len(wanted), 500):
+        chunk = wanted[start:start + 500]
+        placeholders = ",".join("?" for _ in chunk)
+        rows = con.execute(
+            "SELECT s.guid, s.dead_since, t.respawn_time"
+            " FROM creature_spawns s"
+            " JOIN creature_templates t ON t.entry = s.entry"
+            f" WHERE s.guid IN ({placeholders}) AND s.dead_since > 0",
+            chunk,
+        ).fetchall()
+        for row in rows:
+            statuses[int(row["guid"])] = (
+                int(row["dead_since"] or 0), int(row["respawn_time"] or 0))
+    return statuses
 
 
 def get_creature_spawn(path: str, guid: int) -> Optional[sqlite3.Row]:

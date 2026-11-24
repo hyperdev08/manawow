@@ -6,6 +6,7 @@ import re
 import sqlite3
 import struct
 import zlib
+from functools import lru_cache
 from typing import Dict, List, Optional, Tuple
 
 from src.world import databases
@@ -396,6 +397,7 @@ def _migrate_item_template_columns(con: sqlite3.Connection) -> None:
 
 def init_world_db(path: str) -> None:
     """Create/upgrade the world-side template tables used by characters."""
+    client_cache_version.cache_clear()
     con = _open_raw(path)  # world bank: never routed
     try:
         con.executescript(CREATE_WORLD_TEMPLATE_SQL)
@@ -1576,6 +1578,7 @@ def _seed_starter_items(con: sqlite3.Connection) -> None:
 CACHE_FORMAT_VERSION = 4
 
 
+@lru_cache(maxsize=8)
 def client_cache_version(path: str) -> int:
     """Return the value for ``SMSG_CLIENTCACHE_VERSION``.
 

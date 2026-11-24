@@ -1,4 +1,4 @@
-"""Player spell casting, power/cooldown spend and spell effects."""
+﻿"""Player spell casting, power/cooldown spend and spell effects."""
 from __future__ import annotations
 
 import math
@@ -226,7 +226,7 @@ class SpellsMixin:
                                             SPELL_FAILED_OUT_OF_RANGE)
                     return
             if hasattr(self, "_has_line_of_sight") and \
-                    not self._has_line_of_sight(
+                    not await self._has_line_of_sight(
                         self._unit_eye_position(self.player_guid), dest):
                 await self._cast_failed(cast_id, spell_id,
                                         SPELL_FAILED_LINE_OF_SIGHT)
@@ -254,7 +254,7 @@ class SpellsMixin:
             else:
                 target_eye = None
             if target_eye is not None and hasattr(self, "_has_line_of_sight") \
-                    and not self._has_line_of_sight(
+                    and not await self._has_line_of_sight(
                         self._unit_eye_position(self.player_guid), target_eye):
                 await self._cast_failed(cast_id, spell_id,
                                         SPELL_FAILED_LINE_OF_SIGHT)

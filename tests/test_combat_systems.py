@@ -17,7 +17,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
 from src.protocol.opcodes import Opcodes
-from src.world import creature, spells
+from src.world import creature, databases, spells
 from src.world import los
 from src.world.realmsocket import WorldSocket
 from src.world.worldsocket.auras import AurasMixin
@@ -149,8 +149,8 @@ class FakeUnit(AurasMixin, SpellsMixin, StatsMixin, CombatMixin,
     def _target_in_front(self, target_guid, arc=math.pi):
         return WorldSocket._target_in_front(self, target_guid, arc)
 
-    def _has_line_of_sight(self, start, end, map_id=None):
-        return WorldSocket._has_line_of_sight(self, start, end, map_id)
+    async def _has_line_of_sight(self, start, end, map_id=None):
+        return await WorldSocket._has_line_of_sight(self, start, end, map_id)
 
     def _unit_eye_position(self, guid):
         return WorldSocket._unit_eye_position(self, guid)
@@ -490,10 +490,10 @@ async def test_line_of_sight_geometry_and_optional_db_blockers():
         session = FakeUnit()
         session.config.database.world_path = path
         session.character["map"] = 0
-        assert not session._has_line_of_sight(
+        assert not await session._has_line_of_sight(
             (0.0, 0.0, 1.0), (10.0, 0.0, 1.0))
         session.character["map"] = 2
-        assert session._has_line_of_sight(
+        assert await session._has_line_of_sight(
             (0.0, 0.0, 1.0), (10.0, 0.0, 1.0))
 
 
@@ -525,6 +525,58 @@ async def test_melee_and_spell_facing_checks():
     failed = [p for op, p in session.sent
               if op == int(Opcodes.SMSG_CAST_FAILED)]
     assert failed and failed[-1][5] == 61      # SPELL_FAILED_NOT_INFRONT
+
+
+@_async_test
+async def test_weapon_stats_and_procs_are_cached_for_the_session():
+    uri = "file:weapon-cache?mode=memory&cache=shared"
+    keep = sqlite3.connect(uri, uri=True)
+    try:
+        keep.execute(
+            "CREATE TABLE item_templates(entry INTEGER PRIMARY KEY,"
+            " damage_min1 REAL, damage_max1 REAL, delay INTEGER,"
+            " spell_id1 INTEGER DEFAULT 0, spell_trigger1 INTEGER DEFAULT 0,"
+            " spell_ppm_rate1 REAL DEFAULT 0, spell_cooldown1 INTEGER DEFAULT 0,"
+            " spell_charges1 INTEGER DEFAULT 0,"
+            " spell_id2 INTEGER DEFAULT 0, spell_trigger2 INTEGER DEFAULT 0,"
+            " spell_ppm_rate2 REAL DEFAULT 0, spell_cooldown2 INTEGER DEFAULT 0,"
+            " spell_charges2 INTEGER DEFAULT 0,"
+            " spell_id3 INTEGER DEFAULT 0, spell_trigger3 INTEGER DEFAULT 0,"
+            " spell_ppm_rate3 REAL DEFAULT 0, spell_cooldown3 INTEGER DEFAULT 0,"
+            " spell_charges3 INTEGER DEFAULT 0,"
+            " spell_id4 INTEGER DEFAULT 0, spell_trigger4 INTEGER DEFAULT 0,"
+            " spell_ppm_rate4 REAL DEFAULT 0, spell_cooldown4 INTEGER DEFAULT 0,"
+            " spell_charges4 INTEGER DEFAULT 0,"
+            " spell_id5 INTEGER DEFAULT 0, spell_trigger5 INTEGER DEFAULT 0,"
+            " spell_ppm_rate5 REAL DEFAULT 0, spell_cooldown5 INTEGER DEFAULT 0,"
+            " spell_charges5 INTEGER DEFAULT 0)")
+        keep.execute(
+            "CREATE TABLE character_items(id INTEGER PRIMARY KEY,"
+            " character_guid INTEGER, item_entry INTEGER, slot INTEGER)")
+        keep.execute(
+            "INSERT INTO item_templates(entry, damage_min1, damage_max1,"
+            " delay, spell_id1, spell_trigger1, spell_ppm_rate1,"
+            " spell_cooldown1, spell_charges1)"
+            " VALUES(100, 5.0, 9.0, 2000, 17152, 2, 1.0, 0, 0)")
+        keep.execute("INSERT INTO character_items VALUES(1, 42, 100, 15)")
+        keep.commit()
+
+        session = FakeUnit()
+        session.config.database.world_path = "weapon-cache"
+        session.player_guid = 42
+        with mock.patch(
+                "src.world.worldsocket.combat.databases.connect_character",
+                side_effect=lambda _path: sqlite3.connect(uri, uri=True)) as connect:
+            first = session._player_weapon_stats()
+            second = session._player_weapon_stats()
+            procs = session._equipped_item_proc_entries(15)
+            procs_again = session._equipped_item_proc_entries(15)
+        assert first == second and first["min"] == 5.0
+        assert (second["min"], second["max"]) == (5.0, 9.0)
+        assert procs is procs_again and procs[0]["spell_id"] == 17152
+        assert connect.call_count == 2       # one weapon row, one proc row
+    finally:
+        keep.close()
 
 
 @_async_test
@@ -745,3 +797,26 @@ async def test_fled_creature_does_not_reset_while_victim_stays_near_home():
         session.character["x"] = 61.0
         await session._creature_combat_tick(5, time.monotonic())
         reset.assert_awaited_once_with(5)
+
+
+def test_spell_template_lookup_is_cached():
+    """Hot combat/aura lookups must not open SQLite on every tick."""
+    spells.clear_caches()
+    first = spells.get_spell_template(WORLD_DB, 133)     # Fireball
+    assert first is not None
+    before = spells.get_spell_template.cache_info()
+    second = spells.get_spell_template(WORLD_DB, 133)
+    after = spells.get_spell_template.cache_info()
+    assert second is first
+    assert after.hits == before.hits + 1
+    assert after.misses == before.misses
+
+
+@_async_test
+async def test_regenerate_ignores_a_session_logged_out_mid_tick():
+    """Logout can clear ``character`` while a combat tick is awaiting."""
+    class LoggedOut:
+        character = None
+
+    # The guarded method returns before touching any other session state.
+    await StatsMixin._regenerate(LoggedOut(), time.monotonic())

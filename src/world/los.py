@@ -22,7 +22,6 @@ code.
 from __future__ import annotations
 
 import math
-import os
 import sqlite3
 from dataclasses import dataclass
 from typing import Iterable, Sequence
@@ -94,20 +93,23 @@ def has_line_of_sight(start: Sequence[float], end: Sequence[float],
     return True
 
 
-_cache: dict[str, tuple[float, list[SightBlocker]]] = {}
+_cache: dict[str, list[SightBlocker]] = {}
 
 
 def load_blockers(path: str) -> list[SightBlocker]:
-    """Load and cache blockers from ``sight_blockers`` (empty when absent)."""
-    if not path or not os.path.exists(path):
-        return []
-    try:
-        mtime = os.path.getmtime(path)
-    except OSError:
+    """Load and cache blockers from ``sight_blockers`` (empty when absent).
+
+    The world database is regenerated offline (the docs require stopping the
+    server first), so the blocker set is process-static.  Earlier versions
+    statted the database on every line-of-sight query; on Windows that
+    filesystem metadata call can block for hundreds of milliseconds during
+    combat, freezing the whole event loop.  Load once and keep it cached.
+    """
+    if not path:
         return []
     cached = _cache.get(path)
-    if cached is not None and cached[0] == mtime:
-        return cached[1]
+    if cached is not None:
+        return cached
     try:
         con = sqlite3.connect(path)
         try:
@@ -125,7 +127,7 @@ def load_blockers(path: str) -> list[SightBlocker]:
                      float(row[6]))
         for row in rows
     ]
-    _cache[path] = (mtime, blockers)
+    _cache[path] = blockers
     return blockers
 
 

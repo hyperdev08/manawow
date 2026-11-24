@@ -15,6 +15,7 @@ from src.world import databases
 from src.world import gameobject
 from src.world import geometry
 from src.world import graveyard
+from src.world import los
 from src.world import quests
 from src.world.groups import GroupManager
 from src.world.world_combat import WorldCombatManager
@@ -110,6 +111,24 @@ class WorldServer:
             self.log.info(f"World client disconnected: {peer}")
 
     async def start(self):
+        # Load the static LOS blocker set off the event loop.  A per-query
+        # mtime/exists check used to block the loop on Windows during combat.
+        world_path = self.config.database.world_path
+        await asyncio.to_thread(los.load_blockers, world_path)
+        # Spawn-pool trees take a few hundred milliseconds to build.  Warm them
+        # before accepting players so the first login does not compete with
+        # that Python work for the GIL while the client is loading.
+        try:
+            gameobject_pools, creature_pools = await asyncio.gather(
+                asyncio.to_thread(gameobject.GameObjectPools.load, world_path),
+                asyncio.to_thread(gameobject.load_creature_pools, world_path),
+            )
+            self.gameobjects.pools = gameobject_pools
+            self.creature_pools = creature_pools
+        except Exception as exc:
+            # A damaged/missing pool table is not fatal; the lazy per-login
+            # load will retry and the rest of the world still starts.
+            self.log.warning(f"Could not preload spawn pools: {exc}")
         # Remove persisted groups whose reconnect window elapsed while the
         # server was offline (or before the first player logs in).
         await self.groups.expire_offline_groups()
