@@ -18,7 +18,12 @@ from typing import Dict, Iterable, List, Optional, Tuple
 from src.protocol.opcodes import Opcodes
 from src.world import character_db
 from src.world import creature
+from src.world import gameobject
 from src.world import quests as Q
+from src.world import update_fields as F
+
+# How close a quest object (wanted poster, quest book) must be to talk to it.
+QUEST_OBJECT_DISTANCE = 10.0
 
 MAX_PLAYER_LEVEL = 80
 EQUIP_ERR_INV_FULL = 50
@@ -67,6 +72,9 @@ class QuestsMixin:
             stored.update(fields)
         if hasattr(self, "_send_player_fields"):
             await self._send_player_fields(fields)
+        # Quest chests start or stop glittering for this player.
+        if hasattr(self, "refresh_gameobject_quest_flags"):
+            await self.refresh_gameobject_quest_flags()
 
     def _save_quest(self, quest_id: int, entry: dict) -> None:
         Q.save_quest(self.config.database.world_path, int(self.player_guid),
@@ -76,10 +84,35 @@ class QuestsMixin:
     # Quest giver lookup
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _giver_kind(spawn) -> str:
+        """``creature`` for NPC rows; objects and items carry ``giver_kind``."""
+        return spawn["giver_kind"] if "giver_kind" in spawn.keys() else Q.GIVER_CREATURE
+
+    def _quest_item_giver(self, guid: int):
+        """An item in the bags that starts a quest (``item_template.startquest``)."""
+        for item in (self.character or {}).get("inventory", {}).values():
+            if int(item.get("guid") or 0) != int(guid):
+                continue
+            entry = int(item["item_entry"])
+            if not Q.quests_started_by(self.config.database.world_path, entry, Q.GIVER_ITEM):
+                return None
+            return {"entry": entry, "giver_kind": Q.GIVER_ITEM, "guid": int(guid)}
+        return None
+
     def _questgiver_spawn(self, guid: int):
-        """Creature spawn for a quest giver guid, or ``None``."""
+        """The quest giver behind ``guid`` (creature, object or item), or ``None``."""
         if not guid or self._is_player_guid(guid):
             return None
+        if (int(guid) >> 48) == (F.ITEM_HIGH_GUID >> 48):
+            return self._quest_item_giver(guid)
+        if gameobject.is_gameobject_guid(guid):
+            spawn = (self._usable_gameobject(guid, max_distance=QUEST_OBJECT_DISTANCE)
+                     if hasattr(self, "_usable_gameobject") else None)
+            if spawn is None or not Q.is_quest_giver(
+                    self.config.database.world_path, int(spawn["entry"]), Q.GIVER_GAMEOBJECT):
+                return None
+            return dict(spawn, giver_kind=Q.GIVER_GAMEOBJECT)
         low_guid = creature.creature_low_guid(guid)
         spawn = self._get_creature_spawn(low_guid)
         if spawn is None:
@@ -88,9 +121,9 @@ class QuestsMixin:
             return None
         return spawn
 
-    def _questgiver_status(self, entry: int) -> int:
+    def _questgiver_status(self, entry: int, kind: str = Q.GIVER_CREATURE) -> int:
         return Q.giver_status(self.config.database.world_path, int(entry),
-                              self._quest_state())
+                              self._quest_state(), kind)
 
     async def handle_questgiver_status_query(self, data: bytes):
         """``CMSG_QUESTGIVER_STATUS_QUERY``: uint64 guid."""
@@ -98,7 +131,8 @@ class QuestsMixin:
             return
         guid = struct.unpack_from("<Q", data, 0)[0]
         spawn = self._questgiver_spawn(guid)
-        status = self._questgiver_status(int(spawn["entry"])) if spawn else Q.DIALOG_STATUS_NONE
+        status = (self._questgiver_status(int(spawn["entry"]), self._giver_kind(spawn))
+                  if spawn else Q.DIALOG_STATUS_NONE)
         await self.send_packet(Opcodes.SMSG_QUESTGIVER_STATUS,
                                Q.build_questgiver_status(guid, status))
 
@@ -115,6 +149,14 @@ class QuestsMixin:
             if spawn is None or not int(spawn["npc_flags"]) & Q.UNIT_NPC_FLAG_QUESTGIVER:
                 continue
             statuses.append((int(object_guid), self._questgiver_status(int(spawn["entry"]))))
+        path = self.config.database.world_path
+        for low_guid, spawn in list(getattr(self, "_gameobject_spawn_cache", {}).items()):
+            if int(spawn["type"]) != gameobject.GAMEOBJECT_TYPE_QUESTGIVER:
+                continue
+            if not Q.is_quest_giver(path, int(spawn["entry"]), Q.GIVER_GAMEOBJECT):
+                continue
+            statuses.append((int(self._visible_gameobjects[low_guid]),
+                             self._questgiver_status(int(spawn["entry"]), Q.GIVER_GAMEOBJECT)))
         await self.send_packet(Opcodes.SMSG_QUESTGIVER_STATUS_MULTIPLE,
                                Q.build_questgiver_status_multiple(statuses))
 
@@ -122,9 +164,9 @@ class QuestsMixin:
     # Opening a quest giver
     # ------------------------------------------------------------------
 
-    def _quest_menu(self, entry: int) -> List[Tuple[int, int]]:
+    def _quest_menu(self, entry: int, kind: str = Q.GIVER_CREATURE) -> List[Tuple[int, int]]:
         return Q.quest_menu(self.config.database.world_path, int(entry),
-                            self._quest_state())
+                            self._quest_state(), kind)
 
     def _gossip_quest_items(self, spawn) -> List[dict]:
         """Quest rows to append to a gossip window (empty when not a giver)."""
@@ -140,7 +182,7 @@ class QuestsMixin:
         Returns ``False`` when the creature has nothing to offer.
         """
         path = self.config.database.world_path
-        menu = self._quest_menu(int(spawn["entry"]))
+        menu = self._quest_menu(int(spawn["entry"]), self._giver_kind(spawn))
         if not menu:
             return False
         if len(menu) == 1:
@@ -210,7 +252,7 @@ class QuestsMixin:
     def _giver_has_quest(self, spawn, quest_id: int, ender: bool) -> bool:
         path = self.config.database.world_path
         relation = Q.quests_ended_by if ender else Q.quests_started_by
-        return int(quest_id) in relation(path, int(spawn["entry"]))
+        return int(quest_id) in relation(path, int(spawn["entry"]), self._giver_kind(spawn))
 
     async def handle_questgiver_query_quest(self, data: bytes):
         """``CMSG_QUESTGIVER_QUERY_QUEST``: guid, quest id, uint8 unk."""
@@ -270,12 +312,55 @@ class QuestsMixin:
         if spawn is None or quest is None or not self._giver_has_quest(spawn, quest_id, False):
             await self.send_packet(Opcodes.SMSG_GOSSIP_COMPLETE, b"")
             return
-        await self._accept_quest(quest)
+        accepted = await self._accept_quest(quest)
         await self.send_packet(Opcodes.SMSG_GOSSIP_COMPLETE, b"")
+        if self._giver_kind(spawn) == Q.GIVER_ITEM:
+            if accepted:
+                await self._consume_quest_starter(spawn, quest)
+            return
         await self.send_packet(
             Opcodes.SMSG_QUESTGIVER_STATUS,
-            Q.build_questgiver_status(guid, self._questgiver_status(int(spawn["entry"]))),
+            Q.build_questgiver_status(
+                guid, self._questgiver_status(int(spawn["entry"]), self._giver_kind(spawn))),
         )
+
+    async def _consume_quest_starter(self, giver, quest) -> None:
+        """``Player::AddQuestAndCheckCompletion``: the starting item is used up,
+        unless the quest itself asks for it."""
+        entry = int(giver["entry"])
+        if any(item == entry for item, _count in Q.item_objectives(quest)):
+            return
+        for slot, item in list(self.character.get("inventory", {}).items()):
+            if int(item.get("guid") or 0) == int(giver["guid"]):
+                await self._remove_item_from_slot(int(slot), 1, notify_quests=False)
+                return
+
+    async def handle_use_item(self, data: bytes):
+        """``CMSG_USE_ITEM``: only quest-starting items are handled here.
+
+        ``uint8 bag, uint8 slot, uint8 castCount, uint32 spellId,
+        uint64 itemGuid, ...``.  Items with an on-use spell (potions, food,
+        hearthstone) are item spell casting, part of #11.
+        """
+        if not self.in_world or not self.character or len(data) < 15:
+            return
+        item_guid = struct.unpack_from("<Q", data, 7)[0]
+        giver = self._quest_item_giver(item_guid)
+        if giver is None:
+            self.log.debug(f"Item use for {item_guid:#x}: only quest items are handled")
+            return
+        path = self.config.database.world_path
+        quest_id = Q.quests_started_by(path, giver["entry"], Q.GIVER_ITEM)[0]
+        quest = Q.get_quest_template(path, quest_id)
+        if quest is None:
+            return
+        state = self._quest_state()
+        if quest_id in self._quest_log_map():
+            await self._send_quest_invalid(Q.INVALIDREASON_QUEST_ALREADY_ON)
+        elif quest_id in state.rewarded and not Q.is_repeatable(quest):
+            await self._send_quest_invalid(Q.INVALIDREASON_QUEST_ALREADY_DONE)
+        else:
+            await self._send_quest_details(item_guid, quest)
 
     async def _accept_quest(self, quest) -> bool:
         """``Player::AddQuest``; returns ``True`` when the quest was added."""
@@ -486,6 +571,39 @@ class QuestsMixin:
                 await self.send_packet(
                     Opcodes.SMSG_QUESTUPDATE_ADD_KILL,
                     Q.build_questupdate_add_kill(quest_id, target, current + 1,
+                                                 required, guid),
+                )
+            if updated:
+                await self._quest_check_complete(quest_id, quest, state)
+                changed = True
+        if changed:
+            await self._send_visible_questgiver_statuses()
+
+    async def _quest_on_gameobject_used(self, guid: int, entry: int) -> None:
+        """``Player::KillCreditGO``: "use the object" objectives (negative ids)."""
+        log = self._quest_log_map()
+        if not log:
+            return
+        path = self.config.database.world_path
+        changed = False
+        for quest_id, state in list(log.items()):
+            if int(state["status"]) != Q.QUEST_STATUS_INCOMPLETE:
+                continue
+            quest = Q.get_quest_template(path, quest_id)
+            if quest is None:
+                continue
+            updated = False
+            for index, go_entry, required in Q.object_objectives(quest):
+                if go_entry != int(entry):
+                    continue
+                current = int(state["counts"][index])
+                if current >= required:
+                    continue
+                state["counts"][index] = current + 1
+                updated = True
+                await self.send_packet(
+                    Opcodes.SMSG_QUESTUPDATE_ADD_KILL,
+                    Q.build_questupdate_add_kill(quest_id, -go_entry, current + 1,
                                                  required, guid),
                 )
             if updated:

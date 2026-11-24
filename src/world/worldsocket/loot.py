@@ -11,6 +11,7 @@ from typing import Dict, List, Tuple
 from src.protocol.opcodes import Opcodes
 from src.world import character_db
 from src.world import creature
+from src.world import gameobject
 from src.world import login_packets
 from src.world import object_update
 from src.world import update_fields as F
@@ -112,8 +113,13 @@ class LootMixin:
             con.close()
         return [(entry, count) for entry, count in cleaned if entry in valid]
 
-    def _generate_loot(self, entry: int, loot_id: int = 0) -> List[Tuple[int, int]]:
+    LOOT_TABLES = frozenset(("creature_loot_template", "gameobject_loot_template"))
+
+    def _generate_loot(self, entry: int, loot_id: int = 0,
+                       table: str = "creature_loot_template") -> List[Tuple[int, int]]:
         """Roll ``creature_loot_template`` (including references) once.
+
+        ``table`` is ``gameobject_loot_template`` for chests, herbs and ore.
 
         ``loot_id`` is ``creature_template.LootId``; it defaults to the creature
         entry when the template has no separate loot id.  References are stored
@@ -123,12 +129,14 @@ class LootMixin:
         semantics.  Quest-only rows drop only for a player who needs the item;
         conditional rows are skipped because there is no condition engine.
         """
+        if table not in self.LOOT_TABLES:
+            raise ValueError(f"unknown loot table {table}")
         con = sqlite3.connect(self.config.database.world_path)
         try:
             rows = con.execute(
                 "SELECT item, chance_or_quest_chance, group_id, "
-                "mincount_or_ref, maxcount, condition_id "
-                "FROM creature_loot_template WHERE entry = ?",
+                f"mincount_or_ref, maxcount, condition_id FROM {table} "
+                "WHERE entry = ?",
                 (int(loot_id or entry),),
             ).fetchall()
             rolled: List[Tuple[int, int]] = []
@@ -269,6 +277,9 @@ class LootMixin:
         target = int(combat.get("loot_target") or 0)
         if not target:
             return
+        if gameobject.is_gameobject_guid(target):
+            self._persist_gameobject_loot(combat)
+            return
         remaining = self._remaining_loot(combat)
         money = int(combat.get("loot_money") or 0)
         if remaining or money:
@@ -362,7 +373,13 @@ class LootMixin:
         """Forget the open loot window without changing the stored loot."""
         combat = self._get_combat_state()
         target = int(combat.get("loot_target") or 0)
-        if target and hasattr(self, "_group_manager"):
+        if target and gameobject.is_gameobject_guid(target):
+            runtime = self._go_runtime()
+            low_guid = gameobject.gameobject_low_guid(target)
+            if runtime.looter.get(low_guid) == int(self.player_guid or 0):
+                runtime.looter.pop(low_guid, None)
+            await self._set_looting_flag(False)
+        elif target and hasattr(self, "_group_manager"):
             manager = self._group_manager()
             if manager is not None:
                 manager.release_loot(
@@ -383,6 +400,10 @@ class LootMixin:
             )
         # Clear in-memory state but KEEP loot in database for later.  Anything
         # already taken was persisted as soon as it was taken.
+        combat = self._get_combat_state()
+        target = int(combat.get("loot_target") or 0)
+        if target and gameobject.is_gameobject_guid(target):
+            await self._release_gameobject_loot(target, emptied=False)
         await self._close_loot()
 
     async def handle_loot_money(self, data: bytes):
@@ -420,6 +441,10 @@ class LootMixin:
         if self._remaining_loot(combat) or int(combat.get("loot_money") or 0) > 0:
             return False
         target = int(combat.get("loot_target") or 0)
+        if target and gameobject.is_gameobject_guid(target):
+            await self._close_loot()
+            await self._release_gameobject_loot(target, emptied=True)
+            return True
         if target:
             await self._send_creature_fields(
                 creature.creature_low_guid(target),

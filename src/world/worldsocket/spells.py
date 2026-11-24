@@ -9,6 +9,7 @@ import time
 
 from src.protocol.opcodes import Opcodes
 from src.world import creature
+from src.world import gameobject
 from src.world import object_update
 from src.world import spells
 
@@ -170,8 +171,18 @@ class SpellsMixin:
             await self._cast_failed(cast_id, spell_id, SPELL_FAILED_NOT_READY)
             return
 
+        # Opening spells target a game object; it has to be visible, spawned
+        # and within reach (the spells' range is the interaction distance).
+        go_target = bool(target_guid) and gameobject.is_gameobject_guid(target_guid)
+        if go_target:
+            reach = max(template.get_range(), gameobject.GAMEOBJECT_USE_DISTANCE)
+            if self._usable_gameobject(target_guid, max_distance=reach) is None:
+                await self._cast_failed(cast_id, spell_id, SPELL_FAILED_BAD_TARGETS)
+                return
+
         # A live target must be within the spell's range before anything else.
-        target_low = creature.creature_low_guid(target_guid) if target_guid else 0
+        target_low = (creature.creature_low_guid(target_guid)
+                      if target_guid and not go_target else 0)
         spawn = self._get_creature_spawn(target_low) if target_low else None
         is_peer_target = bool(
             hasattr(self, "_is_peer_player_guid") and target_guid
@@ -180,7 +191,7 @@ class SpellsMixin:
                        if is_peer_target
                        and hasattr(self, "_peer_session_for_guid") else None)
         if (target_guid and not self._is_player_guid(target_guid)
-                and not is_peer_target and spawn is None):
+                and not is_peer_target and spawn is None and not go_target):
             await self._cast_failed(cast_id, spell_id, SPELL_FAILED_BAD_TARGETS)
             return
         if target_peer is not None and target_peer.character:
@@ -221,7 +232,7 @@ class SpellsMixin:
 
         # Facing and line-of-sight checks.  Self-casts and caster-centred AoE
         # are exempt.  Weapon abilities always require the victim in front.
-        if target_guid and not self._is_player_guid(target_guid):
+        if target_guid and not self._is_player_guid(target_guid) and not go_target:
             needs_front = bool(
                 template.facing_caster_flags & spells.SPELL_FACING_FLAG_INFRONT
                 or template.has_weapon_effect())
@@ -1362,6 +1373,12 @@ class SpellsMixin:
             etype = int(effect["effect"])
             if not etype:
                 continue
+            if etype == spells.SPELL_EFFECT_OPEN_LOCK:
+                if target_guid and gameobject.is_gameobject_guid(target_guid):
+                    await self._open_lock(target_guid, int(template.id))
+                continue
+            if target_guid and gameobject.is_gameobject_guid(target_guid):
+                continue                    # no other effect acts on objects yet
             # Persistent ground auras (Blizzard, Consecration, Death and Decay,
             # ...) are created once per cast; their companion
             # PERIODIC_TRIGGER_SPELL effect supplies the tick damage.

@@ -974,6 +974,8 @@ class AurasMixin:
             flags |= UNIT_FLAG_SILENCED
         if mods["pacified"]:
             flags |= UNIT_FLAG_PACIFIED
+        if int(state.get("flags", 0)) & 0x00000400:      # UNIT_FLAG_LOOTING
+            flags |= 0x00000400
         if flags != state.get("flags"):
             state["flags"] = flags
             await self._send_player_fields({F.UNIT_FIELD_FLAGS: flags})

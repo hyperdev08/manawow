@@ -172,6 +172,7 @@ A real 3.3.5a client can now log in, pick a character and **enter the world**:
 - Corpse money uses the real `creature_template.MinLootGold` / `MaxLootGold` values imported from CMaNGOS (no synthetic level-based coins)
 - `CMSG_LOOT`, `CMSG_AUTOSTORE_LOOT_ITEM`, `CMSG_LOOT_MONEY`, `CMSG_LOOT_RELEASE`
 - Quest items (negative `ChanceOrQuestChance`) only drop for a player with an active, unfinished quest that needs them
+- Drop chances are stored as floats (`0.5`, `6.4011`...); refresh the loot tables of an older `world.db` with `python tools/import_wotlk_db.py --dump WoTLKDB.sql --loot-only`
 
 ### Quests
 - `quest_templates` (9,086 quests), `creature_quest_starters` / `creature_quest_enders` (from `creature_questrelation` / `creature_involvedrelation`) and `areatrigger_quests` (from `areatrigger_involvedrelation`) imported from CMaNGOS; an existing `world.db` gets them with `python tools/import_wotlk_db.py --dump WoTLKDB.sql --quests-only`
@@ -198,6 +199,34 @@ A real 3.3.5a client can now log in, pick a character and **enter the world**:
 - Not implemented yet: honor/token prices (`ExtendedCost`, those items are hidden), buyback, repair, reputation discounts, `condition_id`
 - Upgrade an existing `world.db` with `python tools/import_wotlk_db.py --dump WoTLKDB.sql --vendors-only`
 
+### Game objects
+- `gameobject_templates` (19,555) and `gameobject_spawns` (100,337) imported from CMaNGOS `gameobject_template` / `gameobject`, with `gameobject_addon` start states and animation progress and `gameobject_spawn_entry` for spawns without a fixed entry
+- `0xF110` object guids with the entry in bits 24-47; create blocks with stationary position, low guid and the packed int64 world rotation (TrinityCore `GameObject::UpdatePackedRotation`); doors and buttons with `startOpen` start open
+- `CMSG_GAMEOBJECT_QUERY` -> `SMSG_GAMEOBJECT_QUERY_RESPONSE` (name, icon, cast-bar caption, the 24 data fields, size, quest items)
+- Objects within 150 yards come with the login burst and are created/destroyed as the player moves; each map's spawns are read once, off the event loop, into an in-memory 64-yard grid, so visibility scans never query SQLite
+- `CMSG_GAMEOBJ_USE`: doors and buttons open/close for every player (with their auto-close timer); chests open their loot; chairs and benches seat the player on the nearest slot (same-map teleport + sit stand state); books and plaques open their pages (`SMSG_GAMEOBJECT_PAGETEXT` + `CMSG_PAGE_TEXT_QUERY`, 1,879 `page_text` rows); cameras start their cinematic; mailboxes open empty (no mail system yet)
+- Locked objects are opened by the client's spell (Opening, Herb Gathering, Mining...): `SPELL_EFFECT_OPEN_LOCK` on a game object target; the client checks the lock's skill against its own `Lock.dbc`
+- Object loot comes from `gameobject_loot_template` (15,862 rows) plus the template's min/max gold; consumable chests, herbs and ore despawn when emptied and respawn after `spawntimesecs`, reusable chests refill after their restock time
+- Quest chests are clickable and sparkle (`GAMEOBJECT_DYNAMIC`) only for players who need them
+- CMaNGOS pools (`pool_gameobject`, `pool_gameobject_template`, `pool_template`, `pool_pool`): only `max_limit` members of a pool exist at a time, and a used one is replaced by a new roll after its respawn time (29,763 pooled spawns)
+- Not shown: transports (elevators, boats) and spawns with a negative respawn time (script-only)
+- Quest objects: wanted posters and other QUESTGIVER objects start/end quests (`gameobject_questrelation` / `gameobject_involvedrelation`: 527 starters, 443 enders) through the usual quest windows; they are clickable (`GO_DYNFLAG_LO_ACTIVATE`) only while they have something for the player, re-checked on quest changes and level-up. The 3.3.5 client shows no "!" over objects and never queries their status
+- Goobers: page text, quest gating (`goober.questId`), "use the object" objectives (negative `ReqCreatureOrGOId`, credited like `Player::KillCreditGO`), custom animation or open state with auto-close, on-use spell, consumable despawn; quest goobers sparkle for players on the quest, generic quest objects only sparkle
+- Quest-starting items (`item_template.startquest`, 385 items): `CMSG_USE_ITEM` opens the quest; the item is used up on accept unless the quest asks for it. Other item use (potions, food, hearthstone) is item spell casting (#11)
+- CMaNGOS `spawn_group` limits (`MaxCount`, groups without a `WorldState` condition) are imported as pools for both objects and creatures
+- Not usable yet: traps, spell casters, meeting stones, fishing, summoned objects
+- Upgrade an existing `world.db` with `python tools/import_wotlk_db.py --dump WoTLKDB.sql --gameobjects-only`
+
+### Creature pools
+- `pool_creature`, `pool_creature_template` and `spawn_group` (with `MaxCount`, no `WorldState`) limit how many spawns of a group exist at once: rare spawns such as Gruff Swiftbite or Fedfennel show at one of their spawn points instead of all of them (715 pooled creatures)
+- Pools are loaded once per server, off the event loop, and filter the creature visibility scans
+- Refresh with `python tools/import_wotlk_db.py --dump WoTLKDB.sql --pools-only` (creature and object pools)
+- Not handled yet: `spawn_group` world-state conditions (day/night RP groups keep spawning) and creature spawns with `id = 0` that take their entry from `spawn_group_entry` (5,893 spawns are still skipped by the importer)
+
+### World events
+- There is no event calendar yet, so the world is shown with no world event active: creatures and objects that only spawn during an event (`game_event_creature` / `game_event_gameobject` with a positive event: Darkmoon Faire, Midsummer, Hallow's End, Winter Veil, the Arena Tournament realm NPCs...) are hidden; spawns removed during an event (negative event) stay
+- The links are stored in `creature_events` / `gameobject_events`; refresh them with `python tools/import_wotlk_db.py --dump WoTLKDB.sql --events-only`
+
 ### Chat + emotes
 - `CMSG_MESSAGECHAT` / `SMSG_MESSAGECHAT`: `/say`, `/yell`, `/whisper`, `/me` (emote)
 - `CMSG_TEXT_EMOTE`, `CMSG_EMOTE`, `CMSG_SET_SHEATHED`
@@ -223,6 +252,17 @@ python run_servers.py
 python run_auth.py
 python run_world.py
 ```
+
+### Finding event-loop stalls
+
+Every session runs on one asyncio loop, so a blocking call freezes all players at once. Start the servers with the stall watchdog to find them:
+
+```bash
+python run_servers.py --watchdog        # report stalls of 1 s or more
+python run_servers.py --watchdog 0.25   # or pick the threshold
+```
+
+Each stall is appended to `logs/stalls.log` with the stack of the loop thread at that moment (the line that is blocking, repeated every 2 s while it lasts) and its total duration once the loop answers again. The worldserver log gets a one-line warning per stall. `run_world.py` takes the same flag.
 
 ### Stopping the servers
 
@@ -375,12 +415,14 @@ wow335a-pyserver/
         │   ├── creature_movement.py
         │   ├── summons.py
         │   ├── loot.py
+        │   ├── gameobjects.py
         │   └── inventory.py
         ├── server.py
         ├── realmsocket.py  # thin facade, re-exports WorldSocket + constants
         ├── object_update.py
         ├── movement.py
         ├── creature.py
+        ├── gameobject.py  # game object schema, map grid, create blocks, query
         ├── spells.py
         ├── rune_costs.py
         ├── playercreateinfo.sql  # authentic level-1 spells + action bars

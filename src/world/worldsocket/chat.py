@@ -258,8 +258,12 @@ class ChatMixin:
 
         if len(data) < 4:
             return
-        stand_state = struct.unpack_from("<I", data, 0)[0]
+        await self._set_stand_state(struct.unpack_from("<I", data, 0)[0])
 
+    async def _set_stand_state(self, stand_state: int) -> None:
+        """Store byte 0 of ``UNIT_FIELD_BYTES_1`` and show it to everyone."""
+        if not self.in_world or not self.character:
+            return
         # Update the cached character's UNIT_FIELD_BYTES_1 byte 0
         from src.world import update_fields as F
 

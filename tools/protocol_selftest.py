@@ -43,6 +43,7 @@ from src.world import spells
 from src.world import update_fields as F
 from src.world import character_db
 from src.world import creature
+from src.world import gameobject
 from tools.init_db import init_databases
 
 
@@ -404,6 +405,7 @@ def parse_update_object(payload: bytes, compressed: bool) -> dict:
 
     player_block = None
     creature_blocks = []
+    gameobject_blocks = []
     for block_idx in range(block_count):
         update_type = body[pos]
         pos += 1
@@ -416,8 +418,16 @@ def parse_update_object(payload: bytes, compressed: bool) -> dict:
         # Items (TYPEID_ITEM = 1) have no movement info because their flags=0.
         # Player and creature blocks have UPDATEFLAG_LIVING | UPDATEFLAG_HAS_POSITION = 0x60
         has_movement = bool(flags & (object_update.UPDATEFLAG_LIVING | object_update.UPDATEFLAG_HAS_POSITION))
+        stationary = (type_id == gameobject.TYPEID_GAMEOBJECT)
 
-        if has_movement:
+        if stationary:
+            # Game objects: stationary x, y, z, o only (no MovementInfo).
+            move_flags = move_flags2 = move_time = 0
+            x, y, z, o = struct.unpack_from("<ffff", body, pos)
+            pos += 16
+            fall_time = 0.0
+            speeds = (0,) * 9
+        elif has_movement:
             move_flags = struct.unpack_from("<I", body, pos)[0]
             pos += 4
             move_flags2 = struct.unpack_from("<H", body, pos)[0]
@@ -441,6 +451,10 @@ def parse_update_object(payload: bytes, compressed: bool) -> dict:
         if flags & object_update.UPDATEFLAG_HIGHGUID:
             high_guid = struct.unpack_from("<I", body, pos)[0]
             pos += 4
+        rotation = None
+        if flags & gameobject.UPDATEFLAG_ROTATION:
+            rotation = struct.unpack_from("<q", body, pos)[0]
+            pos += 8
 
         mask_blocks = body[pos]
         pos += 1
@@ -452,6 +466,8 @@ def parse_update_object(payload: bytes, compressed: bool) -> dict:
             max_field = F.PLAYER_VALUES_COUNT
         elif type_id == object_update.TYPEID_UNIT:
             max_field = F.UNIT_END
+        elif type_id == gameobject.TYPEID_GAMEOBJECT:
+            max_field = F.GAMEOBJECT_END
         else:
             max_field = F.ITEM_END
         for field in range(max_field):
@@ -472,6 +488,7 @@ def parse_update_object(payload: bytes, compressed: bool) -> dict:
             "position": (x, y, z, o),
             "speeds": speeds,
             "high_guid": high_guid,
+            "rotation": rotation,
             "mask_blocks": mask_blocks,
             "values": values,
         }
@@ -480,9 +497,12 @@ def parse_update_object(payload: bytes, compressed: bool) -> dict:
             player_block = block_data
         elif type_id == object_update.TYPEID_UNIT:
             creature_blocks.append(block_data)
+        elif type_id == gameobject.TYPEID_GAMEOBJECT:
+            gameobject_blocks.append(block_data)
 
     assert player_block is not None, "no player block found in update object"
     player_block["creatures"] = creature_blocks
+    player_block["gameobjects"] = gameobject_blocks
     return player_block
 
 

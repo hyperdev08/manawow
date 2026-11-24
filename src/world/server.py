@@ -11,6 +11,7 @@ from src.common import sqlite_tuning
 from src.world.realmsocket import WorldSocket
 from src.world import character_db
 from src.world import creature
+from src.world import gameobject
 from src.world import geometry
 from src.world import quests
 from src.world.groups import GroupManager
@@ -28,6 +29,10 @@ class WorldServer:
         self.creature_combat = WorldCombatManager(self)
         # Party/raid membership (session-scoped until persisted group support).
         self.groups = GroupManager(self)
+        # Runtime state of game objects (opened doors, looted chests).
+        self.gameobjects = gameobject.GameObjectRuntime()
+        # Which pooled creatures exist (rare spawns); loaded on first use.
+        self.creature_pools = None
         self.packet_log = get_packet_log()
         self.packet_log.Initialize(config.logging.log_dir)
         # WAL + synchronous=NORMAL: rollback-journal commits blocked the event
@@ -40,6 +45,7 @@ class WorldServer:
         # orientation column to databases created before world entry existed).
         character_db.init_character_db(config.database.world_path)
         quests.init_quest_db(config.database.world_path)
+        gameobject.init_gameobject_db(config.database.world_path)
         world_geometry = geometry.get_geometry(config,
                                                config.database.world_path)
         if world_geometry is None:

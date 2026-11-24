@@ -1,6 +1,7 @@
 """Entering/leaving the world, respawns and creature visibility."""
 from __future__ import annotations
 
+import asyncio
 import sqlite3
 import struct
 import time
@@ -8,6 +9,7 @@ import time
 from src.protocol.opcodes import Opcodes
 from src.world import character_db
 from src.world import creature
+from src.world import gameobject
 from src.world import login_packets
 from src.world import object_update
 from src.world import update_fields as F
@@ -108,6 +110,7 @@ class WorldEntryMixin:
         # Static creatures are added to the same update packet so the client
         # receives the whole visible world in one atomic create update.
         creature_blocks = await self.send_npc_spawns()
+        creature_blocks += await self.send_gameobject_spawns()
         # Fetch known spells for this character
         known_spells = character_db.get_character_spells(
             self.config.database.world_path, self.player_guid
@@ -168,6 +171,7 @@ class WorldEntryMixin:
             self._visible_creatures = {}
             self._creature_spawn_cache = {}
             self._creature_scan_pos = None
+            self.forget_gameobjects()
             combat = self._get_combat_state()
             combat["idle"].clear()
             combat["idle_settle"].clear()
@@ -293,6 +297,7 @@ class WorldEntryMixin:
         self._visible_creatures = {}
         self._creature_spawn_cache = {}
         self._creature_scan_pos = None
+        await self.destroy_visible_gameobjects()
         idle = self._get_combat_state()["idle"]
         idle.clear()
         self._get_combat_state()["idle_settle"].clear()
@@ -333,6 +338,30 @@ class WorldEntryMixin:
             f"map {self.character['map']} zone {self.character['zone']}"
         )
 
+    async def _creature_pools(self):
+        """The world's creature pools (rare spawns), loaded once off the loop."""
+        server = getattr(self, "server", None)
+        holder = server if server is not None and hasattr(server, "creature_pools") else self
+        pools = getattr(holder, "creature_pools", None)
+        if pools is None:
+            pools = await asyncio.to_thread(
+                gameobject.load_creature_pools, self.config.database.world_path)
+            if getattr(holder, "creature_pools", None) is None:
+                holder.creature_pools = pools
+            pools = holder.creature_pools
+        return pools
+
+    async def _creature_spawns_near(self, x: float, y: float, z: float) -> list:
+        """Static creatures in range, without the pool members that are not up."""
+        spawns = creature.get_creature_spawns_near(
+            self.config.database.world_path,
+            int(self.character["map"]),
+            x, y, z,
+            CREATURE_VISIBILITY_RADIUS,
+        )
+        pools = await self._creature_pools()
+        return [row for row in spawns if not pools.is_hidden(int(row["guid"]))]
+
     async def send_npc_spawns(self) -> list[bytes]:
         """Return create blocks for the static creatures near the player."""
         if not self.character:
@@ -341,12 +370,7 @@ class WorldEntryMixin:
         if point is None:
             return []
         x, y, z = point
-        spawns = creature.get_creature_spawns_near(
-            self.config.database.world_path,
-            int(self.character["map"]),
-            x, y, z,
-            CREATURE_VISIBILITY_RADIUS,
-        )
+        spawns = await self._creature_spawns_near(x, y, z)
         self._visible_creatures = {
             int(row["guid"]): creature.creature_guid(
                 int(row["guid"]), int(row["entry"])
@@ -374,6 +398,7 @@ class WorldEntryMixin:
         """
         if not self.in_world or not self.character:
             return
+        await self.refresh_gameobject_visibility(force=force)
         point = self._creature_scan_point()
         if point is None:
             return
@@ -383,12 +408,7 @@ class WorldEntryMixin:
             if dx * dx + dy * dy + dz * dz < CREATURE_RESCAN_DISTANCE ** 2:
                 return
 
-        spawns = creature.get_creature_spawns_near(
-            self.config.database.world_path,
-            int(self.character["map"]),
-            point[0], point[1], point[2],
-            CREATURE_VISIBILITY_RADIUS,
-        )
+        spawns = await self._creature_spawns_near(point[0], point[1], point[2])
         current = {int(row["guid"]): row for row in spawns}
         # Summons are session-local and never appear in the spatial query, so
         # carry them across rescans instead of destroying them as "left range".
