@@ -1,4 +1,4 @@
-﻿"""Creature wander and waypoint movement generators."""
+"""Creature wander and waypoint movement generators."""
 from __future__ import annotations
 
 import math

@@ -13,6 +13,7 @@ sys.path.insert(0, ROOT)
 from src.protocol.opcodes import Opcodes
 from src.world import character_db, group_packets
 from src.world.groups import GroupManager
+from src.world.worldsocket.groups import GroupsMixin
 
 
 class FakeSession:
@@ -56,6 +57,15 @@ def _make_group(*sessions):
     server = FakeServer(*sessions)
     manager = server.groups
     leader, member = sessions[0], sessions[1]
+    asyncio.run(manager.invite(leader, member.character["name"]))
+    asyncio.run(manager.accept(member))
+    return manager, manager.group_for(leader.player_guid)
+
+
+def _make_group_with_path(path, leader, member):
+    server = FakeServer(leader, member)
+    manager = server.groups
+    manager.load(path)
     asyncio.run(manager.invite(leader, member.character["name"]))
     asyncio.run(manager.accept(member))
     return manager, manager.group_for(leader.player_guid)
@@ -382,6 +392,51 @@ def test_ready_check_and_target_icons():
         assert group.target_icons[2] == 0
 
     asyncio.run(flow())
+
+
+def test_restart_starts_offline_clock_when_saved_without_one(tmp_path):
+    path, leader_guid, member_guid = _make_db(tmp_path)
+    leader = FakeSession(leader_guid, "Leader")
+    member = FakeSession(member_guid, "Member")
+    manager, group = _make_group_with_path(path, leader, member)
+    assert group.offline_since == 0
+
+    restarted = GroupManager(FakeServer())
+    restarted.load(path)
+    loaded = restarted.group_for(leader_guid)
+    assert loaded is not None
+    assert loaded.offline_since > 0
+
+
+def test_forget_character_removes_a_deleted_member(tmp_path):
+    path, leader_guid, member_guid = _make_db(tmp_path)
+    leader = FakeSession(leader_guid, "Leader")
+    member = FakeSession(member_guid, "Member")
+    manager, group = _make_group_with_path(path, leader, member)
+    assert member_guid in group.members
+
+    asyncio.run(manager.forget_character(member_guid))
+    assert member_guid not in group.members
+    assert manager.group_for(member_guid) is None
+
+
+def test_raid_target_handler_accepts_the_9_byte_packet():
+    leader = FakeSession(100, "Leader")
+    member = FakeSession(200, "Member")
+    manager, group = _make_group(leader, member)
+
+    class Handler:
+        player_guid = 100
+
+        def _group_manager(self):
+            return manager
+
+        async def send_packet(self, opcode, payload=b""):
+            pass
+
+    asyncio.run(GroupsMixin.handle_raid_target_update(
+        Handler(), struct.pack("<BQ", 2, 4242)))
+    assert group.target_icons[2] == 4242
 
 
 def test_roll_timer_passes_silent_members():

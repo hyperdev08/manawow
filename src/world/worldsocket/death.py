@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import asyncio
 import math
-import sqlite3
 import struct
 import time
 
@@ -25,13 +24,7 @@ SPIRIT_HEAL_RESURRECT_PERCENT = 0.5
 
 
 def _write_item_durability(path: str, rows) -> None:
-    con = sqlite3.connect(path)
-    try:
-        con.executemany(
-            "UPDATE character_items SET durability = ? WHERE id = ?", rows)
-        con.commit()
-    finally:
-        con.close()
+    character_db.update_item_durability(path, rows)
 
 
 class DeathMixin:

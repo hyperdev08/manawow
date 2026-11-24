@@ -167,7 +167,7 @@ class GroupsMixin:
             if group is not None:
                 await manager.send_target_icons(self, group)
             return
-        if len(data) < 10:
+        if len(data) < 9:
             return
         target_guid = struct.unpack_from("<Q", data, 1)[0]
         await manager.set_target_icon(self, int(icon_id), int(target_guid))

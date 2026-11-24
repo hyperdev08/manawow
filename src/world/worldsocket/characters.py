@@ -82,6 +82,9 @@ class CharactersMixin:
                 self.log.warning("CMSG_CHAR_DELETE with guid 0")
             elif character_db.delete_character(self.config.database.world_path, self.account_id, guid):
                 result = CHAR_DELETE_SUCCESS
+                groups = getattr(getattr(self, "server", None), "groups", None)
+                if groups is not None:
+                    await groups.forget_character(guid)
                 self.log.info(f"Deleted character guid {guid} for account {self.account_name}")
             else:
                 # Not owned by this account, or already gone.

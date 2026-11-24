@@ -239,6 +239,13 @@ class GroupManager:
                 continue
             if group.leader_guid not in group.members:
                 group.leader_guid = next(iter(group.members))
+            # A persisted group with offline_since = 0 was saved while someone
+            # was online.  After a restart/crash nobody is, so start the
+            # reconnect countdown now instead of keeping the group forever.
+            if not group.offline_since and not any(
+                    self.session_for(member.guid) is not None
+                    for member in group.members.values()):
+                group.offline_since = int(time.time())
             self.groups[group.id] = group
             max_id = max(max_id, group.id)
         self._next_id = max_id + 1
@@ -456,6 +463,17 @@ class GroupManager:
             await self.disband(group, notify=False)
             for session in sessions:
                 await self.send_empty_group_list(session)
+
+    async def forget_character(self, character_guid: int) -> None:
+        """Remove a deleted character from groups and pending invitations."""
+        guid = int(character_guid or 0)
+        if not guid:
+            return
+        group = self.invites.pop(guid, None)
+        if group is not None:
+            group.invites.discard(guid)
+            await self._persist(group)
+        await self.leave(guid)
 
     async def leave(self, session_or_guid) -> None:
         guid = (int(session_or_guid.player_guid)

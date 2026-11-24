@@ -346,7 +346,7 @@ regenerating the world bank never touches player data.  A legacy combined
 characters, items, spells and quest logs it contains are copied into
 `data/characters.db`, and the old file is left untouched.
 
-The worldserver also creates and migrates the character, creature and spell tables when it starts, so a checkout made before a schema addition still works without re-running `init_db.py`.
+The worldserver also creates and migrates the character, creature and spell tables when it starts, so a checkout made before a schema addition still works without re-running `init_db.py`.  The GitHub Actions test workflow caches the pinned dump and runs `python tools/import_wotlk_db.py --db data/world.db --combined`; the unit tests use that single-file layout, while a normal server still splits characters into `data/characters.db`.  Tests that need the generated world bank skip automatically when it is absent.
 
 ### Downloading terrain, VMaps and MMaps
 

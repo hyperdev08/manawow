@@ -1,4 +1,4 @@
-﻿"""Combat loop, melee swings and attacker state updates."""
+"""Combat loop, melee swings and attacker state updates."""
 from __future__ import annotations
 
 import asyncio

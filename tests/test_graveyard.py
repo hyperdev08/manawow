@@ -18,6 +18,7 @@ def _seed(path: str) -> None:
                 (2, 0, 100.0, 0.0, 10.0, 0.0, "Zone/both"),
                 (3, 0, 50.0, 0.0, 10.0, 0.0, "Other team"),
                 (4, 1, 0.0, 0.0, 10.0, 0.0, "Dungeon fallback"),
+                (5, 0, 0.0, 0.0, 10.0, 0.0, "Enemy-only zone"),
             ],
         )
         con.executemany(
@@ -28,6 +29,7 @@ def _seed(path: str) -> None:
                 (2, 12, 0, 0),
                 (3, 12, 0, graveyard.TEAM_HORDE),
                 (4, 999, 0, graveyard.TEAM_ALLIANCE),
+                (5, 13, 0, graveyard.TEAM_HORDE),
             ],
         )
         con.commit()
@@ -45,6 +47,16 @@ def test_zone_and_team_win_over_distance(tmp_path):
     grave = graveyard.closest_graveyard(
         path, 0, 12, 49.0, 0.0, 10.0, race=2)
     assert grave is not None and grave["id"] == 3
+
+
+def test_enemy_faction_graveyard_is_never_selected(tmp_path):
+    path = str(tmp_path / "graves.db")
+    _seed(path)
+    # Zone 13 only links the Horde graveyard; an Alliance ghost must fall back
+    # to its same-map team graveyard instead of the enemy one.
+    grave = graveyard.closest_graveyard(
+        path, 0, 13, 0.0, 0.0, 10.0, race=1)
+    assert grave is not None and grave["id"] != 5
 
 
 def test_falls_back_to_same_map_then_other_map(tmp_path):

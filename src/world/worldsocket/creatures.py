@@ -1,4 +1,4 @@
-﻿"""Creature spawn state, health, aggro and combat ticks."""
+"""Creature spawn state, health, aggro and combat ticks."""
 from __future__ import annotations
 
 import asyncio
@@ -135,10 +135,12 @@ class CreaturesMixin:
         await self._send_creature_packet(int(low_guid), opcode, payload)
 
     def _creature_health(self, guid: int) -> int:
-        """Get the current health of a creature from the DB.
+        """Get the current health, preferring the shared in-memory value.
 
         ``dead_since > 0`` marks a corpse even though ``current_health`` is 0
-        both for a corpse and for a spawn that has never been damaged.
+        both for a corpse and for a spawn that has never been damaged.  The
+        database write is asynchronous, so reading the row back after every
+        hit would lose the second hit of the same combat tick.
         """
         low_guid = creature.creature_low_guid(guid)
         spawn = self._get_creature_spawn(low_guid)
@@ -146,6 +148,15 @@ class CreaturesMixin:
             return 0
         if int(spawn["dead_since"] or 0) > 0:
             return 0
+        manager = self._creature_combat_manager()
+        if manager is not None:
+            health = manager.get_health(low_guid, spawn)
+            if health is not None:
+                return max(0, int(health))
+        combat = self._get_combat_state()
+        cached = combat.setdefault("creature_health", {})
+        if int(low_guid) in cached:
+            return max(0, int(cached[int(low_guid)]))
         current = int(spawn["current_health"] or 0)
         if current > 0:
             return current
@@ -158,15 +169,22 @@ class CreaturesMixin:
         return max(1, int(base * multiplier))
 
     def _set_creature_health(self, low_guid: int, health: int) -> None:
-        """Persist a creature's current health (summons stay in memory)."""
-        summon = getattr(self, "_summoned_creatures", {}).get(int(low_guid))
+        """Update the authoritative health in memory, then persist lazily."""
+        low_guid = int(low_guid)
+        health = max(0, int(health))
+        summon = getattr(self, "_summoned_creatures", {}).get(low_guid)
         if summon is not None:
-            summon["current_health"] = max(0, int(health))
+            summon["current_health"] = health
             return
+        combat = self._get_combat_state()
+        combat.setdefault("creature_health", {})[low_guid] = health
+        manager = self._creature_combat_manager()
+        if manager is not None:
+            manager.set_health(low_guid, health)
         submit_db_write(
             execute_write, self.config.database.world_path,
             "UPDATE creature_spawns SET current_health = ? WHERE guid = ?",
-            (max(0, int(health)), int(low_guid)),
+            (health, low_guid),
         )
 
     def _get_creature_spawn(self, low_guid: int):
@@ -909,6 +927,9 @@ class CreaturesMixin:
             if manager is not None:
                 manager.forget(int(low_guid))
                 manager.forget_idle(int(low_guid))
+                manager.forget_health(int(low_guid))
+            self._get_combat_state().setdefault(
+                "creature_health", {}).pop(int(low_guid), None)
             groups = getattr(getattr(self, "server", None), "groups", None)
             if groups is not None:
                 groups.forget_corpse(int(low_guid))

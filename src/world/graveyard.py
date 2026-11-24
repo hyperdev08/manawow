@@ -96,6 +96,10 @@ def closest_graveyard(path: str, map_id: int, zone: int, x: float, y: float,
     for row in rows:
         ghost_loc = int(row[7] or 0)
         faction = int(row[8] or 0)
+        # A graveyard explicitly linked to the enemy team must never be used,
+        # even when it is the closest one on the map/instance.
+        if faction and team and faction != team:
+            continue
         if ghost_loc == zone and faction == team:
             rank = 0
         elif ghost_loc == zone and faction == 0:

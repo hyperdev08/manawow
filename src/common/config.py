@@ -113,6 +113,8 @@ class Config:
                          else str(raw_client_data)),
             group_offline_expiry=int(get(
                 raw, "worldserver", "group_offline_expiry", default=300)),
+            start_money=int(get(
+                raw, "worldserver", "start_money", default=0)),
         )
         world_path = str(get(raw, "database", "world_path",
                              default="./data/world.db"))

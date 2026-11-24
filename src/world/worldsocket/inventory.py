@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import struct
 
-from src.common.db_io import execute_write, run_db_write
+from src.common.db_io import run_db_write
 from src.protocol.opcodes import Opcodes
 from src.world import character_db
 from src.world import login_packets
@@ -274,10 +274,9 @@ class InventoryMixin:
 
         new_count = current - int(count)
         await run_db_write(
-            execute_write, self.config.database.world_path,
-            "UPDATE character_items SET stack_count = ? "
-            "WHERE character_guid = ? AND slot = ?",
-            (new_count, self.player_guid, internal_slot),
+            character_db.update_character_item_stack,
+            self.config.database.world_path, int(self.player_guid),
+            int(internal_slot), new_count,
         )
         item["stack_count"] = new_count
         opcode, payload = object_update.build_item_values_update(

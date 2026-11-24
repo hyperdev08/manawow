@@ -799,6 +799,56 @@ async def test_fled_creature_does_not_reset_while_victim_stays_near_home():
         reset.assert_awaited_once_with(5)
 
 
+class _HealthUnit(CreaturesMixin):
+    """A minimal session whose creature health comes from the new cache."""
+
+    def __init__(self):
+        self.config = types.SimpleNamespace(
+            database=types.SimpleNamespace(world_path="unused.db"))
+        self.character = {"guid": 1, "name": "Tester", "map": 0}
+        self.player_guid = 1
+        self._combat_state = {
+            "aggro": {}, "creature_health": {}, "in_combat": False,
+        }
+        self._summoned_creatures = {}
+        self._spawns = {
+            5: {"guid": 5, "entry": 1005, "map": 0, "x": 0.0, "y": 0.0,
+                "z": 0.0, "o": 0.0, "dead_since": 0, "base_health": 100,
+                "hp_multiplier": 1.0, "current_health": 100, "level": 1,
+                "min_level": 1, "max_level": 1},
+        }
+
+    def _get_combat_state(self):
+        return self._combat_state
+
+    def _creature_combat_manager(self):
+        return None
+
+    def _get_creature_spawn(self, low_guid):
+        return self._spawns.get(int(low_guid))
+
+    async def _send_creature_fields(self, low_guid, fields):
+        pass
+
+    def _aggro_creature(self, low_guid):
+        pass
+
+    def _add_threat(self, *args, **kwargs):
+        pass
+
+
+@_async_test
+async def test_two_hits_in_one_tick_both_apply_while_db_write_is_queued():
+    unit = _HealthUnit()
+    guid = creature.creature_guid(5, 1005)
+    with mock.patch("src.world.worldsocket.creatures.submit_db_write"):
+        assert not await unit._deal_damage_to_creature(guid, 30)
+        assert not await unit._deal_damage_to_creature(guid, 30)
+    # The row still says 100 because the writes are asynchronous.
+    assert unit._spawns[5]["current_health"] == 100
+    assert unit._creature_health(guid) == 40
+
+
 def test_spell_template_lookup_is_cached():
     """Hot combat/aura lookups must not open SQLite on every tick."""
     spells.clear_caches()

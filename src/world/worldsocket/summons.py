@@ -1,4 +1,4 @@
-﻿"""Summoned creatures: pets and guardians created by spells.
+"""Summoned creatures: pets and guardians created by spells.
 
 The world database only describes static spawns, so a summon is a session-local
 ``creature_spawns``-shaped row.  The guid allocator uses the top of the 24-bit

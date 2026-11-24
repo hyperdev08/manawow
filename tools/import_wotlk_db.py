@@ -2191,6 +2191,9 @@ def main() -> None:
                         help="re-download the pinned CMaNGOS dump even when "
                              "the cached copy is valid")
     parser.add_argument("--db", help="target SQLite world database (default: config/config.yaml)")
+    parser.add_argument("--combined", action="store_true",
+                        help="keep the character tables inside the world database "
+                             "(used by CI and the unit-test suite)")
     parser.add_argument("--rune-cost-dbc", help="path to the client's SpellRuneCost.dbc")
     parser.add_argument("--spell-duration-dbc",
                         help="path to the client's SpellDuration.dbc")
@@ -2228,7 +2231,9 @@ def main() -> None:
     character_path = getattr(config.database, "character_path", "")
 
     db_path = args.db or config.database.world_path
-    if args.db:
+    if args.combined:
+        character_path = ""
+    elif args.db:
         # A custom world path gets a sibling characters.db, not the one from
         # config/config.yaml.
         character_path = os.path.join(
@@ -2275,6 +2280,9 @@ def main() -> None:
         from src.world.quests import init_world_quest_db
         init_world_quest_db(db_path)
         print(f"character database ready: {character_path}")
+    else:
+        from src.world.character_db import init_character_db
+        init_character_db(db_path)
 
     print(f"\nvisible spawns at each starting position ({os.path.abspath(db_path)}):")
     report_start_zones(db_path)

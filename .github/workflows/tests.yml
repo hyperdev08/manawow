@@ -24,5 +24,14 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements-dev.txt
 
+      - name: Cache pinned CMaNGOS dump
+        uses: actions/cache@v4
+        with:
+          path: data/cache
+          key: cmangos-5612dec4fd60
+
+      - name: Generate world database
+        run: python tools/import_wotlk_db.py --db data/world.db --combined
+
       - name: Run tests
         run: pytest -v

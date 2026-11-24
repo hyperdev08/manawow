@@ -72,6 +72,63 @@ def test_character_rows_are_written_to_the_separate_store(tmp_path):
     assert "item_templates" in world_tables
 
 
+def test_character_progress_and_item_writes_follow_the_character_store(
+        tmp_path):
+    world = str(tmp_path / "world.db")
+    characters = str(tmp_path / "characters.db")
+    _fresh_world(world)
+    con = sqlite3.connect(world)
+    con.execute(
+        "INSERT OR REPLACE INTO item_templates(entry, name1, stackable,"
+        " display_id) VALUES(159, 'Ice Cold Milk', 20, 100)")
+    con.commit()
+    con.close()
+
+    character_db.configure(world, characters)
+    character_db.init_split_databases(world, characters)
+    guid = character_db.create_character(
+        world, 1, "Splitwrite", 1, 4, 0, 0, 0, 0, 0, 0)
+    character_db.add_item_to_inventory(world, guid, 159, 3)
+    character_db.update_character_progress(world, guid, 7, 1234)
+    character_db.update_character_bytes(world, guid, "bytes1", 0x01020304)
+    character_db.update_character_bytes(world, guid, "bytes2", 0x05060708)
+    character_db.update_character_item_stack(world, guid, 256, 2)
+    character_db.update_character_item_enchant(world, guid, 15, 323)
+
+    store = sqlite3.connect(characters)
+    try:
+        row = store.execute(
+            "SELECT level, xp, bytes1, bytes2 FROM characters WHERE guid = ?",
+            (guid,)).fetchone()
+        assert row == (7, 1234, 0x01020304, 0x05060708)
+        item_id, stack, enchant = store.execute(
+            "SELECT id, stack_count, enchantment_2 FROM character_items"
+            " WHERE character_guid = ? AND slot = 256", (guid,)).fetchone()
+        assert (stack, enchant) == (2, 0)
+        character_db.update_item_durability(world, [(42, item_id)])
+        assert store.execute(
+            "SELECT durability FROM character_items WHERE id = ?",
+            (item_id,)).fetchone()[0] == 42
+    finally:
+        store.close()
+
+    # Deleting the character also removes its trainer/quest state.
+    character_db.set_character_skill(
+        world, guid, 182, 21, 1, 75, 1)
+    character_db.add_character_proficiency(world, guid, 2, 0x20)
+    assert character_db.delete_character(world, 1, guid)
+    store = sqlite3.connect(characters)
+    try:
+        assert store.execute(
+            "SELECT COUNT(*) FROM character_skills WHERE character_guid = ?",
+            (guid,)).fetchone()[0] == 0
+        assert store.execute(
+            "SELECT COUNT(*) FROM character_proficiencies"
+            " WHERE character_guid = ?", (guid,)).fetchone()[0] == 0
+    finally:
+        store.close()
+
+
 def test_legacy_combined_database_is_migrated_once(tmp_path):
     world = str(tmp_path / "world.db")
     characters = str(tmp_path / "characters.db")
@@ -123,10 +180,13 @@ def test_legacy_combined_database_is_migrated_once(tmp_path):
 def test_config_derives_a_sibling_character_database(tmp_path):
     config_path = tmp_path / "config.yaml"
     config_path.write_text(
+        "worldserver:\n"
+        "  start_money: 100\n"
         "database:\n"
         "  world_path: \"./data/world.db\"\n",
         encoding="utf-8")
     cfg = Config.load(config_path)
+    assert cfg.worldserver.start_money == 100
     assert os.path.normpath(cfg.database.character_path) == os.path.normpath(
         os.path.join(".", "data", "characters.db"))
 

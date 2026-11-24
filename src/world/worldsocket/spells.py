@@ -1,4 +1,4 @@
-﻿"""Player spell casting, power/cooldown spend and spell effects."""
+"""Player spell casting, power/cooldown spend and spell effects."""
 from __future__ import annotations
 
 import math
@@ -7,8 +7,9 @@ import sqlite3
 import struct
 import time
 
-from src.common.db_io import execute_write, run_db_write
+from src.common.db_io import run_db_write
 from src.protocol.opcodes import Opcodes
+from src.world import character_db
 from src.world import creature
 from src.world import databases
 from src.world import gameobject
@@ -1032,10 +1033,8 @@ class SpellsMixin:
             "max_duration": duration_ms / 1000.0,
         }
         await run_db_write(
-            execute_write, path,
-            "UPDATE character_items SET enchantment_2 = ?"
-            " WHERE character_guid = ? AND slot = ? AND slot IN (15,16)",
-            (enchant_id, int(self.player_guid or 0), slot),
+            character_db.update_character_item_enchant, path,
+            int(self.player_guid or 0), int(slot), enchant_id,
         )
         inventory = getattr(self, "character", {}).get("inventory") or {}
         item = inventory.get(int(slot))
@@ -2390,10 +2389,9 @@ class SpellsMixin:
         if entry is None:
             return
         await run_db_write(
-            execute_write, self.config.database.world_path,
-            "UPDATE character_items SET enchantment_2 = 0"
-            " WHERE character_guid = ? AND slot = ?",
-            (int(self.player_guid or 0), int(slot)),
+            character_db.update_character_item_enchant,
+            self.config.database.world_path, int(self.player_guid or 0),
+            int(slot), 0,
         )
         inventory = getattr(self, "character", {}).get("inventory") or {}
         item = inventory.get(int(slot))

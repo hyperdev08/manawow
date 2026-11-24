@@ -360,7 +360,8 @@ CREATE_CHARACTER_TABLES_SQL = _schema_subset(
     CREATE_CHARACTERS_SQL, {"characters", "character_items",
                             "character_spells", "character_skills",
                             "character_proficiencies", "character_corpses",
-                            "groups", "group_members"})
+                            "character_taxi_nodes", "groups",
+                            "group_members"})
 CREATE_WORLD_TEMPLATE_SQL = _schema_subset(
     CREATE_CHARACTERS_SQL, {"item_templates", "player_classlevelstats",
                             "player_levelstats"})
@@ -446,6 +447,7 @@ CHARACTER_TABLES = (
     "character_skills",
     "character_proficiencies",
     "character_corpses",
+    "character_taxi_nodes",
     "character_quests",
     "character_quests_rewarded",
     "groups",
@@ -983,6 +985,7 @@ def delete_character(path: str, account_id: int, guid: int) -> bool:
             from src.world import quests
             quests.delete_character_quests(con, guid)
             for table in ("character_items", "character_spells",
+                          "character_skills", "character_proficiencies",
                           "character_corpses"):
                 try:
                     con.execute(
@@ -2275,6 +2278,75 @@ def set_character_money(path: str, character_guid: int, money: int) -> None:
             "UPDATE characters SET money = ? WHERE guid = ?",
             (max(0, int(money)), int(character_guid)),
         )
+        con.commit()
+    finally:
+        con.close()
+
+
+def update_character_progress(path: str, character_guid: int, level: int,
+                              xp: int) -> None:
+    """Persist level/XP to the character bank (split-aware)."""
+    con = _connect(path)
+    try:
+        con.execute(
+            "UPDATE characters SET level = ?, xp = ? WHERE guid = ?",
+            (int(level), int(xp), int(character_guid)),
+        )
+        con.commit()
+    finally:
+        con.close()
+
+
+def update_character_bytes(path: str, character_guid: int, column: str,
+                           value: int) -> None:
+    """Persist one of the packed PLAYER_BYTES* fields."""
+    if column not in ("bytes1", "bytes2", "bytes3"):
+        raise ValueError(f"unsupported character bytes column {column!r}")
+    con = _connect(path)
+    try:
+        con.execute(
+            f"UPDATE characters SET {column} = ? WHERE guid = ?",
+            (int(value) & 0xFFFFFFFF, int(character_guid)),
+        )
+        con.commit()
+    finally:
+        con.close()
+
+
+def update_character_item_stack(path: str, character_guid: int, slot: int,
+                                count: int) -> None:
+    con = _connect(path)
+    try:
+        con.execute(
+            "UPDATE character_items SET stack_count = ?"
+            " WHERE character_guid = ? AND slot = ?",
+            (int(count), int(character_guid), int(slot)),
+        )
+        con.commit()
+    finally:
+        con.close()
+
+
+def update_character_item_enchant(path: str, character_guid: int, slot: int,
+                                  enchantment_2: int) -> None:
+    con = _connect(path)
+    try:
+        con.execute(
+            "UPDATE character_items SET enchantment_2 = ?"
+            " WHERE character_guid = ? AND slot = ?",
+            (int(enchantment_2), int(character_guid), int(slot)),
+        )
+        con.commit()
+    finally:
+        con.close()
+
+
+def update_item_durability(path: str, rows) -> None:
+    """Persist ``(durability, item_id)`` pairs to the character bank."""
+    con = _connect(path)
+    try:
+        con.executemany(
+            "UPDATE character_items SET durability = ? WHERE id = ?", rows)
         con.commit()
     finally:
         con.close()

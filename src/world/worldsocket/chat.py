@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import struct
 
-from src.common.db_io import execute_write, run_db_write
+from src.common.db_io import run_db_write
 from src.protocol.opcodes import Opcodes
 from src.world import character_db
 from src.world import login_packets
@@ -273,9 +273,9 @@ class ChatMixin:
 
         # Persist to DB
         await run_db_write(
-            execute_write, self.config.database.world_path,
-            "UPDATE characters SET bytes1 = ? WHERE guid = ?",
-            (new_bytes1, self.player_guid),
+            character_db.update_character_bytes,
+            self.config.database.world_path, int(self.player_guid),
+            "bytes1", new_bytes1,
         )
 
         # Send VALUES update to peers so they see the stand state change
@@ -355,9 +355,9 @@ class ChatMixin:
 
         # Persist to DB
         await run_db_write(
-            execute_write, self.config.database.world_path,
-            "UPDATE characters SET bytes2 = ? WHERE guid = ?",
-            (new_bytes2, self.player_guid),
+            character_db.update_character_bytes,
+            self.config.database.world_path, int(self.player_guid),
+            "bytes2", new_bytes2,
         )
 
         # Send VALUES update to peers so they see the weapon drawn/sheath change
