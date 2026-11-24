@@ -394,3 +394,149 @@ def test_build_pool_rows():
     assert rows["gameobject_pool_members"] == [(1, 10, 0.0), (2, 11, 25.5), (3, 11, 25.5)]
     assert rows["pool_templates"] == [(10, 1, "Chests")]
     assert rows["pool_pools"] == [(11, 12, 0.0)]
+
+
+
+# ----------------------------------------------------------------------
+# Chairs, books, cameras, mailboxes
+# ----------------------------------------------------------------------
+def _with_data(row, **data):
+    row.update({f"data{i}": 0 for i in range(24)})
+    row.update(data)
+    return row
+
+
+def test_chair_seat_picks_the_nearest_slot():
+    import math as _m
+    bench = _with_data(_spawn(x=0.0, y=0.0, o=0.0, size=1.0), data0=3)
+    # Facing +x, so the three seats lie on the y axis, one yard apart.
+    assert go.chair_seat(bench, 0.2, 5.0) == pytest.approx((0.0, 1.0), abs=1e-6)
+    assert go.chair_seat(bench, 0.2, -5.0) == pytest.approx((0.0, -1.0), abs=1e-6)
+    assert go.chair_seat(bench, 3.0, 0.1) == pytest.approx((0.0, 0.0), abs=1e-6)
+    stool = _with_data(_spawn(x=5.0, y=5.0, o=_m.pi / 3))
+    assert go.chair_seat(stool, 0.0, 0.0) == pytest.approx((5.0, 5.0))   # one slot
+
+
+def test_chair_stand_states():
+    assert go.chair_stand_state(_template(type=7, data1=0)) == 4     # low
+    assert go.chair_stand_state(_template(type=7, data1=2)) == 6     # high
+    assert go.chair_stand_state(_template(type=7, data1=9)) == 6     # clamped
+
+
+def test_page_text_chain(tmp_path):
+    db = str(tmp_path / "world.db")
+    go.init_gameobject_db(db)
+    con = sqlite3.connect(db)
+    con.executemany("INSERT INTO page_text(entry, text, next_page) VALUES(?,?,?)",
+                    [(1, "Chapter one", 2), (2, "Chapter two", 0), (5, "Loop", 5)])
+    con.commit()
+    con.close()
+    pages = go.build_page_text_responses(db, 1)
+    assert pages == [struct.pack("<I", 1) + b"Chapter one\x00" + struct.pack("<I", 2),
+                     struct.pack("<I", 2) + b"Chapter two\x00" + struct.pack("<I", 0)]
+    assert go.build_page_text_responses(db, 9) == [
+        struct.pack("<I", 9) + b"Item page missing.\x00" + struct.pack("<I", 0)]
+    assert len(go.build_page_text_responses(db, 5)) == 1                # no endless loop
+    assert go.text_page(_template(type=9, data0=1)) == 1
+    assert go.camera_cinematic(_template(type=13, data1=42)) == 42
+
+
+async def _roleplay_flow(tmp_path):
+    from src.world import movement
+    auth_db, world_db = str(tmp_path / "auth.db"), str(tmp_path / "world.db")
+    cfg = Config(
+        authserver=AuthConfig(host="127.0.0.1", port=0, realm_id=1, realm_name="T",
+                              realm_address="127.0.0.1", realm_build_min=st.BUILD,
+                              realm_build_max=st.BUILD),
+        worldserver=WorldConfig(host="127.0.0.1", port=0, realm_id=1, motd="T"),
+        database=DBConfig(auth_path=auth_db, world_path=world_db),
+        logging=LogConfig(level="WARNING", log_dir=str(tmp_path / "logs"), console=False),
+    )
+    init_databases(cfg)
+    x, y, z = START
+    con = sqlite3.connect(world_db)
+    _insert(con,
+            [_template(entry=601, type=go.GAMEOBJECT_TYPE_CHAIR, name="Wooden Bench",
+                       data0=2, data1=1),
+             _template(entry=602, type=go.GAMEOBJECT_TYPE_TEXT, name="Book", data0=77),
+             _template(entry=603, type=go.GAMEOBJECT_TYPE_CAMERA, name="Eye", data1=95)],
+            [_spawn(guid=11, entry=601, x=x + 3, y=y, z=z, o=0.0,
+                    type=go.GAMEOBJECT_TYPE_CHAIR),
+             _spawn(guid=12, entry=602, x=x - 3, y=y, z=z, type=go.GAMEOBJECT_TYPE_TEXT),
+             _spawn(guid=13, entry=603, x=x, y=y + 3, z=z, type=go.GAMEOBJECT_TYPE_CAMERA)])
+    con.execute("INSERT INTO page_text(entry, text, next_page) VALUES(77, 'Hello', 0)")
+    con.commit()
+    con.close()
+    go.clear_cache()
+    salt, verifier = SRP6.make_registration_data(st.USERNAME, st.PASSWORD)
+    con = sqlite3.connect(auth_db)
+    con.execute("INSERT INTO account(username, v, s, expansion) VALUES(?,?,?,2)",
+                (st.USERNAME, verifier, salt))
+    con.commit()
+    con.close()
+    server = WorldServer(cfg)
+    world = await asyncio.start_server(server.handle_client, "127.0.0.1", 0)
+    cfg.worldserver.port = world.sockets[0].getsockname()[1]
+    auth = await asyncio.start_server(AuthServer(cfg).handle_client, "127.0.0.1", 0)
+    cfg.authserver.port = auth.sockets[0].getsockname()[1]
+    writer = None
+    try:
+        session_key, _addr, realm_id = await st.authserver_flow("127.0.0.1", cfg.authserver.port)
+        reader, writer, crypt = await st.world_handshake(
+            "127.0.0.1", cfg.worldserver.port, st.USERNAME, session_key, realm_id)
+        create = b"Sitter\x00" + bytes([1, 1, 0, 0, 0, 0, 0, 0, 0])
+        await st.send_client_packet(writer, int(Opcodes.CMSG_CHAR_CREATE), create, crypt)
+        await st.read_server_packet(reader, crypt)
+        await st.send_client_packet(writer, int(Opcodes.CMSG_CHAR_ENUM), crypt=crypt)
+        _op, enum_payload = await st.read_server_packet(reader, crypt)
+        player = struct.unpack_from("<Q", enum_payload, 1)[0]
+        await st.send_client_packet(writer, int(Opcodes.CMSG_PLAYER_LOGIN),
+                                    struct.pack("<Q", player), crypt)
+        await st.read_login_burst(reader, crypt)
+
+        async def send(opcode, payload=b""):
+            await st.send_client_packet(writer, int(opcode), payload, crypt)
+
+        # Bench: teleported onto a seat and sitting on a medium chair.
+        await send(Opcodes.CMSG_GAMEOBJ_USE, struct.pack("<Q", _guid(11, 601)))
+        _op, payload, _ = await _read_until(reader, crypt, {Opcodes.MSG_MOVE_TELEPORT_ACK})
+        guid, pos = movement.parse_packed_guid(payload, 0)
+        assert guid == player
+        info, _end = movement.parse_movement_info(payload, pos + 4)
+        assert info.x == pytest.approx(x + 3) and info.z == pytest.approx(z)
+        assert abs(info.y - y) == pytest.approx(0.5, abs=1e-4)        # one of two seats
+        _op, payload, _ = await _read_until(reader, crypt, {Opcodes.SMSG_STANDSTATE_UPDATE})
+        assert payload == bytes([go.UNIT_STAND_STATE_SIT_LOW_CHAIR + 1])
+        session = next(s for s in server.sessions if s.player_guid == player)
+        assert session.character["bytes1"] & 0xFF == 5
+
+        # Book: page text window, then the pages on request.
+        await send(Opcodes.CMSG_GAMEOBJ_USE, struct.pack("<Q", _guid(12, 602)))
+        _op, payload, _ = await _read_until(reader, crypt, {Opcodes.SMSG_GAMEOBJECT_PAGETEXT})
+        assert struct.unpack("<Q", payload)[0] == _guid(12, 602)
+        await send(Opcodes.CMSG_PAGE_TEXT_QUERY, struct.pack("<IQ", 77, _guid(12, 602)))
+        _op, payload, _ = await _read_until(reader, crypt,
+                                            {Opcodes.SMSG_PAGE_TEXT_QUERY_RESPONSE})
+        assert payload == struct.pack("<I", 77) + b"Hello\x00" + struct.pack("<I", 0)
+
+        # Camera: cinematic.
+        await send(Opcodes.CMSG_GAMEOBJ_USE, struct.pack("<Q", _guid(13, 603)))
+        _op, payload, _ = await _read_until(reader, crypt, {Opcodes.SMSG_TRIGGER_CINEMATIC})
+        assert payload == struct.pack("<I", 95)
+
+        # Mailbox: empty list.
+        await send(Opcodes.CMSG_GET_MAIL_LIST, struct.pack("<Q", 1))
+        _op, payload, _ = await _read_until(reader, crypt, {Opcodes.SMSG_MAIL_LIST_RESULT})
+        assert payload == struct.pack("<IB", 0, 0)
+    finally:
+        if writer is not None:
+            writer.close()
+        world.close()
+        auth.close()
+        await world.wait_closed()
+        await auth.wait_closed()
+        go.clear_cache()
+
+
+def test_chairs_books_cameras_and_mailboxes(tmp_path):
+    asyncio.run(_roleplay_flow(tmp_path))

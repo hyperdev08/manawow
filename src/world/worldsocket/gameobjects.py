@@ -9,6 +9,7 @@ import time
 from src.protocol.opcodes import Opcodes
 from src.world import gameobject
 from src.world import login_packets
+from src.world import movement
 from src.world import object_update
 from src.world import quests as Q
 from src.world import update_fields as F
@@ -312,6 +313,19 @@ class GameObjectsMixin:
             await self._toggle_gameobject(spawn)
         elif go_type == gameobject.GAMEOBJECT_TYPE_CHEST:
             await self._open_gameobject_loot(guid, spawn)
+        elif go_type == gameobject.GAMEOBJECT_TYPE_CHAIR:
+            await self._sit_on_chair(spawn)
+        elif go_type == gameobject.GAMEOBJECT_TYPE_TEXT:
+            # The client asks for the pages itself (CMSG_PAGE_TEXT_QUERY).
+            await self.send_packet(Opcodes.SMSG_GAMEOBJECT_PAGETEXT,
+                                   struct.pack("<Q", int(guid)))
+        elif go_type == gameobject.GAMEOBJECT_TYPE_CAMERA:
+            cinematic = gameobject.camera_cinematic(spawn)
+            if cinematic:
+                await self.send_packet(Opcodes.SMSG_TRIGGER_CINEMATIC,
+                                       struct.pack("<I", cinematic))
+        elif go_type == gameobject.GAMEOBJECT_TYPE_MAILBOX:
+            pass                        # the client opens the frame itself
         else:
             self.log.debug(f"Using game object type {go_type} ({spawn['name']}) "
                            "is not implemented yet")
@@ -328,6 +342,58 @@ class GameObjectsMixin:
         else:
             runtime.set_state(low_guid, new_state, gameobject.auto_close_seconds(spawn))
         await self._broadcast_gameobject_state(spawn, new_state)
+
+    async def _sit_on_chair(self, spawn) -> None:
+        """Move onto the nearest seat and sit (``GameObject::Use`` CHAIR)."""
+        x, y = gameobject.chair_seat(spawn, float(self.character["x"]),
+                                     float(self.character["y"]))
+        z, o = float(spawn["z"]), float(spawn["o"] or 0.0)
+        await self._teleport_nearby(x, y, z, o)
+        state = gameobject.chair_stand_state(spawn)
+        await self._set_stand_state(state)
+        # Unit::SetStandState tells the player's own client explicitly.
+        await self.send_packet(Opcodes.SMSG_STANDSTATE_UPDATE, struct.pack("<B", state))
+
+    async def _teleport_nearby(self, x: float, y: float, z: float, o: float) -> None:
+        """Same-map teleport: ``MSG_MOVE_TELEPORT_ACK`` to the player, ``MSG_MOVE_TELEPORT`` to others."""
+        self.character["x"], self.character["y"] = float(x), float(y)
+        self.character["z"], self.character["o"] = float(z), float(o)
+        info = movement.MovementInfo(time=self._server_tick_ms(), x=float(x), y=float(y),
+                                     z=float(z), o=float(o))
+        self.movement_info = info
+        self._teleport_counter = getattr(self, "_teleport_counter", 0) + 1
+        await self.send_packet(
+            Opcodes.MSG_MOVE_TELEPORT_ACK,
+            movement.pack_guid(int(self.player_guid))
+            + struct.pack("<I", self._teleport_counter)
+            + movement.build_movement_info(info))
+        if hasattr(self, "send_packet_to_peers"):
+            await self.send_packet_to_peers(
+                Opcodes.MSG_MOVE_TELEPORT,
+                movement.build_movement_packet(int(self.player_guid), info))
+        self.persist_position(force=True)
+
+    async def handle_teleport_ack(self, data: bytes):
+        """``MSG_MOVE_TELEPORT_ACK`` from the client: the near teleport is done."""
+        self.log.debug("Near teleport acknowledged")
+
+    async def handle_page_text_query(self, data: bytes):
+        """``CMSG_PAGE_TEXT_QUERY``: ``uint32 pageID, uint64 guid``."""
+        if len(data) < 4:
+            return
+        page_id = struct.unpack_from("<I", data, 0)[0]
+        for payload in gameobject.build_page_text_responses(
+                self.config.database.world_path, page_id):
+            await self.send_packet(Opcodes.SMSG_PAGE_TEXT_QUERY_RESPONSE, payload)
+
+    async def handle_get_mail_list(self, data: bytes):
+        """``CMSG_GET_MAIL_LIST``: there is no mail system yet, the box is empty."""
+        await self.send_packet(Opcodes.SMSG_MAIL_LIST_RESULT, struct.pack("<IB", 0, 0))
+
+    async def handle_query_next_mail_time(self, data: bytes):
+        """``MSG_QUERY_NEXT_MAIL_TIME``: no unread mail (``-DAY``, no senders)."""
+        await self.send_packet(Opcodes.MSG_QUERY_NEXT_MAIL_TIME,
+                               struct.pack("<fI", -86400.0, 0))
 
     # ------------------------------------------------------------------
     # Loot

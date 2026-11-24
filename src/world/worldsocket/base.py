@@ -252,6 +252,14 @@ class SocketBase:
                 await self.handle_gameobject_use(data)
             elif opcode == Opcodes.CMSG_GAMEOBJ_REPORT_USE:
                 pass                      # achievement criteria only
+            elif opcode == Opcodes.CMSG_PAGE_TEXT_QUERY:
+                await self.handle_page_text_query(data)
+            elif opcode == Opcodes.CMSG_GET_MAIL_LIST:
+                await self.handle_get_mail_list(data)
+            elif opcode == Opcodes.MSG_QUERY_NEXT_MAIL_TIME:
+                await self.handle_query_next_mail_time(data)
+            elif opcode == Opcodes.MSG_MOVE_TELEPORT_ACK:
+                await self.handle_teleport_ack(data)
             elif opcode == Opcodes.CMSG_GOSSIP_HELLO:
                 await self.handle_gossip_hello(data)
             elif opcode == Opcodes.CMSG_GOSSIP_SELECT_OPTION:

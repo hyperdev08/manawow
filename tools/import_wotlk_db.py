@@ -1200,6 +1200,8 @@ def import_world(dump_path: str, db_path: str, clear: bool = True,
             gameobject_tables.get("gameobject_loot_template") or ()))
         counts["gameobject_pool_members"] = insert_gameobject_pool_rows(
             con, build_gameobject_pool_rows(gameobject_tables, go_spawns))
+        counts["page_text"] = insert_page_text_rows(
+            con, gameobject_tables.get("page_text"))
 
         con.commit()
         con.execute("PRAGMA optimize")
@@ -1261,7 +1263,8 @@ def import_world(dump_path: str, db_path: str, clear: bool = True,
 GAMEOBJECT_DUMP_TABLES = ("gameobject_template", "gameobject", "gameobject_addon",
                           "gameobject_spawn_entry", "game_event_gameobject",
                           "gameobject_loot_template", "pool_gameobject",
-                          "pool_gameobject_template", "pool_template", "pool_pool")
+                          "pool_gameobject_template", "pool_template", "pool_pool",
+                          "page_text")
 
 # CMaNGOS gameobject_template column -> server column.
 _GO_TEMPLATE_DUMP = {
@@ -1369,6 +1372,16 @@ def build_gameobject_pool_rows(tables: dict, spawn_rows) -> dict[str, list[tuple
         for r in tables.get("pool_pool") or []})
     return {"gameobject_pool_members": sorted(members.values()),
             "pool_templates": templates, "pool_pools": pools}
+
+
+def insert_page_text_rows(con, raw_rows) -> int:
+    """Replace ``page_text`` (books, plaques and readable items)."""
+    rows = [(_sqlite_int(r.get("entry")), _text_or_empty(r.get("text")),
+             _sqlite_int(r.get("next_page"))) for r in raw_rows or ()]
+    con.execute("DELETE FROM page_text")
+    con.executemany("INSERT OR REPLACE INTO page_text(entry, text, next_page) "
+                    "VALUES(?, ?, ?)", rows)
+    return len(rows)
 
 
 def insert_gameobject_pool_rows(con, rows: dict) -> int:
@@ -1490,6 +1503,7 @@ def import_gameobjects(dump_path: str, db_path: str) -> dict[str, int]:
                                         tables.get("gameobject_loot_template") or ())
         counts["gameobject_pool_members"] = insert_gameobject_pool_rows(
             con, build_gameobject_pool_rows(tables, spawn_rows))
+        counts["page_text"] = insert_page_text_rows(con, tables.get("page_text"))
         con.commit()
     finally:
         con.close()
@@ -1497,6 +1511,7 @@ def import_gameobjects(dump_path: str, db_path: str) -> dict[str, int]:
         f"imported {counts['gameobject_templates']:,} game object templates and "
         f"{counts['gameobject_spawns']:,} spawns ({counts['gameobject_events']:,} "
         f"tied to world events, {counts['gameobject_pool_members']:,} pooled, "
+        f"{counts['page_text']:,} pages, "
         f"{counts['gameobject_loot_template']:,} loot rows) "
         f"in {time.time() - started:.1f}s "
         f"(skipped {skipped['missing_template']:,} without a template, "

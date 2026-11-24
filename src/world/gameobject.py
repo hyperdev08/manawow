@@ -76,7 +76,10 @@ GAMEOBJECT_TYPE_CHEST = 3
 GAMEOBJECT_TYPE_GENERIC = 5
 GAMEOBJECT_TYPE_TRAP = 6
 GAMEOBJECT_TYPE_CHAIR = 7
+GAMEOBJECT_TYPE_TEXT = 9
 GAMEOBJECT_TYPE_GOOBER = 10
+GAMEOBJECT_TYPE_CAMERA = 13
+GAMEOBJECT_TYPE_MAILBOX = 19
 GAMEOBJECT_TYPE_TRANSPORT = 11
 GAMEOBJECT_TYPE_MO_TRANSPORT = 15
 GAMEOBJECT_TYPE_DUEL_ARBITER = 16
@@ -203,6 +206,14 @@ CREATE TABLE IF NOT EXISTS pool_pools(
   pool_id INTEGER PRIMARY KEY,
   mother_pool INTEGER NOT NULL,
   chance REAL NOT NULL DEFAULT 0
+);
+
+-- Book and plaque pages (also readable items): one row per page, chained
+-- through ``next_page``.
+CREATE TABLE IF NOT EXISTS page_text(
+  entry INTEGER PRIMARY KEY,
+  text TEXT NOT NULL DEFAULT '',
+  next_page INTEGER NOT NULL DEFAULT 0
 );
 
 -- CMaNGOS ``game_event_gameobject``: a positive event spawns the object only
@@ -607,6 +618,75 @@ def auto_close_seconds(template: Mapping) -> float:
     if int(template["type"]) in (GAMEOBJECT_TYPE_DOOR, GAMEOBJECT_TYPE_BUTTON):
         return _data(template, 2) / 1000.0
     return 0.0
+
+
+# ``UNIT_STAND_STATE_SIT_LOW_CHAIR``; medium and high chairs follow (+1, +2).
+UNIT_STAND_STATE_SIT_LOW_CHAIR = 4
+
+
+def chair_stand_state(template: Mapping) -> int:
+    """Stand state for ``chair.height`` (0 low, 1 medium, 2 high)."""
+    return UNIT_STAND_STATE_SIT_LOW_CHAIR + max(0, min(2, _data(template, 1)))
+
+
+def chair_seat(spawn: Mapping, x: float, y: float) -> Tuple[float, float]:
+    """The free seat of a bench closest to ``(x, y)`` (``GameObject::Use`` CHAIR).
+
+    The ``chair.slots`` seats sit on a line through the object's centre,
+    perpendicular to its facing, ``size`` yards apart.
+    """
+    slots = max(1, _data(spawn, 0))
+    size = float(spawn["size"] or 1.0)
+    across = float(spawn["o"] or 0.0) + math.pi / 2.0
+    best = None
+    for slot in range(slots):
+        offset = size * slot - size * (slots - 1) / 2.0
+        sx = float(spawn["x"]) + offset * math.cos(across)
+        sy = float(spawn["y"]) + offset * math.sin(across)
+        dist = (sx - x) ** 2 + (sy - y) ** 2
+        if best is None or dist < best[0]:
+            best = (dist, sx, sy)
+    return best[1], best[2]
+
+
+def text_page(template: Mapping) -> int:
+    """First ``page_text`` entry of a book/plaque (``text.pageID``)."""
+    return _data(template, 0) if int(template["type"]) == GAMEOBJECT_TYPE_TEXT else 0
+
+
+def camera_cinematic(template: Mapping) -> int:
+    """``camera.cinematicId`` of a camera object (``CinematicSequences.dbc``)."""
+    return _data(template, 1) if int(template["type"]) == GAMEOBJECT_TYPE_CAMERA else 0
+
+
+MAX_PAGE_CHAIN = 64
+PAGE_MISSING_TEXT = "Item page missing."
+
+
+def build_page_text_responses(path: str, page_id: int) -> List[bytes]:
+    """One ``SMSG_PAGE_TEXT_QUERY_RESPONSE`` per page of the chain.
+
+    ``WorldSession::HandlePageTextQueryOpcode``: ``uint32 pageID, string
+    text, uint32 nextPage``; a missing page ends the chain with a fixed text.
+    """
+    out = []
+    con = sqlite3.connect(path)
+    try:
+        seen = set()
+        while page_id and page_id not in seen and len(out) < MAX_PAGE_CHAIN:
+            seen.add(page_id)
+            try:
+                row = con.execute("SELECT text, next_page FROM page_text WHERE entry = ?",
+                                  (int(page_id),)).fetchone()
+            except sqlite3.OperationalError:
+                row = None
+            text, next_page = (row[0], int(row[1] or 0)) if row else (PAGE_MISSING_TEXT, 0)
+            out.append(struct.pack("<I", int(page_id)) + _cstring(text)
+                       + struct.pack("<I", next_page))
+            page_id = next_page
+    finally:
+        con.close()
+    return out
 
 
 def respawn_delay(spawn: Mapping) -> int:
