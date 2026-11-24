@@ -721,6 +721,9 @@ class StatsMixin:
         if leveled:
             fields.update(self._derived_player_fields())
         await self._send_player_fields(fields)
+        if leveled and hasattr(self, "refresh_gameobject_quest_flags"):
+            # New quests may unlock: wanted posters become clickable.
+            await self.refresh_gameobject_quest_flags()
         if leveled:
             self.log.info(
                 f"'{self.character['name']}' reached level {level} "

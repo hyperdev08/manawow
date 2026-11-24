@@ -210,8 +210,18 @@ A real 3.3.5a client can now log in, pick a character and **enter the world**:
 - Quest chests are clickable and sparkle (`GAMEOBJECT_DYNAMIC`) only for players who need them
 - CMaNGOS pools (`pool_gameobject`, `pool_gameobject_template`, `pool_template`, `pool_pool`): only `max_limit` members of a pool exist at a time, and a used one is replaced by a new roll after its respawn time (29,763 pooled spawns)
 - Not shown: transports (elevators, boats) and spawns with a negative respawn time (script-only)
-- Not usable yet: quest givers, goobers (quest objects), traps, spell casters, meeting stones, fishing (#12 phase 3+)
+- Quest objects: wanted posters and other QUESTGIVER objects start/end quests (`gameobject_questrelation` / `gameobject_involvedrelation`: 527 starters, 443 enders) through the usual quest windows; they are clickable (`GO_DYNFLAG_LO_ACTIVATE`) only while they have something for the player, re-checked on quest changes and level-up. The 3.3.5 client shows no "!" over objects and never queries their status
+- Goobers: page text, quest gating (`goober.questId`), "use the object" objectives (negative `ReqCreatureOrGOId`, credited like `Player::KillCreditGO`), custom animation or open state with auto-close, on-use spell, consumable despawn; quest goobers sparkle for players on the quest, generic quest objects only sparkle
+- Quest-starting items (`item_template.startquest`, 385 items): `CMSG_USE_ITEM` opens the quest; the item is used up on accept unless the quest asks for it. Other item use (potions, food, hearthstone) is item spell casting (#11)
+- CMaNGOS `spawn_group` limits (`MaxCount`, groups without a `WorldState` condition) are imported as pools for both objects and creatures
+- Not usable yet: traps, spell casters, meeting stones, fishing, summoned objects
 - Upgrade an existing `world.db` with `python tools/import_wotlk_db.py --dump WoTLKDB.sql --gameobjects-only`
+
+### Creature pools
+- `pool_creature`, `pool_creature_template` and `spawn_group` (with `MaxCount`, no `WorldState`) limit how many spawns of a group exist at once: rare spawns such as Gruff Swiftbite or Fedfennel show at one of their spawn points instead of all of them (715 pooled creatures)
+- Pools are loaded once per server, off the event loop, and filter the creature visibility scans
+- Refresh with `python tools/import_wotlk_db.py --dump WoTLKDB.sql --pools-only` (creature and object pools)
+- Not handled yet: `spawn_group` world-state conditions (day/night RP groups keep spawning) and creature spawns with `id = 0` that take their entry from `spawn_group_entry` (5,893 spawns are still skipped by the importer)
 
 ### World events
 - There is no event calendar yet, so the world is shown with no world event active: creatures and objects that only spawn during an event (`game_event_creature` / `game_event_gameobject` with a positive event: Darkmoon Faire, Midsummer, Hallow's End, Winter Veil, the Arena Tournament realm NPCs...) are hidden; spawns removed during an event (negative event) stay

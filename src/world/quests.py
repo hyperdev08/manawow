@@ -189,6 +189,18 @@ CREATE TABLE IF NOT EXISTS creature_quest_enders(
   PRIMARY KEY(entry, quest)
 );
 CREATE INDEX IF NOT EXISTS idx_quest_enders_quest ON creature_quest_enders(quest);
+-- gameobject_questrelation / gameobject_involvedrelation: wanted posters,
+-- quest books and other QUESTGIVER objects.
+CREATE TABLE IF NOT EXISTS gameobject_quest_starters(
+  entry INTEGER NOT NULL,
+  quest INTEGER NOT NULL,
+  PRIMARY KEY(entry, quest)
+);
+CREATE TABLE IF NOT EXISTS gameobject_quest_enders(
+  entry INTEGER NOT NULL,
+  quest INTEGER NOT NULL,
+  PRIMARY KEY(entry, quest)
+);
 -- areatrigger_involvedrelation: AreaTrigger.dbc id -> exploration quest.
 CREATE TABLE IF NOT EXISTS areatrigger_quests(
   trigger_id INTEGER PRIMARY KEY,
@@ -266,15 +278,28 @@ def get_quest_template(path: str, quest_id: int) -> Optional[dict]:
     return _TEMPLATE_CACHE[key]
 
 
-def _relation(path: str, table: str, entry: int) -> Tuple[int, ...]:
-    key = (path, table, int(entry))
+# Who can give/take quests: creatures, game objects and quest-starting items
+# (``item_template.startquest``; items never end quests).
+GIVER_CREATURE = "creature"
+GIVER_GAMEOBJECT = "gameobject"
+GIVER_ITEM = "item"
+_STARTER_SQL = {
+    GIVER_CREATURE: "SELECT quest FROM creature_quest_starters WHERE entry = ? ORDER BY quest",
+    GIVER_GAMEOBJECT: "SELECT quest FROM gameobject_quest_starters WHERE entry = ? ORDER BY quest",
+    GIVER_ITEM: "SELECT start_quest FROM item_templates WHERE entry = ? AND start_quest <> 0",
+}
+_ENDER_SQL = {
+    GIVER_CREATURE: "SELECT quest FROM creature_quest_enders WHERE entry = ? ORDER BY quest",
+    GIVER_GAMEOBJECT: "SELECT quest FROM gameobject_quest_enders WHERE entry = ? ORDER BY quest",
+}
+
+
+def _relation(path: str, sql: str, entry: int) -> Tuple[int, ...]:
+    key = (path, sql, int(entry))
     if key not in _RELATION_CACHE:
         con = sqlite3.connect(path)
         try:
-            rows = con.execute(
-                f"SELECT quest FROM {table} WHERE entry = ? ORDER BY quest",
-                (int(entry),),
-            ).fetchall()
+            rows = con.execute(sql, (int(entry),)).fetchall()
         except sqlite3.OperationalError:
             rows = []
         finally:
@@ -283,17 +308,17 @@ def _relation(path: str, table: str, entry: int) -> Tuple[int, ...]:
     return _RELATION_CACHE[key]
 
 
-def quests_started_by(path: str, creature_entry: int) -> Tuple[int, ...]:
-    return _relation(path, "creature_quest_starters", creature_entry)
+def quests_started_by(path: str, entry: int, kind: str = GIVER_CREATURE) -> Tuple[int, ...]:
+    return _relation(path, _STARTER_SQL[kind], entry)
 
 
-def quests_ended_by(path: str, creature_entry: int) -> Tuple[int, ...]:
-    return _relation(path, "creature_quest_enders", creature_entry)
+def quests_ended_by(path: str, entry: int, kind: str = GIVER_CREATURE) -> Tuple[int, ...]:
+    sql = _ENDER_SQL.get(kind)
+    return _relation(path, sql, entry) if sql else ()
 
 
-def is_quest_giver(path: str, creature_entry: int) -> bool:
-    return bool(quests_started_by(path, creature_entry)
-                or quests_ended_by(path, creature_entry))
+def is_quest_giver(path: str, entry: int, kind: str = GIVER_CREATURE) -> bool:
+    return bool(quests_started_by(path, entry, kind) or quests_ended_by(path, entry, kind))
 
 
 def prerequisite_quests(path: str, quest: Mapping) -> List[int]:
@@ -491,6 +516,15 @@ def kill_objectives(quest: Mapping) -> List[Tuple[int, int, int]]:
     return out
 
 
+def object_objectives(quest: Mapping) -> List[Tuple[int, int, int]]:
+    """``[(index, gameobject_entry, required)]``: "use the object" objectives.
+
+    They are stored as negative ``ReqCreatureOrGOId`` values.
+    """
+    return [(index, -target, required) for index, target, required in kill_objectives(quest)
+            if target < 0]
+
+
 def item_objectives(quest: Mapping) -> List[Tuple[int, int]]:
     out = []
     for index in range(1, QUEST_ITEM_OBJECTIVES_COUNT + 1):
@@ -675,10 +709,11 @@ def objectives_complete(quest: Mapping, entry: Mapping,
     return True
 
 
-def giver_status(path: str, creature_entry: int, state: QuestState) -> int:
-    """``Player::GetQuestDialogStatus`` for one creature."""
+def giver_status(path: str, creature_entry: int, state: QuestState,
+                 kind: str = GIVER_CREATURE) -> int:
+    """``Player::GetQuestDialogStatus`` for one creature or game object."""
     result = DIALOG_STATUS_NONE
-    for quest_id in quests_ended_by(path, creature_entry):
+    for quest_id in quests_ended_by(path, creature_entry, kind):
         quest = get_quest_template(path, quest_id)
         if quest is None:
             continue
@@ -687,7 +722,7 @@ def giver_status(path: str, creature_entry: int, state: QuestState) -> int:
             result = max(result, DIALOG_STATUS_REWARD)
         elif status == QUEST_STATUS_INCOMPLETE:
             result = max(result, DIALOG_STATUS_INCOMPLETE)
-    for quest_id in quests_started_by(path, creature_entry):
+    for quest_id in quests_started_by(path, creature_entry, kind):
         quest = get_quest_template(path, quest_id)
         if quest is None or state.status(quest_id) != QUEST_STATUS_NONE:
             continue
@@ -703,16 +738,17 @@ def giver_status(path: str, creature_entry: int, state: QuestState) -> int:
     return result
 
 
-def quest_menu(path: str, creature_entry: int, state: QuestState) -> List[Tuple[int, int]]:
+def quest_menu(path: str, creature_entry: int, state: QuestState,
+               kind: str = GIVER_CREATURE) -> List[Tuple[int, int]]:
     """``PlayerMenu::PrepareQuestMenu``: ``[(quest_id, icon)]``."""
     menu: List[Tuple[int, int]] = []
     seen: Set[int] = set()
-    for quest_id in quests_ended_by(path, creature_entry):
+    for quest_id in quests_ended_by(path, creature_entry, kind):
         if state.status(quest_id) in (QUEST_STATUS_COMPLETE, QUEST_STATUS_INCOMPLETE):
             if get_quest_template(path, quest_id) is not None:
                 menu.append((quest_id, QUEST_ICON_ACTIVE))
                 seen.add(quest_id)
-    for quest_id in quests_started_by(path, creature_entry):
+    for quest_id in quests_started_by(path, creature_entry, kind):
         if quest_id in seen:
             continue
         quest = get_quest_template(path, quest_id)

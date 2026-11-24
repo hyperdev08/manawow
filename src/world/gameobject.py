@@ -197,6 +197,13 @@ CREATE TABLE IF NOT EXISTS gameobject_pool_members(
   pool INTEGER NOT NULL,
   chance REAL NOT NULL DEFAULT 0
 );
+-- ``pool_creature`` / ``pool_creature_template``: rare spawns and mobs that
+-- share spawn points.
+CREATE TABLE IF NOT EXISTS creature_pool_members(
+  guid INTEGER PRIMARY KEY,
+  pool INTEGER NOT NULL,
+  chance REAL NOT NULL DEFAULT 0
+);
 CREATE TABLE IF NOT EXISTS pool_templates(
   entry INTEGER PRIMARY KEY,
   max_limit INTEGER NOT NULL DEFAULT 0,
@@ -738,9 +745,46 @@ def quest_loot_items(path: str, loot: int) -> frozenset:
     return result
 
 
+def object_quest_id(template: Mapping) -> int:
+    """``goober.questId`` / ``_generic.questID``: the quest the object is for."""
+    go_type = int(template["type"])
+    if go_type == GAMEOBJECT_TYPE_GOOBER:
+        return _data(template, 1)
+    if go_type == GAMEOBJECT_TYPE_GENERIC:
+        return _data(template, 5)
+    return 0
+
+
+def goober_page(template: Mapping) -> int:
+    return _data(template, 7) if int(template["type"]) == GAMEOBJECT_TYPE_GOOBER else 0
+
+
+def goober_custom_anim(template: Mapping) -> int:
+    return _data(template, 4) if int(template["type"]) == GAMEOBJECT_TYPE_GOOBER else 0
+
+
+def goober_spell(template: Mapping) -> int:
+    return _data(template, 10) if int(template["type"]) == GAMEOBJECT_TYPE_GOOBER else 0
+
+
+def goober_consumable(template: Mapping) -> bool:
+    return int(template["type"]) == GAMEOBJECT_TYPE_GOOBER and bool(_data(template, 5))
+
+
+def goober_reset_seconds(template: Mapping) -> float:
+    """``goober.autoClose`` (ms); TrinityCore resets at once when it is 0."""
+    return max(1.0, _data(template, 3) / 1000.0)
+
+
 def is_quest_object(template: Mapping, path: str) -> bool:
     """True for objects whose use depends on the player's quests."""
-    if int(template["type"]) != GAMEOBJECT_TYPE_CHEST:
+    go_type = int(template["type"])
+    if go_type == GAMEOBJECT_TYPE_QUESTGIVER:
+        from src.world import quests
+        return quests.is_quest_giver(path, int(template["entry"]), quests.GIVER_GAMEOBJECT)
+    if go_type in (GAMEOBJECT_TYPE_GOOBER, GAMEOBJECT_TYPE_GENERIC):
+        return bool(object_quest_id(template))
+    if go_type != GAMEOBJECT_TYPE_CHEST:
         return False
     return bool(chest_quest_id(template) or quest_loot_items(path, loot_id(template)))
 
@@ -764,8 +808,12 @@ def _roll_member(candidates: List[Tuple[int, float]]) -> Optional[int]:
     return random.choice(equal or [m for m, _ in candidates])
 
 
-class GameObjectPools:
-    """Which pooled spawns currently exist (CMaNGOS ``PoolManager``)."""
+class SpawnPools:
+    """Which pooled spawns currently exist (CMaNGOS ``PoolManager``).
+
+    One instance per spawn kind: game objects and creatures have separate
+    guid ranges and member tables but share ``pool_templates``/``pool_pools``.
+    """
 
     def __init__(self, members=(), limits=None, children=()):
         self.member_pool: Dict[int, int] = {}
@@ -786,12 +834,14 @@ class GameObjectPools:
                 self._spawn_pool(pool, self.limits.get(pool, 0))
 
     @classmethod
-    def load(cls, path: str) -> "GameObjectPools":
+    def load(cls, path: str, member_table: str = "gameobject_pool_members") -> "SpawnPools":
+        if member_table not in ("gameobject_pool_members", "creature_pool_members"):
+            raise ValueError(f"unknown pool member table {member_table}")
         con = sqlite3.connect(path)
         try:
             try:
                 members = con.execute(
-                    "SELECT guid, pool, chance FROM gameobject_pool_members").fetchall()
+                    f"SELECT guid, pool, chance FROM {member_table}").fetchall()
                 limits = dict(con.execute("SELECT entry, max_limit FROM pool_templates"))
                 children = con.execute(
                     "SELECT pool_id, mother_pool, chance FROM pool_pools").fetchall()
@@ -799,7 +849,7 @@ class GameObjectPools:
                 members, limits, children = [], {}, []
         finally:
             con.close()
-        # Only keep the pool tree above pools that hold game objects.
+        # Only keep the pool tree above pools that hold members of this kind.
         used = {pool for _guid, pool, _chance in members}
         while True:
             grown = used | {mother for child, mother, _c in children if child in used}
@@ -851,6 +901,13 @@ class GameObjectPools:
                 self.active.add(guid)
                 spawned.append(guid)
         return spawned
+
+
+GameObjectPools = SpawnPools
+
+
+def load_creature_pools(path: str) -> SpawnPools:
+    return SpawnPools.load(path, "creature_pool_members")
 
 
 # ---------------------------------------------------------------------------
