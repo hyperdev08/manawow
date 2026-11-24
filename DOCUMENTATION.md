@@ -221,7 +221,8 @@ A real 3.3.5a client can now log in, pick a character and **enter the world**:
 - `pool_creature`, `pool_creature_template` and `spawn_group` (with `MaxCount`, no `WorldState`) limit how many spawns of a group exist at once: rare spawns such as Gruff Swiftbite or Fedfennel show at one of their spawn points instead of all of them (715 pooled creatures)
 - Pools are loaded once per server, off the event loop, and filter the creature visibility scans
 - Refresh with `python tools/import_wotlk_db.py --dump WoTLKDB.sql --pools-only` (creature and object pools)
-- Not handled yet: `spawn_group` world-state conditions (day/night RP groups keep spawning) and creature spawns with `id = 0` that take their entry from `spawn_group_entry` (5,893 spawns are still skipped by the importer)
+- Spawns stored with `id = 0` take their entry from `creature_spawn_entry` / `gameobject_spawn_entry` or, inside a spawn group, from `spawn_group_entry` (chosen once per guid at import, so it is reproducible): 5,650 creatures and 3,136 objects that used to be skipped. Add them to an existing `world.db` with `python tools/import_wotlk_db.py --dump WoTLKDB.sql --spawn-entries-only` (creatures; `--gameobjects-only` for objects)
+- Not handled yet: `spawn_group` world-state conditions (day/night RP groups keep spawning)
 
 ### World events
 - There is no event calendar yet, so the world is shown with no world event active: creatures and objects that only spawn during an event (`game_event_creature` / `game_event_gameobject` with a positive event: Darkmoon Faire, Midsummer, Hallow's End, Winter Veil, the Arena Tournament realm NPCs...) are hidden; spawns removed during an event (negative event) stay

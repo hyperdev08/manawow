@@ -14,6 +14,7 @@ Usage::
     python tools/import_wotlk_db.py --dump WoTLKDB.sql --events-only
     python tools/import_wotlk_db.py --dump WoTLKDB.sql --loot-only
     python tools/import_wotlk_db.py --dump WoTLKDB.sql --pools-only
+    python tools/import_wotlk_db.py --dump WoTLKDB.sql --spawn-entries-only
 
 ``--quests-only`` refreshes just the quest tables (``quest_template`` and the
 creature/area-trigger quest relations) of an existing database.
@@ -882,7 +883,8 @@ def import_world(dump_path: str, db_path: str, clear: bool = True,
     gameobject_tables = read_gameobject_tables(text)
     _, raw_game_event_creature = wotlk_dump.rows(text, "game_event_creature")
     creature_pool_tables = {t: wotlk_dump.rows(text, t)[1] for t in (
-        "pool_creature", "pool_creature_template", *SPAWN_GROUP_TABLES)}
+        "pool_creature", "pool_creature_template", "creature_spawn_entry",
+        *SPAWN_GROUP_TABLES)}
     del text
 
     rune_cost_rows = read_rune_cost_dbc(rune_cost_dbc) if rune_cost_dbc else []
@@ -892,60 +894,20 @@ def import_world(dump_path: str, db_path: str, clear: bool = True,
     template_rows = [_template_row(row) for row in raw_templates]
     known_entries = {row[0] for row in template_rows}
 
-    spawn_rows = []
-    skipped_missing = 0
-    skipped_phase = 0
-    skipped_mask = 0
-    for row in raw_spawns:
-        if int(row.get("spawnMask") or 0) & 1 == 0:
-            skipped_mask += 1
-            continue
-        if int(row.get("phaseMask") or 0) != 1:
-            skipped_phase += 1
-            continue
-        entry = int(row.get("id") or 0)
-        if entry not in known_entries:
-            skipped_missing += 1
-            continue
-        spawn_rows.append((
-            int(row["guid"]),
-            entry,
-            int(row.get("map") or 0),
-            0,
-            float(row.get("position_x") or 0.0),
-            float(row.get("position_y") or 0.0),
-            float(row.get("position_z") or 0.0),
-            float(row.get("orientation") or 0.0),
-            0,
-            int(row.get("spawntimesecsmin") or 0),
-            # ``MovementType`` and ``spawndist`` are per-spawn overrides.  A
-            # missing value stays -1/0.0 so the runtime can fall back to the
-            # template or a heuristic instead of forcing every creature idle.
-            int(row.get("MovementType") if row.get("MovementType") is not None else -1),
-            float(row.get("spawndist") or 0.0),
-        ))
+    entry_for = resolve_spawn_entries(
+        creature_pool_tables.get("creature_spawn_entry"), creature_pool_tables,
+        SPAWN_GROUP_CREATURE, known_entries)
+    spawn_rows, skipped = build_creature_spawn_rows(raw_spawns, known_entries, entry_for)
+    skipped_missing = skipped["missing_template"]
+    skipped_phase = skipped["phase"]
+    skipped_mask = skipped["spawn_mask"]
 
     # Waypoint paths.  ``creature_movement.Id`` is the spawn GUID, so rows for
     # spawns that were filtered out (other phases, missing templates) are
     # dropped as well.  ``creature_movement_template`` is keyed by entry and
     # optional path id.
-    spawn_guids = {row[0] for row in spawn_rows}
-    movement_rows = []
-    for row in raw_creature_movement:
-        guid = int(row.get("Id") or 0)
-        if guid not in spawn_guids:
-            continue
-        movement_rows.append((
-            guid,
-            int(row.get("Point") or 0),
-            float(row.get("PositionX") or 0.0),
-            float(row.get("PositionY") or 0.0),
-            float(row.get("PositionZ") or 0.0),
-            float(row.get("Orientation") or 0.0),
-            int(row.get("WaitTime") or 0),
-            int(row.get("ScriptId") or 0),
-            _text_or_empty(row.get("Comment")),
-        ))
+    movement_rows = build_creature_movement_rows(
+        raw_creature_movement, {row[0] for row in spawn_rows})
 
     movement_template_rows = []
     for row in raw_creature_movement_template:
@@ -1266,7 +1228,7 @@ def import_world(dump_path: str, db_path: str, clear: bool = True,
     return stats
 
 
-SPAWN_GROUP_TABLES = ("spawn_group", "spawn_group_spawn")
+SPAWN_GROUP_TABLES = ("spawn_group", "spawn_group_spawn", "spawn_group_entry")
 GAMEOBJECT_DUMP_TABLES = ("gameobject_template", "gameobject", "gameobject_addon",
                           "gameobject_spawn_entry", "game_event_gameobject",
                           "gameobject_loot_template", "pool_gameobject",
@@ -1385,6 +1347,170 @@ def merge_pool_members(primary, extra) -> list[tuple]:
     """``pool_*`` membership wins over a ``spawn_group`` for the same guid."""
     taken = {row[0] for row in primary}
     return sorted(list(primary) + [row for row in extra if row[0] not in taken])
+
+
+def _pick_entry(guid: int, options: list[tuple[int, int]]) -> int:
+    """One entry for a spawn, reproducible per guid.
+
+    ``options`` is ``[(entry, chance)]``; a chance of 0 shares what the
+    explicit chances leave (CMaNGOS ``SpawnGroup`` entry roll).
+    """
+    import random
+
+    rng = random.Random(int(guid))
+    explicit = [(e, c) for e, c in options if c > 0]
+    equal = [e for e, c in options if c <= 0]
+    roll = rng.random() * 100.0
+    for entry, chance in explicit:
+        roll -= chance
+        if roll < 0:
+            return entry
+    pool = equal or [e for e, _ in options]
+    return rng.choice(pool)
+
+
+def resolve_spawn_entries(spawn_entry_rows, group_tables: dict, kind: int,
+                          known_entries) -> dict[int, int]:
+    """Entry for spawns stored with ``id = 0``.
+
+    CMaNGOS picks it at spawn time from ``creature_spawn_entry`` /
+    ``gameobject_spawn_entry`` (one of the listed entries) or, for spawns in
+    a ``spawn_group``, from ``spawn_group_entry``.  The import makes the
+    choice once, seeded by the guid, so it is reproducible.
+    """
+    by_guid: dict[int, list[tuple[int, int]]] = {}
+    for r in spawn_entry_rows or []:
+        entry = _sqlite_int(r.get("entry"))
+        if entry in known_entries:
+            by_guid.setdefault(_sqlite_int(r.get("guid")), []).append((entry, 0))
+    group_kind = {_sqlite_int(r.get("Id")): _sqlite_int(r.get("Type"))
+                  for r in group_tables.get("spawn_group") or []}
+    group_entries: dict[int, list[tuple[int, int]]] = {}
+    for r in group_tables.get("spawn_group_entry") or []:
+        entry = _sqlite_int(r.get("Entry"))
+        if entry in known_entries:
+            group_entries.setdefault(_sqlite_int(r.get("Id")), []).append(
+                (entry, _sqlite_int(r.get("Chance"))))
+    for r in group_tables.get("spawn_group_spawn") or []:
+        group, guid = _sqlite_int(r.get("Id")), _sqlite_int(r.get("Guid"))
+        if group_kind.get(group) == kind and group in group_entries and guid not in by_guid:
+            by_guid[guid] = group_entries[group]
+    return {guid: _pick_entry(guid, sorted(options)) for guid, options in by_guid.items()}
+
+
+def build_creature_spawn_rows(raw_spawns, known_entries,
+                              entry_for: dict[int, int] | None = None,
+                              only_zero_id: bool = False) -> tuple[list[tuple], dict]:
+    """``creature_spawns`` rows (see ``SPAWN_COLUMNS``) and the skip counts.
+
+    ``entry_for`` resolves spawns stored with ``id = 0``; ``only_zero_id``
+    keeps just those (the ``--spawn-entries-only`` upgrade).
+    """
+    entry_for = entry_for or {}
+    rows = []
+    skipped = {"missing_template": 0, "phase": 0, "spawn_mask": 0}
+    for row in raw_spawns:
+        stored = int(row.get("id") or 0)
+        if only_zero_id and stored:
+            continue
+        if int(row.get("spawnMask") or 0) & 1 == 0:
+            skipped["spawn_mask"] += 1
+            continue
+        if int(row.get("phaseMask") or 0) != 1:
+            skipped["phase"] += 1
+            continue
+        guid = int(row["guid"])
+        entry = stored or entry_for.get(guid, 0)
+        if entry not in known_entries:
+            skipped["missing_template"] += 1
+            continue
+        rows.append((
+            guid,
+            entry,
+            int(row.get("map") or 0),
+            0,
+            float(row.get("position_x") or 0.0),
+            float(row.get("position_y") or 0.0),
+            float(row.get("position_z") or 0.0),
+            float(row.get("orientation") or 0.0),
+            0,
+            int(row.get("spawntimesecsmin") or 0),
+            # ``MovementType`` and ``spawndist`` are per-spawn overrides.  A
+            # missing value stays -1/0.0 so the runtime can fall back to the
+            # template or a heuristic instead of forcing every creature idle.
+            int(row.get("MovementType") if row.get("MovementType") is not None else -1),
+            float(row.get("spawndist") or 0.0),
+        ))
+    return rows, skipped
+
+
+def build_creature_movement_rows(raw_movement, spawn_guids) -> list[tuple]:
+    rows = []
+    for row in raw_movement or []:
+        guid = int(row.get("Id") or 0)
+        if guid not in spawn_guids:
+            continue
+        rows.append((
+            guid,
+            int(row.get("Point") or 0),
+            float(row.get("PositionX") or 0.0),
+            float(row.get("PositionY") or 0.0),
+            float(row.get("PositionZ") or 0.0),
+            float(row.get("Orientation") or 0.0),
+            int(row.get("WaitTime") or 0),
+            int(row.get("ScriptId") or 0),
+            _text_or_empty(row.get("Comment")),
+        ))
+    return rows
+
+
+def import_spawn_entries(dump_path: str, db_path: str) -> dict[str, int]:
+    """``--spawn-entries-only``: add the creatures stored with ``id = 0``.
+
+    Existing spawns (and their runtime state) are left alone; the new ones
+    get their waypoints, and the world-event links and pools are refreshed
+    so they cover them too.
+    """
+    import sqlite3
+
+    started = time.time()
+    text = wotlk_dump.read_dump(dump_path)
+    _, raw_spawns = wotlk_dump.rows(text, "creature")
+    _, raw_movement = wotlk_dump.rows(text, "creature_movement")
+    _, raw_events = wotlk_dump.rows(text, "game_event_creature")
+    tables = {t: wotlk_dump.rows(text, t)[1] for t in (
+        "creature_spawn_entry", "pool_creature", "pool_creature_template",
+        *SPAWN_GROUP_TABLES)}
+    del text
+    con = sqlite3.connect(db_path)
+    try:
+        known = {e for (e,) in con.execute("SELECT entry FROM creature_templates")}
+        entry_for = resolve_spawn_entries(tables["creature_spawn_entry"], tables,
+                                          SPAWN_GROUP_CREATURE, known)
+        rows, skipped = build_creature_spawn_rows(raw_spawns, known, entry_for,
+                                                  only_zero_id=True)
+        existing = {g for (g,) in con.execute("SELECT guid FROM creature_spawns")}
+        rows = [row for row in rows if row[0] not in existing]
+        con.executemany(
+            f"INSERT INTO creature_spawns({', '.join(SPAWN_COLUMNS)}) "
+            f"VALUES({', '.join('?' for _ in SPAWN_COLUMNS)})", rows)
+        con.executemany(
+            "INSERT OR REPLACE INTO creature_movement("
+            "id, point, position_x, position_y, position_z, orientation,"
+            " wait_time, script_id, comment) VALUES(?,?,?,?,?,?,?,?,?)",
+            build_creature_movement_rows(raw_movement, {row[0] for row in rows}))
+        all_spawns = con.execute("SELECT guid, entry FROM creature_spawns").fetchall()
+        events = insert_creature_event_rows(
+            con, build_event_rows(raw_events, (g for g, _e in all_spawns)))
+        pooled = insert_creature_pool_rows(con, *build_creature_pool_rows(tables, all_spawns))
+        con.commit()
+    finally:
+        con.close()
+    print(f"added {len(rows):,} creature spawns stored with id 0 "
+          f"({skipped['missing_template']:,} without a known entry); "
+          f"{events:,} world-event links, {pooled:,} pooled creatures "
+          f"in {time.time() - started:.1f}s")
+    return {"added": len(rows), "events": events, "pooled": pooled, **skipped}
 
 
 def build_pool_members(direct_rows, template_rows, spawn_rows) -> list[tuple]:
@@ -1544,6 +1670,10 @@ def build_gameobject_rows(tables: dict) -> tuple[list[tuple], list[tuple], dict]
         guid, entry = _sqlite_int(r.get("guid")), _sqlite_int(r.get("entry"))
         if entry in known and (guid not in spawn_entry or entry < spawn_entry[guid]):
             spawn_entry[guid] = entry
+    # Spawns in a spawn_group take their entry from spawn_group_entry.
+    for guid, entry in resolve_spawn_entries(None, tables, SPAWN_GROUP_GAMEOBJECT,
+                                             known).items():
+        spawn_entry.setdefault(guid, entry)
 
     spawn_rows = []
     skipped = {"missing_template": 0, "phase": 0, "spawn_mask": 0}
@@ -1784,6 +1914,9 @@ def main() -> None:
                         help="only refresh npc_vendor and item buy counts")
     parser.add_argument("--gameobjects-only", action="store_true",
                         help="only (re)import the game object templates and spawns")
+    parser.add_argument("--spawn-entries-only", action="store_true",
+                        help="only add the creature spawns stored with id 0 (entry "
+                             "from creature_spawn_entry / spawn_group_entry)")
     parser.add_argument("--pools-only", action="store_true",
                         help="only refresh the creature and game object pools")
     parser.add_argument("--loot-only", action="store_true",
@@ -1820,6 +1953,9 @@ def main() -> None:
         return
     if args.pools_only:
         import_pools(args.dump, db_path)
+        return
+    if args.spawn_entries_only:
+        import_spawn_entries(args.dump, db_path)
         return
 
     import_world(args.dump, db_path, clear=not args.keep_existing,
