@@ -198,6 +198,18 @@ A real 3.3.5a client can now log in, pick a character and **enter the world**:
 - Not implemented yet: honor/token prices (`ExtendedCost`, those items are hidden), buyback, repair, reputation discounts, `condition_id`
 - Upgrade an existing `world.db` with `python tools/import_wotlk_db.py --dump WoTLKDB.sql --vendors-only`
 
+### Game objects
+- `gameobject_templates` (19,555) and `gameobject_spawns` (100,337) imported from CMaNGOS `gameobject_template` / `gameobject`, with `gameobject_addon` start states and animation progress and `gameobject_spawn_entry` for spawns without a fixed entry
+- `0xF110` object guids with the entry in bits 24-47; create blocks with stationary position, low guid and the packed int64 world rotation (TrinityCore `GameObject::UpdatePackedRotation`); doors and buttons with `startOpen` start open
+- `CMSG_GAMEOBJECT_QUERY` -> `SMSG_GAMEOBJECT_QUERY_RESPONSE` (name, icon, cast-bar caption, the 24 data fields, size, quest items)
+- Objects within 150 yards come with the login burst and are created/destroyed as the player moves; each map's spawns are read once, off the event loop, into an in-memory 64-yard grid, so visibility scans never query SQLite
+- Not shown yet: transports (elevators, boats); using objects (doors, chests, herbs, quest objects) is not implemented yet (#12)
+- Upgrade an existing `world.db` with `python tools/import_wotlk_db.py --dump WoTLKDB.sql --gameobjects-only`
+
+### World events
+- There is no event calendar yet, so the world is shown with no world event active: creatures and objects that only spawn during an event (`game_event_creature` / `game_event_gameobject` with a positive event: Darkmoon Faire, Midsummer, Hallow's End, Winter Veil, the Arena Tournament realm NPCs...) are hidden; spawns removed during an event (negative event) stay
+- The links are stored in `creature_events` / `gameobject_events`; refresh them with `python tools/import_wotlk_db.py --dump WoTLKDB.sql --events-only`
+
 ### Chat + emotes
 - `CMSG_MESSAGECHAT` / `SMSG_MESSAGECHAT`: `/say`, `/yell`, `/whisper`, `/me` (emote)
 - `CMSG_TEXT_EMOTE`, `CMSG_EMOTE`, `CMSG_SET_SHEATHED`
@@ -375,12 +387,14 @@ wow335a-pyserver/
         │   ├── creature_movement.py
         │   ├── summons.py
         │   ├── loot.py
+        │   ├── gameobjects.py
         │   └── inventory.py
         ├── server.py
         ├── realmsocket.py  # thin facade, re-exports WorldSocket + constants
         ├── object_update.py
         ├── movement.py
         ├── creature.py
+        ├── gameobject.py  # game object schema, map grid, create blocks, query
         ├── spells.py
         ├── rune_costs.py
         ├── playercreateinfo.sql  # authentic level-1 spells + action bars

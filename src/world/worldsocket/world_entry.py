@@ -108,6 +108,7 @@ class WorldEntryMixin:
         # Static creatures are added to the same update packet so the client
         # receives the whole visible world in one atomic create update.
         creature_blocks = await self.send_npc_spawns()
+        creature_blocks += await self.send_gameobject_spawns()
         # Fetch known spells for this character
         known_spells = character_db.get_character_spells(
             self.config.database.world_path, self.player_guid
@@ -168,6 +169,7 @@ class WorldEntryMixin:
             self._visible_creatures = {}
             self._creature_spawn_cache = {}
             self._creature_scan_pos = None
+            self.forget_gameobjects()
             combat = self._get_combat_state()
             combat["idle"].clear()
             combat["idle_settle"].clear()
@@ -293,6 +295,7 @@ class WorldEntryMixin:
         self._visible_creatures = {}
         self._creature_spawn_cache = {}
         self._creature_scan_pos = None
+        await self.destroy_visible_gameobjects()
         idle = self._get_combat_state()["idle"]
         idle.clear()
         self._get_combat_state()["idle_settle"].clear()
@@ -374,6 +377,7 @@ class WorldEntryMixin:
         """
         if not self.in_world or not self.character:
             return
+        await self.refresh_gameobject_visibility(force=force)
         point = self._creature_scan_point()
         if point is None:
             return

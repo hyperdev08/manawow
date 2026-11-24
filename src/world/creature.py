@@ -853,6 +853,7 @@ def init_creature_db(path: str) -> None:
     con = sqlite3.connect(path)
     try:
         con.executescript(CREATE_CREATURE_SQL)
+        con.executescript(CREATE_CREATURE_EVENTS_SQL)
         # Migrate creature_templates
         columns = {row[1] for row in con.execute("PRAGMA table_info(creature_templates)")}
         for column, declaration in _TEMPLATE_COLUMNS:
@@ -949,13 +950,31 @@ FROM creature_spawns s
 JOIN creature_templates t ON t.entry = s.entry
 """
 
+# CMaNGOS ``game_event_creature``: a positive event spawns the creature only
+# while that world event runs (Darkmoon Faire, Brewfest, the Arena Tournament
+# realm NPCs...), a negative one removes it during the event.  There is no
+# event calendar yet, so the world is shown with no event active: positive
+# event spawns are hidden, negative ones stay.
+CREATE_CREATURE_EVENTS_SQL = """
+CREATE TABLE IF NOT EXISTS creature_events(
+  guid INTEGER NOT NULL,
+  event INTEGER NOT NULL,
+  PRIMARY KEY(guid, event)
+);
+"""
+_NO_ACTIVE_EVENT = (
+    " AND NOT EXISTS (SELECT 1 FROM creature_events e"
+    " WHERE e.guid = s.guid AND e.event > 0)"
+)
+
 
 def get_creature_spawns(path: str, map_id: int) -> List[sqlite3.Row]:
     con = sqlite3.connect(path)
     con.row_factory = sqlite3.Row
     try:
         return con.execute(
-            _SPAWN_SELECT + " WHERE s.map = ? AND t.visible <> 0 ORDER BY s.guid",
+            _SPAWN_SELECT + " WHERE s.map = ? AND t.visible <> 0"
+            + _NO_ACTIVE_EVENT + " ORDER BY s.guid",
             (int(map_id),)
         ).fetchall()
     finally:
@@ -975,7 +994,8 @@ def get_creature_spawns_near(path: str, map_id: int, x: float, y: float,
     ``creature_templates.visible`` is 0 for Blizzard's tooling creatures
     (invisible stalkers, bunnies, quest triggers, "[DND]" props).  They stay in
     the database but are never sent, which is what keeps the starting zones free
-    of invisible units and Karazhan pedestal props.
+    of invisible units and Karazhan pedestal props.  Spawns that belong to a
+    world event (``creature_events``) are left out the same way.
     """
     radius = max(0.0, float(radius))
     if radius <= 0.0:
@@ -988,7 +1008,7 @@ def get_creature_spawns_near(path: str, map_id: int, x: float, y: float,
             _SPAWN_SELECT
             + " WHERE s.map = ? AND t.visible <> 0"
             " AND s.x BETWEEN ? AND ? AND s.y BETWEEN ? AND ?"
-            " ORDER BY s.guid",
+            + _NO_ACTIVE_EVENT + " ORDER BY s.guid",
             (int(map_id), x - radius, x + radius, y - radius, y + radius),
         ).fetchall()
     finally:

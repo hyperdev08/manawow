@@ -159,6 +159,17 @@ ITEM_FIELD_MAXDURABILITY = 61      # uint32
 ITEM_FIELD_CREATE_PLAYED_TIME = 62 # uint32
 ITEM_END = 64
 
+# --- GameObject (relative to OBJECT_END = 6) ----------------------------
+OBJECT_FIELD_CREATED_BY = 6        # uint64
+GAMEOBJECT_DISPLAYID = 8           # uint32
+GAMEOBJECT_FLAGS = 9               # uint32
+GAMEOBJECT_PARENTROTATION = 10     # 4 x float (x, y, z, w)
+GAMEOBJECT_DYNAMIC = 14            # uint16 dyn flags | uint16 path progress
+GAMEOBJECT_FACTION = 15            # uint32
+GAMEOBJECT_LEVEL = 16              # uint32
+GAMEOBJECT_BYTES_1 = 17            # state, type, art kit, anim progress
+GAMEOBJECT_END = 18
+
 # Type masks for OBJECT_FIELD_TYPE
 TYPEMASK_OBJECT = 0x0001
 TYPEMASK_ITEM = 0x0002
