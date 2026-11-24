@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import math
 import random
 import sqlite3
 import struct
@@ -58,25 +59,51 @@ class LootMixin:
         # no fallback generation here: a corpse whose loot has been taken must
         # stay empty when the window is reopened.
         loot_data = spawn["loot_json"] if "loot_json" in spawn.keys() else ""
-        items: List[Tuple[int, int]] = []
+        raw_items: List[Tuple[int, int]] = []
         money = 0
         if loot_data:
             try:
                 parsed = json.loads(loot_data)
-                items = [tuple(item) for item in parsed.get("items", [])]
+                raw_items = [tuple(item) for item in parsed.get("items", [])]
                 money = int(parsed.get("money", 0) or 0)
             except (json.JSONDecodeError, TypeError, ValueError):
-                items = []
+                raw_items = []
                 money = 0
-        items = self._filter_loot_items(items)
+        items = self._filter_loot_items(raw_items)
+        slot_keys = self._loot_slot_keys(raw_items, items)
         empty = not items and money <= 0
         if empty:
             await self._set_loot_json(low_guid, "")
+        # Group loot rules are applied when the window is first opened.  Above
+        # threshold items become need/greed rolls or master-loot slots and are
+        # reported to the client through the loot slot type.  Rolls keep the
+        # raw corpse-row slot index; the window may filter empty slots, so the
+        # UI index is mapped through ``slot_keys``.
+        slot_types = {}
+        group = (manager.group_for(int(self.player_guid or 0))
+                 if manager is not None
+                 and hasattr(manager, "group_for") else None)
+        if group is not None and group.size > 1 and raw_items:
+            qualities = self._item_qualities(raw_items)
+            eligible = self._group_loot_eligible_sessions(group)
+            await manager.begin_group_loot(
+                group, low_guid, target_guid,
+                int((self.character or {}).get("map", 0) or 0),
+                raw_items, qualities, eligible)
+            raw_types = manager.loot_slot_types(
+                group, low_guid, raw_items, qualities,
+                int(self.player_guid or 0))
+            slot_types = {
+                index: raw_types.get(slot_keys[index], 0)
+                for index in range(len(items))
+                if slot_keys[index] in raw_types
+            }
         combat["loot_target"] = target_guid
         combat["loot_items"] = list(items)
+        combat["loot_slot_keys"] = list(slot_keys)
         combat["loot_taken"] = []
         combat["loot_money"] = money
-        await self._send_loot_response(target_guid, items, money)
+        await self._send_loot_response(target_guid, items, money, slot_types)
         if empty:
             # Nothing left: stop offering the loot cursor (TrinityCore removes
             # UNIT_DYNFLAG_LOOTABLE when the loot is emptied).
@@ -115,6 +142,81 @@ class LootMixin:
         finally:
             con.close()
         return [(entry, count) for entry, count in cleaned if entry in valid]
+
+    @staticmethod
+    def _loot_slot_keys(raw_items, filtered_items) -> List[int]:
+        """Map filtered loot-window slots back to corpse-row slots.
+
+        A rolled item is marked with a zero count in the corpse row so its
+        index stays stable, but the client only receives non-empty slots.
+        """
+        keys: List[int] = []
+        used: set[int] = set()
+        for entry, count in filtered_items:
+            match = -1
+            for index, (raw_entry, raw_count) in enumerate(raw_items):
+                if index in used:
+                    continue
+                try:
+                    if int(raw_entry) == int(entry) \
+                            and int(raw_count) == int(count):
+                        match = index
+                        break
+                except (TypeError, ValueError):
+                    continue
+            if match < 0:
+                match = len(keys)
+            used.add(match)
+            keys.append(match)
+        return keys
+
+    def _item_qualities(self, items) -> dict[int, int]:
+        """Return ``{item_entry: quality}`` for the loot window."""
+        entries = {int(item[0]) for item in items if int(item[0]) > 0}
+        if not entries:
+            return {}
+        placeholders = ",".join("?" * len(entries))
+        con = sqlite3.connect(self.config.database.world_path)
+        try:
+            return {
+                int(row[0]): int(row[1] or 0)
+                for row in con.execute(
+                    f"SELECT entry, quality FROM item_templates "
+                    f"WHERE entry IN ({placeholders})", list(entries))
+            }
+        finally:
+            con.close()
+
+    def _group_loot_eligible_sessions(self, group):
+        """Online group members on this map and within group reward range."""
+        manager = self._group_manager() if hasattr(
+            self, "_group_manager") else None
+        if manager is None:
+            return []
+        character = self.character or {}
+        map_id = int(character.get("map", 0) or 0)
+        origin = (float(character.get("x", 0.0) or 0.0),
+                  float(character.get("y", 0.0) or 0.0),
+                  float(character.get("z", 0.0) or 0.0))
+        result = []
+        for session in manager.member_sessions(group, map_id):
+            if session is self:
+                result.append(session)
+                continue
+            if session is None or not getattr(session, "character", None):
+                continue
+            try:
+                if session._get_combat_state().get("dead"):
+                    continue
+            except Exception:
+                pass
+            other = session.character
+            point = (float(other.get("x", 0.0) or 0.0),
+                     float(other.get("y", 0.0) or 0.0),
+                     float(other.get("z", 0.0) or 0.0))
+            if math.dist(origin, point) <= 100.0:
+                result.append(session)
+        return result
 
     LOOT_TABLES = frozenset(("creature_loot_template", "gameobject_loot_template"))
 
@@ -279,13 +381,44 @@ class LootMixin:
         if gameobject.is_gameobject_guid(target):
             self._persist_gameobject_loot(combat)
             return
-        remaining = self._remaining_loot(combat)
+        low_guid = creature.creature_low_guid(target)
         money = int(combat.get("loot_money") or 0)
-        if remaining or money:
-            payload = json.dumps({"items": remaining, "money": money})
+        keys = combat.get("loot_slot_keys") or []
+        taken = {int(index) for index in combat.get("loot_taken") or []}
+        items = list(combat.get("loot_items") or [])
+        if keys and len(keys) >= len(items):
+            # Preserve the corpse-row indices used by in-flight group rolls;
+            # only the taken slots become empty.
+            con = sqlite3.connect(self.config.database.world_path)
+            try:
+                row = con.execute(
+                    "SELECT loot_json FROM creature_spawns WHERE guid = ?",
+                    (int(low_guid),)).fetchone()
+            finally:
+                con.close()
+            raw_items = []
+            if row and row[0]:
+                try:
+                    raw_items = list(json.loads(row[0]).get("items") or [])
+                except (ValueError, TypeError, json.JSONDecodeError):
+                    raw_items = []
+            for index in taken:
+                if index < len(keys) and 0 <= int(keys[index]) < len(raw_items):
+                    raw_items[int(keys[index])] = [0, 0]
+            has_items = any(
+                int(item[0] or 0) > 0 and int(item[1] or 0) > 0
+                for item in raw_items)
+            if has_items or money:
+                payload = json.dumps({"items": raw_items, "money": money})
+            else:
+                payload = ""
         else:
-            payload = ""                   # fully looted: corpse stays empty
-        await self._set_loot_json(creature.creature_low_guid(target), payload)
+            remaining = self._remaining_loot(combat)
+            if remaining or money:
+                payload = json.dumps({"items": remaining, "money": money})
+            else:
+                payload = ""               # fully looted: corpse stays empty
+        await self._set_loot_json(low_guid, payload)
 
     @staticmethod
     def _loot_money(spawn) -> int:
@@ -301,12 +434,15 @@ class LootMixin:
         return random.randint(min_gold, max_gold)
 
     async def _send_loot_response(self, guid: int, items: List[Tuple[int, int]],
-                                  money: int) -> None:
+                                  money: int, slot_types=None) -> None:
         """Send ``SMSG_LOOT_RESPONSE`` with one entry per lootable item.
 
         ``displayInfoId`` comes from ``item_templates`` so the window shows the
         real icon; without a template the client falls back to a question mark.
+        ``slot_types`` maps a loot slot index to a 3.3.5a ``LootSlotType``
+        (0 allow, 1 roll ongoing, 2 master, 3 locked).
         """
+        slot_types = slot_types or {}
         templates = {}
         if items:
             placeholders = ",".join("?" * len(items))
@@ -334,7 +470,7 @@ class LootMixin:
             out += struct.pack("<I", display_id)
             out += struct.pack("<i", 0)           # random property seed
             out += struct.pack("<i", 0)           # random property id
-            out += struct.pack("<B", 0)           # LOOT_FILTER_TYPE_LOOT
+            out += struct.pack("<B", int(slot_types.get(index, 0)) & 0xFF)
         await self.send_packet(Opcodes.SMSG_LOOT_RESPONSE, bytes(out))
 
     async def handle_autostore_loot_item(self, data: bytes):
@@ -351,6 +487,16 @@ class LootMixin:
             return
         if list_id in (combat.get("loot_taken") or []):
             return
+        manager = (self._group_manager()
+                   if hasattr(self, "_group_manager") else None)
+        if manager is not None and hasattr(manager, "group_for"):
+            group = manager.group_for(int(self.player_guid or 0))
+            low_guid = creature.creature_low_guid(
+                int(combat["loot_target"] or 0))
+            keys = combat.get("loot_slot_keys") or []
+            raw_slot = keys[list_id] if list_id < len(keys) else list_id
+            if manager.is_loot_slot_blocked(group, low_guid, raw_slot):
+                return
         item_entry, count = combat["loot_items"][list_id]
         changes = await run_db_write(
             character_db.add_item_to_inventory,
@@ -368,6 +514,119 @@ class LootMixin:
         await self.send_packet(Opcodes.SMSG_LOOT_REMOVED, struct.pack("<B", list_id))
         await self._persist_loot(combat)
         await self._finish_loot_if_empty(combat)
+
+    async def _loot_slot_entry(self, loot_target: int, slot: int):
+        """Return ``(item_entry, count)`` for a live creature loot slot."""
+        if gameobject.is_gameobject_guid(int(loot_target)):
+            return 0, 0
+        low_guid = creature.creature_low_guid(int(loot_target))
+        con = sqlite3.connect(self.config.database.world_path)
+        try:
+            row = con.execute(
+                "SELECT loot_json FROM creature_spawns WHERE guid = ?",
+                (int(low_guid),)).fetchone()
+        finally:
+            con.close()
+        if not row or not row[0]:
+            return 0, 0
+        try:
+            items = list(json.loads(row[0]).get("items") or [])
+            entry, count = items[int(slot)]
+            return int(entry or 0), int(count or 0)
+        except (ValueError, TypeError, IndexError, json.JSONDecodeError):
+            return 0, 0
+
+    async def _remove_rolled_loot_slot(self, loot_target: int, slot: int) -> None:
+        """Mark a distributed loot slot as taken in the corpse row."""
+        if gameobject.is_gameobject_guid(int(loot_target)):
+            return
+        low_guid = creature.creature_low_guid(int(loot_target))
+        con = sqlite3.connect(self.config.database.world_path)
+        try:
+            row = con.execute(
+                "SELECT loot_json FROM creature_spawns WHERE guid = ?",
+                (int(low_guid),)).fetchone()
+        finally:
+            con.close()
+        if row and row[0]:
+            try:
+                parsed = json.loads(row[0])
+                items = list(parsed.get("items") or [])
+                if 0 <= int(slot) < len(items):
+                    items[int(slot)] = [0, 0]
+                parsed["items"] = items
+                await self._set_loot_json(low_guid, json.dumps(parsed))
+            except (ValueError, TypeError, json.JSONDecodeError):
+                pass
+        # Every member with this corpse open must drop the slot too.
+        manager = (self._group_manager()
+                   if hasattr(self, "_group_manager") else None)
+        group = (manager.group_for(int(self.player_guid or 0))
+                 if manager is not None else None)
+        sessions = (manager.member_sessions(group)
+                    if group is not None else [self])
+        for session in sessions:
+            if not getattr(session, "in_world", False):
+                continue
+            combat = session._get_combat_state()
+            if int(combat.get("loot_target") or 0) != int(loot_target):
+                continue
+            keys = combat.get("loot_slot_keys") or []
+            if keys:
+                try:
+                    ui_slot = keys.index(int(slot))
+                except ValueError:
+                    continue
+            else:
+                if int(slot) >= len(combat.get("loot_items") or []):
+                    continue
+                ui_slot = int(slot)
+            taken = combat.setdefault("loot_taken", [])
+            if int(ui_slot) not in taken:
+                taken.append(int(ui_slot))
+            try:
+                await session.send_packet(
+                    Opcodes.SMSG_LOOT_REMOVED,
+                    struct.pack("<B", int(ui_slot)))
+                await session._finish_loot_if_empty(combat)
+            except Exception:
+                pass
+
+    async def _award_rolled_loot(self, loot_target: int, low_guid: int,
+                                 item_entry: int, count: int,
+                                 slot: int) -> bool:
+        """Store a won/master-looted item and remove it from the corpse."""
+        if not self.in_world or not self.character:
+            return False
+        changes = await run_db_write(
+            character_db.add_item_to_inventory,
+            self.config.database.world_path, int(self.player_guid),
+            int(item_entry), int(count),
+        )
+        if not changes:
+            await self._send_inventory_failure(self.INVENTORY_FULL)
+            return False
+        await self._deliver_item_changes(int(item_entry), changes)
+        await self.broadcast_equipment_update()
+        await self._remove_rolled_loot_slot(int(loot_target), int(slot))
+        return True
+
+    async def handle_loot_master_give(self, data: bytes):
+        """``CMSG_LOOT_MASTER_GIVE``: master looter hands a slot to a member."""
+        if not self.in_world or not self.character or len(data) < 17:
+            return
+        loot_target, slot, target_guid = struct.unpack_from("<QBQ", data, 0)
+        manager = (self._group_manager()
+                   if hasattr(self, "_group_manager") else None)
+        if manager is None:
+            return
+        combat = self._get_combat_state()
+        if int(combat.get("loot_target") or 0) != int(loot_target):
+            return
+        keys = combat.get("loot_slot_keys") or []
+        raw_slot = keys[slot] if int(slot) < len(keys) else int(slot)
+        await manager.master_loot_give(
+            self, int(loot_target), int(raw_slot), int(target_guid))
 
     async def _close_loot(self) -> None:
         """Forget the open loot window without changing the stored loot."""
@@ -388,6 +647,7 @@ class LootMixin:
         combat["loot_target"] = 0
         combat["loot_items"] = []
         combat["loot_taken"] = []
+        combat["loot_slot_keys"] = []
         combat["loot_money"] = 0
 
     async def handle_loot_release(self, data: bytes):

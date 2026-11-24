@@ -885,6 +885,9 @@ class CreaturesMixin:
             if manager is not None:
                 manager.forget(int(low_guid))
                 manager.forget_idle(int(low_guid))
+            groups = getattr(getattr(self, "server", None), "groups", None)
+            if groups is not None:
+                groups.forget_corpse(int(low_guid))
             combat = self._get_combat_state()
             combat["aggro"].pop(int(low_guid), None)
             combat.setdefault("idle", {}).pop(int(low_guid), None)

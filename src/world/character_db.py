@@ -237,6 +237,38 @@ CREATE TABLE IF NOT EXISTS character_corpses(
   released INTEGER NOT NULL DEFAULT 0
 );
 
+-- Persistent party/raid groups.  Mirrors TrinityCore's `groups` and
+-- `group_member` tables: a group and its members survive logout/restart, so
+-- offline members are still listed when the group comes back online.
+CREATE TABLE IF NOT EXISTS groups(
+  guid INTEGER PRIMARY KEY,
+  leader_guid INTEGER NOT NULL,
+  raid INTEGER NOT NULL DEFAULT 0,
+  loot_method INTEGER NOT NULL DEFAULT 0,
+  master_looter_guid INTEGER NOT NULL DEFAULT 0,
+  loot_threshold INTEGER NOT NULL DEFAULT 2,
+  icon1 INTEGER NOT NULL DEFAULT 0,
+  icon2 INTEGER NOT NULL DEFAULT 0,
+  icon3 INTEGER NOT NULL DEFAULT 0,
+  icon4 INTEGER NOT NULL DEFAULT 0,
+  icon5 INTEGER NOT NULL DEFAULT 0,
+  icon6 INTEGER NOT NULL DEFAULT 0,
+  icon7 INTEGER NOT NULL DEFAULT 0,
+  icon8 INTEGER NOT NULL DEFAULT 0,
+  counter INTEGER NOT NULL DEFAULT 0,
+  -- Unix time when the last online member left (0 while anyone is online)
+  offline_since INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS group_members(
+  group_guid INTEGER NOT NULL,
+  character_guid INTEGER NOT NULL UNIQUE,
+  subgroup INTEGER NOT NULL DEFAULT 0,
+  member_flags INTEGER NOT NULL DEFAULT 0,
+  roles INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY(group_guid, character_guid)
+);
+CREATE INDEX IF NOT EXISTS idx_group_members_group ON group_members(group_guid);
+
 -- Character spells: one row per spell known by a character.
 CREATE TABLE IF NOT EXISTS character_spells(
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -302,7 +334,8 @@ def _schema_subset(sql: str, tables: set[str]) -> str:
 # retained for tests/tools that explicitly create a self-contained database.
 CREATE_CHARACTER_TABLES_SQL = _schema_subset(
     CREATE_CHARACTERS_SQL, {"characters", "character_items",
-                            "character_spells", "character_corpses"})
+                            "character_spells", "character_corpses",
+                            "groups", "group_members"})
 CREATE_WORLD_TEMPLATE_SQL = _schema_subset(
     CREATE_CHARACTERS_SQL, {"item_templates", "player_classlevelstats",
                             "player_levelstats"})
@@ -322,6 +355,16 @@ def _same_path(first: str, second: str) -> bool:
 def _connect(path: str) -> sqlite3.Connection:
     """Open the database that owns characters, attaching the world bank."""
     return databases.connect_character(path)
+
+
+def _to_signed_64(value: int) -> int:
+    """SQLite INTEGER is signed; store full 64-bit object guids two's-complement."""
+    value = int(value or 0) & 0xFFFFFFFFFFFFFFFF
+    return value - 0x10000000000000000 if value >= 0x8000000000000000 else value
+
+
+def _to_unsigned_64(value: int) -> int:
+    return int(value or 0) & 0xFFFFFFFFFFFFFFFF
 
 
 def _open_raw(path: str) -> sqlite3.Connection:
@@ -371,6 +414,8 @@ CHARACTER_TABLES = (
     "character_corpses",
     "character_quests",
     "character_quests_rewarded",
+    "groups",
+    "group_members",
 )
 
 
@@ -411,6 +456,18 @@ def _migrate_corpse_columns(con: sqlite3.Connection) -> None:
             " NOT NULL DEFAULT 0")
 
 
+def _migrate_group_columns(con: sqlite3.Connection) -> None:
+    try:
+        columns = {row[1] for row in con.execute(
+            "PRAGMA table_info(groups)")}
+    except sqlite3.Error:
+        return
+    if columns and "offline_since" not in columns:
+        con.execute(
+            "ALTER TABLE groups ADD COLUMN offline_since INTEGER"
+            " NOT NULL DEFAULT 0")
+
+
 def init_character_store(path: str) -> None:
     """Create/upgrade the per-character database schema."""
     con = _open_raw(path)
@@ -418,6 +475,7 @@ def init_character_store(path: str) -> None:
         con.executescript(CREATE_CHARACTER_TABLES_SQL)
         _migrate_character_columns(con)
         _migrate_corpse_columns(con)
+        _migrate_group_columns(con)
         _migrate_start_positions(con)
         con.commit()
     finally:
@@ -649,6 +707,7 @@ def init_character_db(path: str) -> None:
         con.executescript(CREATE_CHARACTERS_SQL)
         _migrate_character_columns(con)
         _migrate_corpse_columns(con)
+        _migrate_group_columns(con)
         _migrate_item_template_columns(con)
         _migrate_start_positions(con)
         _seed_starter_items(con)
@@ -898,6 +957,23 @@ def delete_character(path: str, account_id: int, guid: int) -> bool:
                         (int(guid),))
                 except sqlite3.OperationalError:
                     pass
+            try:
+                con.execute(
+                    "DELETE FROM group_members WHERE character_guid = ?",
+                    (int(guid),))
+                con.execute(
+                    "UPDATE groups SET leader_guid = ("
+                    " SELECT character_guid FROM group_members"
+                    " WHERE group_guid = groups.guid LIMIT 1)"
+                    " WHERE leader_guid = ?"
+                    " AND EXISTS (SELECT 1 FROM group_members"
+                    "  WHERE group_guid = groups.guid)",
+                    (int(guid),))
+                con.execute(
+                    "DELETE FROM groups WHERE guid NOT IN ("
+                    " SELECT group_guid FROM group_members)")
+            except sqlite3.OperationalError:
+                pass
         con.commit()
         return cur.rowcount > 0
     finally:
@@ -1064,6 +1140,107 @@ def delete_character_corpse(path: str, guid: int) -> None:
     try:
         con.execute("DELETE FROM character_corpses WHERE character_guid = ?",
                     (int(guid),))
+        con.commit()
+    finally:
+        con.close()
+
+
+def load_groups(path: str) -> List[Dict[str, object]]:
+    """Return every persisted group, including offline members."""
+    con = _connect(path)
+    con.row_factory = sqlite3.Row
+    try:
+        group_rows = con.execute(
+            "SELECT * FROM groups ORDER BY guid").fetchall()
+        member_rows = con.execute(
+            "SELECT gm.group_guid, gm.character_guid, gm.subgroup,"
+            " gm.member_flags, gm.roles, ch.name"
+            " FROM group_members gm"
+            " LEFT JOIN characters ch ON ch.guid = gm.character_guid"
+            " ORDER BY gm.group_guid, gm.character_guid").fetchall()
+    except sqlite3.Error:
+        return []
+    finally:
+        con.close()
+    groups: Dict[int, Dict[str, object]] = {}
+    for row in group_rows:
+        group_id = int(row["guid"])
+        groups[group_id] = {
+            "id": group_id,
+            "leader_guid": _to_unsigned_64(row["leader_guid"]),
+            "raid": bool(row["raid"]),
+            "loot_method": int(row["loot_method"] or 0),
+            "master_looter_guid": _to_unsigned_64(
+                row["master_looter_guid"]),
+            "loot_threshold": int(row["loot_threshold"] or 2),
+            "target_icons": [_to_unsigned_64(row[f"icon{index}"])
+                             for index in range(1, 9)],
+            "counter": int(row["counter"] or 0),
+            "offline_since": (int(row["offline_since"] or 0)
+                              if "offline_since" in row.keys() else 0),
+            "members": [],
+        }
+    for row in member_rows:
+        group = groups.get(int(row["group_guid"]))
+        if group is None:
+            continue
+        guid = _to_unsigned_64(row["character_guid"])
+        if not guid:
+            continue
+        group["members"].append({
+            "guid": guid,
+            "name": str(row["name"] or f"Player-{guid}"),
+            "subgroup": int(row["subgroup"] or 0) & 7,
+            "member_flags": int(row["member_flags"] or 0) & 0xFF,
+            "roles": int(row["roles"] or 0) & 0xFF,
+        })
+    return [group for group in groups.values() if group["members"]]
+
+
+def save_group(path: str, group_dict: Dict[str, object]) -> None:
+    """Insert/replace one persisted group and all of its member rows."""
+    group_id = int(group_dict["id"])
+    icons = list(group_dict.get("target_icons") or [])
+    icons = [int(value or 0) for value in icons[:8]]
+    icons.extend([0] * (8 - len(icons)))
+    con = _connect(path)
+    try:
+        con.execute(
+            "INSERT OR REPLACE INTO groups("
+            "guid, leader_guid, raid, loot_method, master_looter_guid,"
+            " loot_threshold, icon1, icon2, icon3, icon4, icon5, icon6,"
+            " icon7, icon8, counter, offline_since)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (group_id, _to_signed_64(group_dict.get("leader_guid")),
+             1 if group_dict.get("raid") else 0,
+             int(group_dict.get("loot_method") or 0),
+             _to_signed_64(group_dict.get("master_looter_guid")),
+             int(group_dict.get("loot_threshold", 2) or 2),
+             *[_to_signed_64(value) for value in icons],
+             int(group_dict.get("counter") or 0),
+             int(group_dict.get("offline_since") or 0)))
+        con.execute("DELETE FROM group_members WHERE group_guid = ?",
+                    (group_id,))
+        for member in group_dict.get("members") or []:
+            con.execute(
+                "INSERT OR REPLACE INTO group_members("
+                "group_guid, character_guid, subgroup, member_flags, roles)"
+                " VALUES(?,?,?,?,?)",
+                (group_id, _to_signed_64(member["guid"]),
+                 int(member.get("subgroup") or 0) & 7,
+                 int(member.get("member_flags") or 0) & 0xFF,
+                 int(member.get("roles") or 0) & 0xFF))
+        con.commit()
+    finally:
+        con.close()
+
+
+def delete_group(path: str, group_id: int) -> None:
+    con = _connect(path)
+    try:
+        con.execute("DELETE FROM group_members WHERE group_guid = ?",
+                    (int(group_id),))
+        con.execute("DELETE FROM groups WHERE guid = ?", (int(group_id),))
         con.commit()
     finally:
         con.close()

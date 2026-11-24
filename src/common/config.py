@@ -33,6 +33,10 @@ class WorldConfig:
     # An empty value disables terrain/LOS/navmesh; run
     # tools/fetch_client_data.py to populate the default directory.
     client_data: str = "./data/client"
+    # Seconds a group may stay fully offline before it is disbanded.
+    # 3.3.5a keeps the party available for a short reconnect window.
+    # 0 disables the offline expiry.
+    group_offline_expiry: int = 300
 
 
 @dataclass
@@ -105,6 +109,8 @@ class Config:
             motd=str(get(raw, "worldserver", "motd", default="ManaWoW")),
             client_data=("" if raw_client_data is None
                          else str(raw_client_data)),
+            group_offline_expiry=int(get(
+                raw, "worldserver", "group_offline_expiry", default=300)),
         )
         world_path = str(get(raw, "database", "world_path",
                              default="./data/world.db"))

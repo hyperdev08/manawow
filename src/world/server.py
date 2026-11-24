@@ -66,6 +66,9 @@ class WorldServer:
         # while a session is waiting for a query result.
         sqlite_tuning.warm_read(world_path)
         sqlite_tuning.warm_read(databases.character_path(world_path))
+        # Groups live in the character store; load them once the schema has
+        # been created so offline members come back with the group.
+        self.groups.load(databases.character_path(world_path))
         self.log.info(
             f"World database: {world_path}; character database: "
             f"{databases.character_path(world_path)}")
@@ -96,7 +99,7 @@ class WorldServer:
             try:
                 player_guid = int(getattr(session, "player_guid", 0) or 0)
                 self.creature_combat.detach_session(player_guid)
-                await self.groups.on_session_end(player_guid)
+                await self.groups.on_session_end(player_guid, session)
             except Exception:
                 pass
             try:
@@ -107,6 +110,9 @@ class WorldServer:
             self.log.info(f"World client disconnected: {peer}")
 
     async def start(self):
+        # Remove persisted groups whose reconnect window elapsed while the
+        # server was offline (or before the first player logs in).
+        await self.groups.expire_offline_groups()
         try:
             self._server = await asyncio.start_server(
                 self.handle_client, self.config.worldserver.host, self.config.worldserver.port

@@ -149,6 +149,9 @@ class WorldEntryMixin:
             await self._send_login_death_location()
         if hasattr(self, "_send_login_corpse_spawns"):
             await self._send_login_corpse_spawns()
+        if self.server is not None and getattr(
+                self.server, "groups", None) is not None:
+            await self.server.groups.on_player_login(self)
 
     async def handle_logout_request(self, data: bytes):
         if self.in_world:
@@ -163,12 +166,15 @@ class WorldEntryMixin:
                     self.server, "creature_combat", None) is not None:
                 self.server.creature_combat.detach_session(
                     int(self.player_guid or 0))
+            # Mark this session offline before the group manager broadcasts the
+            # updated group list, so peers see the member as disconnected but
+            # the persisted group keeps them.
+            self.in_world = False
             if self.server is not None and getattr(
                     self.server, "groups", None) is not None:
                 await self.server.groups.on_session_end(
-                    int(self.player_guid or 0))
+                    int(self.player_guid or 0), self)
             self.log.info(f"Returning '{self.account_name}' to character selection")
-            self.in_world = False
             self.world_entry_complete = False
             self.player_guid = None
             self.character = None

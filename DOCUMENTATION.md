@@ -99,9 +99,17 @@ A real 3.3.5a client can now log in, pick a character and **enter the world**:
 - Party member frames receive periodic `SMSG_PARTY_MEMBER_STATS_FULL` updates (health, power, level, zone, position)
 - Party/raid chat is relayed only to group members; cross-faction invites are rejected
 - Groups are 5-player parties or 40-player raids with eight subgroups; the leader is transferred when the current leader leaves
+- Groups and their members are persisted in `groups` / `group_members` in the character database. A logout keeps the member in the group as offline (`MEMBER_STATUS_OFFLINE`), and both the group and its settings are restored after a server restart or when a member logs back in
+- If every member stays offline for the reconnect window, the group is automatically disbanded. The default is five minutes (`worldserver.group_offline_expiry`, seconds; `0` disables it); a reconnect inside the window clears the timer and restores the group
+- Loot method (`CMSG_LOOT_METHOD`) follows the 3.3.5a enum: free-for-all, round robin, master loot, group loot and need-before-greed, with a configurable loot threshold (uncommon..artifact). The settings are stored with the group and shown in `SMSG_GROUP_LIST`
+- Group loot / need-before-greed start 60-second need/greed/pass rolls for items at or above the threshold (`SMSG_LOOT_START_ROLL`, `SMSG_LOOT_ROLL` roll results, `SMSG_LOOT_ROLL_WON`, `SMSG_LOOT_ALL_PASSED`); silent members pass when the timer expires, and an all-pass leaves the item lootable by hand
+- Master loot blocks above-threshold items for everyone except the master looter, sends `SMSG_LOOT_MASTER_LIST`, and distributes slots through `CMSG_LOOT_MASTER_GIVE`
+- `CMSG_OPT_OUT_OF_LOOT` makes a member automatically pass on future group rolls
+- Ready checks (`MSG_RAID_READY_CHECK`, `MSG_RAID_READY_CHECK_CONFIRM`, `MSG_RAID_READY_CHECK_FINISHED`) are leader/assistant-driven and time out after 30 seconds
+- Raid target icons (`MSG_RAID_TARGET_UPDATE`) support all eight markers, leader/assistant restriction in raids, duplicate-marker cleanup and persistence
 - Group XP is split among nearby living members on the same map with a 10% bonus per extra member (capped at 1.5x)
 - Loot rights belong to the tagger's group; only one member can have a corpse's loot window open at a time to prevent duplicate item takes
-- Limitations: groups are session-scoped (no MySQL persistence/offline members yet); need/greed/master loot, raid markers, ready checks and LFG are not implemented
+- Limitations: round-robin looter rotation, disenchant rolls and LFG are not implemented
 
 ### Death, ghosts, corpses and spirit healers
 - On death the server stores a corpse at the death position, records `death_state` (`1` dead, `2` ghost) and sends `SMSG_DEATH_RELEASE_LOC` with the nearest usable graveyard.

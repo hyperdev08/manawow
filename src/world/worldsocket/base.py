@@ -364,12 +364,28 @@ class SocketBase:
                 await self.handle_group_change_subgroup(data)
             elif opcode == Opcodes.CMSG_GROUP_SWAP_SUB_GROUP:
                 await self.handle_group_swap_subgroup(data)
+            elif opcode == Opcodes.CMSG_GROUP_ASSISTANT_LEADER:
+                await self.handle_group_assistant_leader(data)
+            elif opcode == Opcodes.CMSG_LOOT_METHOD:
+                await self.handle_loot_method(data)
+            elif opcode == Opcodes.MSG_RAID_TARGET_UPDATE:
+                await self.handle_raid_target_update(data)
+            elif opcode == Opcodes.MSG_RAID_READY_CHECK:
+                await self.handle_raid_ready_check(data)
+            elif opcode == Opcodes.MSG_RAID_READY_CHECK_FINISHED:
+                await self.handle_raid_ready_check_finished(data)
             elif opcode == Opcodes.CMSG_REQUEST_PARTY_MEMBER_STATS:
                 await self.handle_request_party_member_stats(data)
             elif opcode == Opcodes.CMSG_LOOT_RELEASE:
                 await self.handle_loot_release(data)
             elif opcode == Opcodes.CMSG_LOOT_MONEY:
                 await self.handle_loot_money(data)
+            elif opcode == Opcodes.CMSG_LOOT_MASTER_GIVE:
+                await self.handle_loot_master_give(data)
+            elif opcode == Opcodes.CMSG_LOOT_ROLL:
+                await self.handle_loot_roll(data)
+            elif opcode == Opcodes.CMSG_OPT_OUT_OF_LOOT:
+                await self.handle_opt_out_of_loot(data)
             elif opcode == Opcodes.CMSG_AUTOSTORE_LOOT_ITEM:
                 await self.handle_autostore_loot_item(data)
             elif opcode == Opcodes.CMSG_LIST_INVENTORY:
@@ -438,7 +454,9 @@ class SocketBase:
                 "loot_target": 0,
                 "loot_items": [],
                 "loot_taken": [],
+                "loot_slot_keys": [],
                 "loot_money": 0,
+                "pass_on_group_loot": False,
                 "selected_guid": 0,
                 "dead": False,
                 "last_respawn_scan": 0.0,

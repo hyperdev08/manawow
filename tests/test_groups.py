@@ -114,7 +114,7 @@ def test_group_list_and_member_stats_layouts():
     assert leader_guid == 100
     loot_method, master, threshold, dungeon, raid, heroic = struct.unpack_from(
         "<BQBBBB", payload, pos)
-    assert loot_method == 0 and master == 0
+    assert loot_method == 3 and master == 0
     assert (threshold, dungeon, raid, heroic) == (2, 0, 0, 0)
 
     stats = group_packets.build_party_member_stats_full(member)
