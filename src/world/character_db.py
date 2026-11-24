@@ -8,6 +8,8 @@ import struct
 import zlib
 from typing import Dict, List, Optional, Tuple
 
+from src.world import databases
+
 CREATE_CHARACTERS_SQL = """
 CREATE TABLE IF NOT EXISTS characters(
   guid INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -257,6 +259,221 @@ CREATE TABLE IF NOT EXISTS player_levelstats(
 CREATE INDEX IF NOT EXISTS idx_player_levelstats_race_class ON player_levelstats(race, class);
 """
 
+
+def _schema_subset(sql: str, tables: set[str]) -> str:
+    """Extract table/index statements for the named tables."""
+    statements = []
+    for statement in sql.split(";"):
+        text = statement.strip()
+        if not text:
+            continue
+        if re.search(r"\bINDEX\b", text[:80], re.I):
+            match = re.search(r"\bON\s+([A-Za-z_][A-Za-z0-9_]*)", text,
+                              re.I)
+            name = match.group(1) if match else ""
+        else:
+            match = re.search(
+                r"\bTABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?([A-Za-z_][A-Za-z0-9_]*)",
+                text, re.I)
+            name = match.group(1) if match else ""
+        if name.lower() in tables:
+            statements.append(text)
+    return ";\n".join(statements) + ";"
+
+
+# Character data is stored in its own SQLite file.  The combined schema is
+# retained for tests/tools that explicitly create a self-contained database.
+CREATE_CHARACTER_TABLES_SQL = _schema_subset(
+    CREATE_CHARACTERS_SQL, {"characters", "character_items",
+                            "character_spells"})
+CREATE_WORLD_TEMPLATE_SQL = _schema_subset(
+    CREATE_CHARACTERS_SQL, {"item_templates", "player_classlevelstats",
+                            "player_levelstats"})
+
+WORLD_VIEW_TABLES = databases.CHARACTER_WORLD_VIEWS
+
+
+def configure(world_path: str, character_path: Optional[str] = None) -> None:
+    """Route character-database calls to a separate file when configured."""
+    databases.configure(world_path, character_path)
+
+
+def _same_path(first: str, second: str) -> bool:
+    return databases.same_path(first, second)
+
+
+def _connect(path: str) -> sqlite3.Connection:
+    """Open the database that owns characters, attaching the world bank."""
+    return databases.connect_character(path)
+
+
+def _open_raw(path: str) -> sqlite3.Connection:
+    """Open ``path`` directly, bypassing the split-database routing."""
+    return sqlite3.connect(path)
+
+
+def _migrate_item_template_columns(con: sqlite3.Connection) -> None:
+    """Add item-template columns introduced after the first schema revision."""
+    columns = {row[1] for row in con.execute(
+        "PRAGMA table_info(item_templates)")}
+    for index in range(1, 6):
+        column = f"spell_ppm_rate{index}"
+        if column not in columns:
+            con.execute(
+                f"ALTER TABLE item_templates ADD COLUMN {column}"
+                " REAL NOT NULL DEFAULT 0.0")
+    if "start_quest" not in columns:
+        # item_template.startquest: using the item opens that quest.
+        con.execute(
+            "ALTER TABLE item_templates ADD COLUMN start_quest INTEGER"
+            " NOT NULL DEFAULT 0")
+    if "buy_count" not in columns:
+        # Vendors sell some items in fixed bundles (water x5, arrows x200).
+        con.execute(
+            "ALTER TABLE item_templates ADD COLUMN buy_count INTEGER"
+            " NOT NULL DEFAULT 1")
+
+
+def init_world_db(path: str) -> None:
+    """Create/upgrade the world-side template tables used by characters."""
+    con = _open_raw(path)  # world bank: never routed
+    try:
+        con.executescript(CREATE_WORLD_TEMPLATE_SQL)
+        _migrate_item_template_columns(con)
+        _seed_starter_items(con)
+        con.commit()
+    finally:
+        con.close()
+
+
+# Tables that move from the legacy combined world database into characters.db.
+CHARACTER_TABLES = (
+    "characters",
+    "character_items",
+    "character_spells",
+    "character_quests",
+    "character_quests_rewarded",
+)
+
+
+def _table_names(con: sqlite3.Connection, schema: str = "main") -> set[str]:
+    return {
+        str(row[0])
+        for row in con.execute(
+            f"SELECT name FROM {schema}.sqlite_master WHERE type = 'table'")
+    }
+
+
+def _migrate_character_columns(con: sqlite3.Connection) -> None:
+    """Add character columns introduced after the first schema revision."""
+    columns = {row[1] for row in con.execute("PRAGMA table_info(characters)")}
+    additions = {
+        "o": "REAL NOT NULL DEFAULT 0.0",
+        "bytes1": "INTEGER NOT NULL DEFAULT 0",
+        "bytes2": "INTEGER NOT NULL DEFAULT 0",
+        "xp": "INTEGER NOT NULL DEFAULT 0",
+        "money": "INTEGER NOT NULL DEFAULT 0",
+    }
+    for name, declaration in additions.items():
+        if name not in columns:
+            con.execute(
+                f"ALTER TABLE characters ADD COLUMN {name} {declaration}")
+
+
+def init_character_store(path: str) -> None:
+    """Create/upgrade the per-character database schema."""
+    con = _open_raw(path)
+    try:
+        con.executescript(CREATE_CHARACTER_TABLES_SQL)
+        _migrate_character_columns(con)
+        _migrate_start_positions(con)
+        con.commit()
+    finally:
+        con.close()
+
+
+def _backfill_split_store(character_path: str, world_path: str) -> None:
+    """Grant missing starter spells using the attached world bank."""
+    con = _open_raw(character_path)
+    try:
+        con.execute("ATTACH DATABASE ? AS world", (world_path,))
+        con.execute(
+            "CREATE TEMP VIEW IF NOT EXISTS playercreateinfo_spell AS"
+            " SELECT * FROM world.playercreateinfo_spell")
+        _backfill_starter_spells(con, seed_world=False)
+        con.commit()
+    finally:
+        con.close()
+
+
+def migrate_legacy_characters(world_path: str,
+                              character_path: str) -> int:
+    """Copy character rows out of a pre-split combined ``world.db``.
+
+    The function only runs into an empty character store, so it is safe to call
+    on every startup: an existing ``characters.db`` is never merged with or
+    overwritten by stale copies left in an old world database.  Returns the
+    number of character rows copied.
+    """
+    world = _open_raw(world_path)
+    try:
+        if "characters" not in _table_names(world):
+            return 0
+        legacy_count = int(world.execute(
+            "SELECT COUNT(*) FROM characters").fetchone()[0] or 0)
+        if not legacy_count:
+            return 0
+    finally:
+        world.close()
+
+    con = _open_raw(character_path)
+    try:
+        if "characters" not in _table_names(con):
+            return 0
+        existing = int(con.execute(
+            "SELECT COUNT(*) FROM characters").fetchone()[0] or 0)
+        if existing:
+            return 0
+        con.execute("ATTACH DATABASE ? AS world", (world_path,))
+        copied = 0
+        for table in CHARACTER_TABLES:
+            if table not in _table_names(con) or table not in _table_names(
+                    con, "world"):
+                continue
+            main_columns = [row[1] for row in con.execute(
+                f"PRAGMA main.table_info({table})")]
+            world_columns = {row[1] for row in con.execute(
+                f"PRAGMA world.table_info({table})")}
+            columns = [name for name in main_columns if name in world_columns]
+            if not columns:
+                continue
+            column_list = ", ".join(f'"{name}"' for name in columns)
+            cur = con.execute(
+                f'INSERT OR IGNORE INTO main."{table}"({column_list})'
+                f' SELECT {column_list} FROM world."{table}"')
+            if table == "characters":
+                copied = max(0, int(cur.rowcount or 0))
+        con.commit()
+        if copied:
+            print(f"Migrated {copied} character(s) from the legacy world database")
+        return copied
+    finally:
+        con.close()
+
+
+def init_split_databases(world_path: str, character_path: str) -> None:
+    """Create/upgrade the world bank and the separate character store."""
+    init_world_db(world_path)
+    init_character_store(character_path)
+    # Character quest tables must exist before the legacy rows are copied.
+    from src.world import quests
+    quests.init_character_quest_db(character_path)
+    migrate_legacy_characters(world_path, character_path)
+    # Backfill after the migration so characters imported from the old
+    # combined database pick up any missing starter spells immediately.
+    _backfill_split_store(character_path, world_path)
+
+
 _NAME_RE = re.compile(r"^[A-Za-z]{2,12}$")
 # 3.3.5a writes INVENTORY_SLOT_BAG_END (23) entries: 19 equipment slots plus
 # the 4 bag slots.  Sending only 19 truncates every record and the client
@@ -388,42 +605,16 @@ def is_valid_race_class(race: int, char_class: int) -> bool:
 
 
 def init_character_db(path: str) -> None:
-    con = sqlite3.connect(path)
+    """Create the combined schema in one file (tests and one-off tools).
+
+    Production uses :func:`init_split_databases` so that characters live in
+    ``data/characters.db`` while the regenerated world bank stays read-only.
+    """
+    con = _open_raw(path)  # init: may be the combined test database
     try:
         con.executescript(CREATE_CHARACTERS_SQL)
-        # Older databases predate the orientation column used for login.
-        columns = {row[1] for row in con.execute("PRAGMA table_info(characters)")}
-        if "o" not in columns:
-            con.execute("ALTER TABLE characters ADD COLUMN o REAL NOT NULL DEFAULT 0.0")
-        if "bytes1" not in columns:
-            con.execute("ALTER TABLE characters ADD COLUMN bytes1 INTEGER NOT NULL DEFAULT 0")
-        if "bytes2" not in columns:
-            con.execute("ALTER TABLE characters ADD COLUMN bytes2 INTEGER NOT NULL DEFAULT 0")
-        if "xp" not in columns:
-            con.execute("ALTER TABLE characters ADD COLUMN xp INTEGER NOT NULL DEFAULT 0")
-        if "money" not in columns:
-            con.execute("ALTER TABLE characters ADD COLUMN money INTEGER NOT NULL DEFAULT 0")
-        # Item proc rates are imported from item_template.spellppmRate_*.  Older
-        # databases only have the spell ids/triggers.
-        item_columns = {
-            row[1] for row in con.execute("PRAGMA table_info(item_templates)")
-        }
-        for index in range(1, 6):
-            column = f"spell_ppm_rate{index}"
-            if column not in item_columns:
-                con.execute(
-                    f"ALTER TABLE item_templates ADD COLUMN {column}"
-                    " REAL NOT NULL DEFAULT 0.0")
-        if "start_quest" not in item_columns:
-            # item_template.startquest: using the item opens that quest.
-            con.execute(
-                "ALTER TABLE item_templates ADD COLUMN start_quest INTEGER NOT NULL DEFAULT 0"
-            )
-        if "buy_count" not in item_columns:
-            # Vendors sell some items in fixed bundles (water x5, arrows x200).
-            con.execute(
-                "ALTER TABLE item_templates ADD COLUMN buy_count INTEGER NOT NULL DEFAULT 1"
-            )
+        _migrate_character_columns(con)
+        _migrate_item_template_columns(con)
         _migrate_start_positions(con)
         _seed_starter_items(con)
         _backfill_starter_spells(con)
@@ -460,14 +651,15 @@ def _starter_spells_for(con: sqlite3.Connection, race: int,
 
 def get_starter_spells(path: str, race: int, char_class: int) -> List[int]:
     """Public helper for callers that only have the database path."""
-    con = sqlite3.connect(path)
+    con = _connect(path)
     try:
         return _starter_spells_for(con, race, char_class)
     finally:
         con.close()
 
 
-def _backfill_starter_spells(con: sqlite3.Connection) -> None:
+def _backfill_starter_spells(con: sqlite3.Connection,
+                             seed_world: bool = True) -> None:
     """Grant any missing starter spells to every character.
 
     Characters created before the authentic ``playercreateinfo_spell`` data
@@ -476,15 +668,21 @@ def _backfill_starter_spells(con: sqlite3.Connection) -> None:
     the table does not exist yet (a tool opened the character database before
     ``init_creature_db``), the backfill is skipped rather than guessing with
     the class-only fallback.
+
+    ``seed_world`` seeds the hand-written starter item rows into the same file.
+    A split character database must pass ``False``: its world templates live in
+    the attached world bank.
     """
     try:
         if con.execute(
                 "SELECT 1 FROM playercreateinfo_spell LIMIT 1").fetchone() is None:
-            _seed_starter_items(con)
+            if seed_world:
+                _seed_starter_items(con)
             con.commit()
             return
     except sqlite3.Error:
-        _seed_starter_items(con)
+        if seed_world:
+            _seed_starter_items(con)
         con.commit()
         return
     rows = con.execute("SELECT guid, race, class FROM characters").fetchall()
@@ -500,8 +698,9 @@ def _backfill_starter_spells(con: sqlite3.Connection) -> None:
         con.commit()
         print(f"Backfilled {added} missing starter spell(s)")
 
-    _seed_starter_items(con)
-    con.commit()
+    if seed_world:
+        _seed_starter_items(con)
+        con.commit()
 
 
 def _migrate_start_positions(con: sqlite3.Connection) -> None:
@@ -541,7 +740,7 @@ def normalize_name(name: str) -> Optional[str]:
 
 
 def list_characters(path: str, account_id: int) -> List[sqlite3.Row]:
-    con = sqlite3.connect(path)
+    con = _connect(path)
     con.row_factory = sqlite3.Row
     try:
         return con.execute(
@@ -554,7 +753,7 @@ def list_characters(path: str, account_id: int) -> List[sqlite3.Row]:
 
 def get_character(path: str, account_id: int, guid: int) -> Optional[sqlite3.Row]:
     """Return the character row if it belongs to ``account_id``."""
-    con = sqlite3.connect(path)
+    con = _connect(path)
     con.row_factory = sqlite3.Row
     try:
         return con.execute(
@@ -578,7 +777,7 @@ def get_character_by_guid(path: str, guid: int) -> Optional[sqlite3.Row]:
     guid = int(guid)
     if not (0 < guid <= 0xFFFFFFFF):
         return None
-    con = sqlite3.connect(path)
+    con = _connect(path)
     con.row_factory = sqlite3.Row
     try:
         return con.execute(
@@ -599,7 +798,7 @@ def find_character_by_name(path: str, name: str) -> Optional[sqlite3.Row]:
     normalized = normalize_name(name)
     if normalized is None:
         return None
-    con = sqlite3.connect(path)
+    con = _connect(path)
     con.row_factory = sqlite3.Row
     try:
         return con.execute(
@@ -629,7 +828,7 @@ def create_character(path: str, account_id: int, name: str, race: int, char_clas
     """
     map_id, zone, x, y, z, o = start_position(race, char_class)
     level = start_level(char_class)
-    con = sqlite3.connect(path)
+    con = _connect(path)
     try:
         cur = con.execute(
             "INSERT INTO characters(account_id, name, race, class, gender, skin, face, "
@@ -647,7 +846,7 @@ def create_character(path: str, account_id: int, name: str, race: int, char_clas
 
 
 def delete_character(path: str, account_id: int, guid: int) -> bool:
-    con = sqlite3.connect(path)
+    con = _connect(path)
     try:
         cur = con.execute(
             "DELETE FROM characters WHERE guid = ? AND account_id = ?",
@@ -663,7 +862,7 @@ def delete_character(path: str, account_id: int, guid: int) -> bool:
 
 
 def character_exists(path: str, account_id: int, guid: int) -> bool:
-    con = sqlite3.connect(path)
+    con = _connect(path)
     try:
         row = con.execute(
             "SELECT 1 FROM characters WHERE guid = ? AND account_id = ?",
@@ -693,7 +892,7 @@ def update_character_position(path: str, guid: int, x: float, y: float, z: float
         params.append(int(zone))
     params.append(int(guid))
 
-    con = sqlite3.connect(path)
+    con = _connect(path)
     try:
         con.execute(
             f"UPDATE characters SET {', '.join(assignments)} WHERE guid = ?",
@@ -1040,7 +1239,7 @@ def client_cache_version(path: str) -> int:
     derived from SQL aggregates over the fields the client actually caches
     instead of hashing every row in Python.
     """
-    con = sqlite3.connect(path)
+    con = _connect(path)
     try:
         row = con.execute(
             """SELECT COUNT(*),
@@ -1058,7 +1257,7 @@ def client_cache_version(path: str) -> int:
                       COALESCE(SUM(buy_price), 0),
                       COALESCE(SUM(LENGTH(name1)), 0),
                       COALESCE(SUM(LENGTH(description)), 0),
-                      COALESCE(MAX(rowid), 0)
+                      COALESCE(MAX(entry), 0)
                FROM item_templates"""
         ).fetchone()
     finally:
@@ -1070,7 +1269,7 @@ def client_cache_version(path: str) -> int:
 
 def get_item_template(path: str, entry: int) -> Optional[sqlite3.Row]:
     """Fetch an item template by entry."""
-    con = sqlite3.connect(path)
+    con = _connect(path)
     con.row_factory = sqlite3.Row
     try:
         return con.execute(
@@ -1087,7 +1286,7 @@ def get_character_inventory(path: str, character_guid: int) -> Dict[int, sqlite3
     template is missing) so callers can build visual packets such as
     ``SMSG_MIRRORIMAGE_DATA`` without a second query per item.
     """
-    con = sqlite3.connect(path)
+    con = _connect(path)
     con.row_factory = sqlite3.Row
     try:
         rows = con.execute(
@@ -1164,7 +1363,7 @@ def get_equipped_item_totals(path: str, character_guid: int) -> Dict[str, int]:
     resistance_columns = ", ".join(
         f"it.{column}" for _key, column in _ITEM_RESISTANCES
     )
-    con = sqlite3.connect(path)
+    con = _connect(path)
     try:
         rows = con.execute(
             f"SELECT {resistance_columns}, {stat_columns},"
@@ -1238,7 +1437,7 @@ def get_equipment_for_char_enum(path: str, character_guid: int) -> List[Tuple[in
     
     Returns [(display_id, inv_type, enchant_visual), ...] for slots 0..22.
     """
-    con = sqlite3.connect(path)
+    con = _connect(path)
     con.row_factory = sqlite3.Row
     try:
         # Join items with templates to get display_id and inventory_type
@@ -1267,7 +1466,7 @@ def create_character_items(path: str, character_guid: int, items: List[Tuple[int
     ``items`` is a list of (item_entry, slot) tuples.
     Returns list of created items with their DB IDs and assigned slots.
     """
-    con = sqlite3.connect(path)
+    con = _connect(path)
     try:
         created_items = []
         for entry, slot in items:
@@ -1314,7 +1513,7 @@ def add_item_to_inventory(path: str, character_guid: int, entry: int,
     changed).  The whole move is atomic: when all of ``count`` cannot be
     stored, nothing is written and ``None`` is returned.
     """
-    con = sqlite3.connect(path)
+    con = _connect(path)
     try:
         template = con.execute(
             "SELECT stackable, max_durability FROM item_templates WHERE entry = ?",
@@ -1614,7 +1813,7 @@ def grant_starter_items(path: str, character_guid: int, race: int,
     created = create_character_items(path, character_guid, items)
 
     # Also grant starter spells
-    con = sqlite3.connect(path)
+    con = _connect(path)
     try:
         _grant_starter_spells(con, character_guid, race, char_class)
         con.commit()
@@ -1626,7 +1825,7 @@ def grant_starter_items(path: str, character_guid: int, race: int,
 
 def delete_character_item(path: str, character_guid: int, slot: int) -> bool:
     """Delete a single item from a character's inventory."""
-    con = sqlite3.connect(path)
+    con = _connect(path)
     try:
         cur = con.execute(
             "DELETE FROM character_items WHERE character_guid = ? AND slot = ?",
@@ -1643,7 +1842,7 @@ def swap_character_items(path: str, character_guid: int, slot_a: int, slot_b: in
     
     Returns True if both slots had items and were swapped, False if either was empty.
     """
-    con = sqlite3.connect(path)
+    con = _connect(path)
     try:
         row_a = con.execute(
             "SELECT * FROM character_items WHERE character_guid = ? AND slot = ?",
@@ -1681,7 +1880,7 @@ def swap_character_items(path: str, character_guid: int, slot_a: int, slot_b: in
 
 def get_character_spells(path: str, character_guid: int) -> List[sqlite3.Row]:
     """Fetch all active spells known by a character."""
-    con = sqlite3.connect(path)
+    con = _connect(path)
     con.row_factory = sqlite3.Row
     try:
         return con.execute(
@@ -1709,7 +1908,7 @@ def get_character_action_spells(path: str, character_guid: int) -> List[int]:
     Dodge or One-Handed Axes are still sent in ``SMSG_INITIAL_SPELLS`` (the
     spellbook shows them) but cannot be placed on an action button.
     """
-    con = sqlite3.connect(path)
+    con = _connect(path)
     con.row_factory = sqlite3.Row
     try:
         rows = con.execute(
@@ -1758,7 +1957,7 @@ def get_character_action_buttons(path: str, character_guid: int) -> dict:
     has no row for the character (an un-imported database), fall back to Attack
     plus every known non-passive spell in spell-id order.
     """
-    con = sqlite3.connect(path)
+    con = _connect(path)
     con.row_factory = sqlite3.Row
     try:
         char = con.execute(

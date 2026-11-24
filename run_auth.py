@@ -19,7 +19,14 @@ async def main():
         cfg_path = os.path.join(os.path.dirname(__file__), "config", "config.example.yaml")
         print(f"config.yaml not found; using {cfg_path}")
     cfg = Config.load(cfg_path)
-    ensure_dirs(os.path.dirname(cfg.database.auth_path), os.path.dirname(cfg.database.world_path), cfg.logging.log_dir)
+    cfg.resolve_database_paths(os.path.dirname(os.path.abspath(__file__)))
+    character_path = getattr(cfg.database, "character_path", "")
+    ensure_dirs(
+        os.path.dirname(cfg.database.auth_path),
+        os.path.dirname(cfg.database.world_path),
+        os.path.dirname(character_path) if character_path else "",
+        cfg.logging.log_dir,
+    )
     server = AuthServer(cfg)
     await server.start()
     await asyncio.Event().wait()

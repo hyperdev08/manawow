@@ -11,6 +11,7 @@ from src.common import sqlite_tuning
 from src.world.realmsocket import WorldSocket
 from src.world import character_db
 from src.world import creature
+from src.world import databases
 from src.world import gameobject
 from src.world import geometry
 from src.world import quests
@@ -35,17 +36,29 @@ class WorldServer:
         self.creature_pools = None
         self.packet_log = get_packet_log()
         self.packet_log.Initialize(config.logging.log_dir)
+        # Characters live in their own database when one is configured; every
+        # character_db/quests call still receives the world path and is routed
+        # by src.world.databases.
+        world_path = config.database.world_path
+        character_path = getattr(config.database, "character_path", "")
+        character_db.configure(world_path, character_path)
         # WAL + synchronous=NORMAL: rollback-journal commits blocked the event
         # loop for seconds on Windows (see src/common/sqlite_tuning.py).
-        sqlite_tuning.install(config.database.world_path)
+        sqlite_tuning.install(world_path, character_path or None)
         # Creature/spell tables (including the bundled 3.3.5a starter spells)
         # come first so the character backfill can read them.
-        creature.init_creature_db(config.database.world_path)
-        # Ensure the character schema exists and is up to date (adds the
-        # orientation column to databases created before world entry existed).
-        character_db.init_character_db(config.database.world_path)
-        quests.init_quest_db(config.database.world_path)
-        gameobject.init_gameobject_db(config.database.world_path)
+        creature.init_creature_db(world_path)
+        if databases.is_split():
+            character_db.init_split_databases(world_path, character_path)
+            quests.init_world_quest_db(world_path)
+        else:
+            # Combined database: keep the test/tool layout working.
+            character_db.init_character_db(world_path)
+            quests.init_quest_db(world_path)
+        gameobject.init_gameobject_db(world_path)
+        self.log.info(
+            f"World database: {world_path}; character database: "
+            f"{databases.character_path(world_path)}")
         world_geometry = geometry.get_geometry(config,
                                                config.database.world_path)
         if world_geometry is None:

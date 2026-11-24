@@ -18,6 +18,7 @@ import sqlite3
 import struct
 from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
+from src.world import databases
 from src.world import update_fields as F
 
 # ---------------------------------------------------------------------------
@@ -169,7 +170,8 @@ def _column_declaration(dump_column: str) -> str:
 
 QUEST_COLUMNS: Tuple[str, ...] = tuple(column_name(c) for c in QUEST_DUMP_COLUMNS)
 
-CREATE_QUEST_SQL = (
+# World-owned quest content.  Imported from the pinned CMaNGOS dump.
+CREATE_WORLD_QUEST_SQL = (
     "CREATE TABLE IF NOT EXISTS quest_templates(\n  "
     + ",\n  ".join(_column_declaration(c) for c in QUEST_DUMP_COLUMNS)
     + "\n);\n"
@@ -206,7 +208,11 @@ CREATE TABLE IF NOT EXISTS areatrigger_quests(
   trigger_id INTEGER PRIMARY KEY,
   quest INTEGER NOT NULL
 );
+"""
+)
 
+# Per-character quest log, stored in characters.db.
+CREATE_CHARACTER_QUEST_SQL = """
 -- Active quest log, one row per quest (max 25 per character).
 CREATE TABLE IF NOT EXISTS character_quests(
   character_guid INTEGER NOT NULL,
@@ -227,21 +233,50 @@ CREATE TABLE IF NOT EXISTS character_quests_rewarded(
   PRIMARY KEY(character_guid, quest_id)
 );
 """
-)
+
+# The combined schema used by tests and one-off tools.
+CREATE_QUEST_SQL = CREATE_WORLD_QUEST_SQL + CREATE_CHARACTER_QUEST_SQL
+
+
+def _migrate_quest_template_columns(con: sqlite3.Connection) -> None:
+    existing = {row[1] for row in con.execute(
+        "PRAGMA table_info(quest_templates)")}
+    for dump_column in QUEST_DUMP_COLUMNS:
+        if column_name(dump_column) not in existing:
+            con.execute(
+                "ALTER TABLE quest_templates ADD COLUMN "
+                + _column_declaration(dump_column)
+            )
+
+
+def init_world_quest_db(path: str) -> None:
+    """Create/upgrade only the static quest content of the world bank."""
+    con = sqlite3.connect(path)
+    try:
+        con.executescript(CREATE_WORLD_QUEST_SQL)
+        _migrate_quest_template_columns(con)
+        con.commit()
+    finally:
+        con.close()
+    clear_cache()
+
+
+def init_character_quest_db(path: str) -> None:
+    """Create/upgrade the per-character quest log."""
+    con = sqlite3.connect(path)
+    try:
+        con.executescript(CREATE_CHARACTER_QUEST_SQL)
+        con.commit()
+    finally:
+        con.close()
 
 
 def init_quest_db(path: str) -> None:
-    """Create/upgrade the quest tables (idempotent)."""
+    """Create/upgrade the combined quest schema (idempotent)."""
     con = sqlite3.connect(path)
     try:
         con.executescript(CREATE_QUEST_SQL)
-        existing = {row[1] for row in con.execute("PRAGMA table_info(quest_templates)")}
-        for dump_column in QUEST_DUMP_COLUMNS:
-            if column_name(dump_column) not in existing:
-                con.execute(
-                    "ALTER TABLE quest_templates ADD COLUMN "
-                    + _column_declaration(dump_column)
-                )
+        _migrate_quest_template_columns(con)
         con.commit()
     finally:
         con.close()
@@ -397,7 +432,7 @@ def item_display_ids(path: str, entries: Iterable[int]) -> Dict[int, int]:
 
 def load_quest_log(path: str, character_guid: int) -> Dict[int, dict]:
     """Return ``{quest_id: {slot, status, explored, counts[4]}}``."""
-    con = sqlite3.connect(path)
+    con = databases.connect_character(path)
     try:
         rows = con.execute(
             "SELECT quest_id, slot, status, explored, count1, count2, count3, "
@@ -418,7 +453,7 @@ def load_quest_log(path: str, character_guid: int) -> Dict[int, dict]:
 
 
 def load_rewarded_quests(path: str, character_guid: int) -> Set[int]:
-    con = sqlite3.connect(path)
+    con = databases.connect_character(path)
     try:
         return {int(r[0]) for r in con.execute(
             "SELECT quest_id FROM character_quests_rewarded WHERE character_guid = ?",
@@ -432,7 +467,7 @@ def load_rewarded_quests(path: str, character_guid: int) -> Set[int]:
 
 def save_quest(path: str, character_guid: int, quest_id: int, entry: Mapping) -> None:
     counts = list(entry["counts"]) + [0] * 4
-    con = sqlite3.connect(path)
+    con = databases.connect_character(path)
     try:
         con.execute(
             "INSERT OR REPLACE INTO character_quests(character_guid, quest_id, "
@@ -447,7 +482,7 @@ def save_quest(path: str, character_guid: int, quest_id: int, entry: Mapping) ->
 
 
 def delete_quest(path: str, character_guid: int, quest_id: int) -> None:
-    con = sqlite3.connect(path)
+    con = databases.connect_character(path)
     try:
         con.execute(
             "DELETE FROM character_quests WHERE character_guid = ? AND quest_id = ?",
@@ -460,7 +495,7 @@ def delete_quest(path: str, character_guid: int, quest_id: int) -> None:
 
 def reward_quest(path: str, character_guid: int, quest_id: int) -> None:
     """Move a quest from the log to the rewarded set in one transaction."""
-    con = sqlite3.connect(path)
+    con = databases.connect_character(path)
     try:
         con.execute(
             "DELETE FROM character_quests WHERE character_guid = ? AND quest_id = ?",

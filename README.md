@@ -13,16 +13,20 @@ pip install -r requirements.txt
 # 2. (Optional) Create your local config — without it the example config is used
 cp config/config.example.yaml config/config.yaml
 
-# 3. Initialize the databases (creates data/auth.db, updates data/world.db)
+# 3. Initialize the split databases (data/auth.db + data/characters.db)
 python tools/init_db.py
 
-# 4. Create a test account
+# 4. Build data/world.db from the pinned CMaNGOS 3.3.5a dump
+#    (downloads once, verifies SHA-256, then imports)
+python tools/import_wotlk_db.py
+
+# 5. Create a test account
 python tools/create_test_account.py TEST TEST
 
-# 5. (Optional) Download extracted terrain/VMaps/MMaps for real LOS + pathfinding
+# 6. (Optional) Download extracted terrain/VMaps/MMaps for real LOS + pathfinding
 python tools/fetch_client_data.py --preset starter
 
-# 6. Start the servers
+# 7. Start the servers
 python run_servers.py
 #    Or run auth and world separately:
 #    python run_auth.py

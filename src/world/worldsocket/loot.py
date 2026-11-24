@@ -11,6 +11,7 @@ from typing import Dict, List, Tuple
 from src.protocol.opcodes import Opcodes
 from src.world import character_db
 from src.world import creature
+from src.world import databases
 from src.world import gameobject
 from src.world import login_packets
 from src.world import object_update
@@ -417,7 +418,7 @@ class LootMixin:
         combat["loot_money"] = 0
         total = int(self.character.get("money", 0)) + money
         self.character["money"] = total
-        con = sqlite3.connect(self.config.database.world_path)
+        con = databases.connect_character(self.config.database.world_path)
         try:
             con.execute("UPDATE characters SET money = ? WHERE guid = ?",
                         (total, int(self.player_guid)))

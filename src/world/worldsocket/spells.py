@@ -9,6 +9,7 @@ import time
 
 from src.protocol.opcodes import Opcodes
 from src.world import creature
+from src.world import databases
 from src.world import gameobject
 from src.world import object_update
 from src.world import spells
@@ -377,7 +378,7 @@ class SpellsMixin:
         import sqlite3
         if not self.player_guid:
             return False
-        con = sqlite3.connect(self.config.database.world_path)
+        con = databases.connect_character(self.config.database.world_path)
         try:
             if item_guid:
                 row = con.execute(
@@ -965,7 +966,7 @@ class SpellsMixin:
         slot = 15
         item_slot = None
         if item_guid:
-            con = sqlite3.connect(path)
+            con = databases.connect_character(path)
             try:
                 row = con.execute(
                     "SELECT slot FROM character_items"
@@ -1029,7 +1030,7 @@ class SpellsMixin:
             "expires": now + duration_ms / 1000.0,
             "max_duration": duration_ms / 1000.0,
         }
-        con = sqlite3.connect(path)
+        con = databases.connect_character(path)
         try:
             con.execute(
                 "UPDATE character_items SET enchantment_2 = ?"
@@ -2391,7 +2392,7 @@ class SpellsMixin:
         entry = combat.setdefault("weapon_enchants", {}).pop(slot, None)
         if entry is None:
             return
-        con = sqlite3.connect(self.config.database.world_path)
+        con = databases.connect_character(self.config.database.world_path)
         try:
             con.execute(
                 "UPDATE character_items SET enchantment_2 = 0"

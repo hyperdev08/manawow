@@ -6,6 +6,7 @@ import struct
 
 from src.protocol.opcodes import Opcodes
 from src.world import character_db
+from src.world import databases
 from src.world import login_packets
 from src.world import object_update
 from src.world import update_fields as F
@@ -271,7 +272,7 @@ class InventoryMixin:
             return current
 
         new_count = current - int(count)
-        con = sqlite3.connect(self.config.database.world_path)
+        con = databases.connect_character(self.config.database.world_path)
         try:
             con.execute(
                 "UPDATE character_items SET stack_count = ? "
@@ -344,7 +345,7 @@ class InventoryMixin:
         """Add ``delta`` copper (negative to spend), persist it, update the client."""
         total = max(0, min(int(self.character.get("money", 0)) + int(delta), 0x7FFFFFFF))
         self.character["money"] = total
-        con = sqlite3.connect(self.config.database.world_path)
+        con = databases.connect_character(self.config.database.world_path)
         try:
             con.execute("UPDATE characters SET money = ? WHERE guid = ?",
                         (total, int(self.player_guid)))

@@ -39,6 +39,10 @@ class WorldConfig:
 class DBConfig:
     auth_path: str = "./data/auth.db"
     world_path: str = "./data/world.db"
+    # Empty means "characters live in world_path" (the combined layout used by
+    # tests and one-off tools).  Config.load() fills in a sibling
+    # characters.db for normal server runs.
+    character_path: str = ""
 
 
 @dataclass
@@ -57,7 +61,7 @@ class Config:
 
     def resolve_database_paths(self, base_dir: str) -> None:
         """Make relative DB paths independent of the caller's CWD."""
-        for attribute in ("auth_path", "world_path"):
+        for attribute in ("auth_path", "world_path", "character_path"):
             value = getattr(self.database, attribute)
             if value and not os.path.isabs(value):
                 setattr(self.database, attribute,
@@ -99,9 +103,18 @@ class Config:
             client_data=("" if raw_client_data is None
                          else str(raw_client_data)),
         )
+        world_path = str(get(raw, "database", "world_path",
+                             default="./data/world.db"))
+        raw_character = get(raw, "database", "character_path", default=None)
+        if raw_character is None:
+            # Default to a sibling characters.db so an existing config.yaml
+            # (written before the split) automatically stops sharing one file.
+            raw_character = os.path.join(
+                os.path.dirname(world_path) or ".", "characters.db")
         db = DBConfig(
             auth_path=str(get(raw, "database", "auth_path", default="./data/auth.db")),
-            world_path=str(get(raw, "database", "world_path", default="./data/world.db")),
+            world_path=world_path,
+            character_path=str(raw_character or ""),
         )
         log = LogConfig(
             level=str(get(raw, "logging", "level", default="INFO")),

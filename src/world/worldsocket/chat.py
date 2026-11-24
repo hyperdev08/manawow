@@ -6,6 +6,7 @@ import struct
 
 from src.protocol.opcodes import Opcodes
 from src.world import character_db
+from src.world import databases
 from src.world import login_packets
 from src.world import object_update
 from src.world import update_fields as F
@@ -272,7 +273,7 @@ class ChatMixin:
         self.character["bytes1"] = new_bytes1
 
         # Persist to DB
-        con = sqlite3.connect(self.config.database.world_path)
+        con = databases.connect_character(self.config.database.world_path)
         try:
             con.execute(
                 "UPDATE characters SET bytes1 = ? WHERE guid = ?",
@@ -358,7 +359,7 @@ class ChatMixin:
         self.character["bytes2"] = new_bytes2
 
         # Persist to DB
-        con = sqlite3.connect(self.config.database.world_path)
+        con = databases.connect_character(self.config.database.world_path)
         try:
             con.execute(
                 "UPDATE characters SET bytes2 = ? WHERE guid = ?",

@@ -120,7 +120,9 @@ class AuthSession:
 
     def get_character_count(self, account_id: int) -> int:
         try:
-            con = sqlite3.connect(self.config.database.world_path)
+            path = (getattr(self.config.database, "character_path", "")
+                    or self.config.database.world_path)
+            con = sqlite3.connect(path)
             try:
                 row = con.execute(
                     "SELECT COUNT(*) FROM characters WHERE account_id = ?", (account_id,)

@@ -22,11 +22,11 @@ A real 3.3.5a client can now log in, pick a character and **enter the world**:
 - `CMSG_PING` / `SMSG_PONG`, realm split and keep-alive handling
 
 ### SQLite storage
-- Accounts, realms and characters
-- `src/common/sqlite_tuning.py` (installed by the worldserver): WAL journal, `synchronous=NORMAL` and `wal_autocheckpoint=0` on every connection, plus a background thread that keeps one connection open and runs PASSIVE checkpoints. The server opens a connection per query on the event-loop thread, and rollback-journal commits used to freeze every session for seconds on Windows (median 362 ms, worst 16 s per commit; now ~5 ms). Stop the server before committing `data/world.db` so the WAL is folded back in
+- Split storage: `data/auth.db` (accounts/realms), `data/characters.db` (characters, inventory, spells, quest logs) and `data/world.db` (regenerable static content). None of the three is committed; the world bank is rebuilt from the pinned CMaNGOS dump
+- `src/common/sqlite_tuning.py` (installed by the worldserver): WAL journal, `synchronous=NORMAL` and `wal_autocheckpoint=0` on every connection, plus a background thread that keeps one connection open and runs PASSIVE checkpoints. The server opens a connection per query on the event-loop thread, and rollback-journal commits used to freeze every session for seconds on Windows (median 362 ms, worst 16 s per commit; now ~5 ms). Stop the server before copying or regenerating a database file so the WAL is folded back in
 
 ### Item system (initial milestone)
-- `SMSG_ITEM_QUERY_SINGLE_RESPONSE` from `item_templates` SQLite table (all 44,613 CMaNGOS `item_template` rows; the shipped `world.db` used to lack 17,539 of them, which silently removed quest items such as 50432 Diseased Wolf Pelt from loot)
+- `SMSG_ITEM_QUERY_SINGLE_RESPONSE` from `item_templates` SQLite table (all 44,613 CMaNGOS `item_template` rows; an older pre-import world database lacked 17,539 of them, which silently removed quest items such as 50432 Diseased Wolf Pelt from loot)
 - Character inventory in `character_items` table (slot -> item instance)
 - Starter kit: the exact `CharStartOutfit.dbc` outfit for the character's race/class (63 rows for the 62 legal 3.3.5a combinations, including the death-knight set and its four bags), with every referenced template seeded from the client's own `Item.dbc` data. Race/class legality comes from `CharBaseInfo.dbc`, so `CMSG_CHAR_CREATE` rejects impossible combinations (e.g., gnome paladin or tauren mage) with `CHAR_CREATE_FAILED`
 - On world entry, items are emitted as `UPDATETYPE_CREATE_OBJECT2` blocks *before* the player block so the `PLAYER_FIELD_INV_SLOT_HEAD` / `PACK_SLOT_1` guids resolve immediately
@@ -172,10 +172,10 @@ A real 3.3.5a client can now log in, pick a character and **enter the world**:
 - Corpse money uses the real `creature_template.MinLootGold` / `MaxLootGold` values imported from CMaNGOS (no synthetic level-based coins)
 - `CMSG_LOOT`, `CMSG_AUTOSTORE_LOOT_ITEM`, `CMSG_LOOT_MONEY`, `CMSG_LOOT_RELEASE`
 - Quest items (negative `ChanceOrQuestChance`) only drop for a player with an active, unfinished quest that needs them
-- Drop chances are stored as floats (`0.5`, `6.4011`...); refresh the loot tables of an older `world.db` with `python tools/import_wotlk_db.py --dump WoTLKDB.sql --loot-only`
+- Drop chances are stored as floats (`0.5`, `6.4011`...); refresh the loot tables of an older `world.db` with `python tools/import_wotlk_db.py --loot-only`
 
 ### Quests
-- `quest_templates` (9,086 quests), `creature_quest_starters` / `creature_quest_enders` (from `creature_questrelation` / `creature_involvedrelation`) and `areatrigger_quests` (from `areatrigger_involvedrelation`) imported from CMaNGOS; an existing `world.db` gets them with `python tools/import_wotlk_db.py --dump WoTLKDB.sql --quests-only`
+- `quest_templates` (9,086 quests), `creature_quest_starters` / `creature_quest_enders` (from `creature_questrelation` / `creature_involvedrelation`) and `areatrigger_quests` (from `areatrigger_involvedrelation`) imported from CMaNGOS; an existing `world.db` gets them with `python tools/import_wotlk_db.py --quests-only`
 - Rules and packet builders live in `src/world/quests.py` (socket-free), handlers in `src/world/worldsocket/quests.py`
 - Quest giver markers: `CMSG_QUESTGIVER_STATUS_QUERY` / `CMSG_QUESTGIVER_STATUS_MULTIPLE_QUERY` answer with the 3.3.5 dialog status (yellow/grey "!" and "?"); statuses are re-sent after accepting, abandoning, progressing or turning in a quest
 - `CMSG_QUESTGIVER_HELLO` and `CMSG_GOSSIP_HELLO`: quests are appended to the gossip window; a giver whose menu has no options opens the quest list, or the single quest directly (`Player::SendPreparedQuest`)
@@ -197,7 +197,7 @@ A real 3.3.5a client can now log in, pick a character and **enter the world**:
 - `CMSG_SELL_ITEM` for backpack items at `sell_price`, whole or partial stacks
 - Hidden from the list: other-faction items and bind-on-pickup gear for other classes
 - Not implemented yet: honor/token prices (`ExtendedCost`, those items are hidden), buyback, repair, reputation discounts, `condition_id`
-- Upgrade an existing `world.db` with `python tools/import_wotlk_db.py --dump WoTLKDB.sql --vendors-only`
+- Upgrade an existing `world.db` with `python tools/import_wotlk_db.py --vendors-only`
 
 ### Game objects
 - `gameobject_templates` (19,555) and `gameobject_spawns` (100,337) imported from CMaNGOS `gameobject_template` / `gameobject`, with `gameobject_addon` start states and animation progress and `gameobject_spawn_entry` for spawns without a fixed entry
@@ -215,18 +215,18 @@ A real 3.3.5a client can now log in, pick a character and **enter the world**:
 - Quest-starting items (`item_template.startquest`, 385 items): `CMSG_USE_ITEM` opens the quest; the item is used up on accept unless the quest asks for it. Other item use (potions, food, hearthstone) is item spell casting (#11)
 - CMaNGOS `spawn_group` limits (`MaxCount`, groups without a `WorldState` condition) are imported as pools for both objects and creatures
 - Not usable yet: traps, spell casters, meeting stones, fishing, summoned objects
-- Upgrade an existing `world.db` with `python tools/import_wotlk_db.py --dump WoTLKDB.sql --gameobjects-only`
+- Upgrade an existing `world.db` with `python tools/import_wotlk_db.py --gameobjects-only`
 
 ### Creature pools
 - `pool_creature`, `pool_creature_template` and `spawn_group` (with `MaxCount`, no `WorldState`) limit how many spawns of a group exist at once: rare spawns such as Gruff Swiftbite or Fedfennel show at one of their spawn points instead of all of them (715 pooled creatures)
 - Pools are loaded once per server, off the event loop, and filter the creature visibility scans
-- Refresh with `python tools/import_wotlk_db.py --dump WoTLKDB.sql --pools-only` (creature and object pools)
-- Spawns stored with `id = 0` take their entry from `creature_spawn_entry` / `gameobject_spawn_entry` or, inside a spawn group, from `spawn_group_entry` (chosen once per guid at import, so it is reproducible): 5,650 creatures and 3,136 objects that used to be skipped. Add them to an existing `world.db` with `python tools/import_wotlk_db.py --dump WoTLKDB.sql --spawn-entries-only` (creatures; `--gameobjects-only` for objects)
+- Refresh with `python tools/import_wotlk_db.py --pools-only` (creature and object pools)
+- Spawns stored with `id = 0` take their entry from `creature_spawn_entry` / `gameobject_spawn_entry` or, inside a spawn group, from `spawn_group_entry` (chosen once per guid at import, so it is reproducible): 5,650 creatures and 3,136 objects that used to be skipped. Add them to an existing `world.db` with `python tools/import_wotlk_db.py --spawn-entries-only` (creatures; `--gameobjects-only` for objects)
 - Not handled yet: `spawn_group` world-state conditions (day/night RP groups keep spawning)
 
 ### World events
 - There is no event calendar yet, so the world is shown with no world event active: creatures and objects that only spawn during an event (`game_event_creature` / `game_event_gameobject` with a positive event: Darkmoon Faire, Midsummer, Hallow's End, Winter Veil, the Arena Tournament realm NPCs...) are hidden; spawns removed during an event (negative event) stay
-- The links are stored in `creature_events` / `gameobject_events`; refresh them with `python tools/import_wotlk_db.py --dump WoTLKDB.sql --events-only`
+- The links are stored in `creature_events` / `gameobject_events`; refresh them with `python tools/import_wotlk_db.py --events-only`
 
 ### Chat + emotes
 - `CMSG_MESSAGECHAT` / `SMSG_MESSAGECHAT`: `/say`, `/yell`, `/whisper`, `/me` (emote)
@@ -274,10 +274,30 @@ python tools/stop_servers.py --force  # kill whatever owns the port
 
 ### Database initialization
 
+The repository ships **no** `.db` files. Three SQLite databases are built
+locally:
+
+| File | Contents | Created by |
+| --- | --- | --- |
+| `data/auth.db` | accounts and the realm list | `tools/init_db.py` |
+| `data/characters.db` | characters, inventory, spells and quest logs | `tools/init_db.py` / first worldserver start |
+| `data/world.db` | static world bank (creatures, items, quests, spells, loot) | `tools/import_wotlk_db.py` |
+
 ```bash
-# Create/upgrade data/auth.db and data/world.db
+# Create the auth/character schemas and an empty world schema
 python tools/init_db.py
+
+# Build the world bank from the pinned CMaNGOS dump
+python tools/import_wotlk_db.py
 ```
+
+`data/world.db` is generated, not committed: it is reproducible because
+`tools/import_wotlk_db.py` downloads a specific `cmangos/wotlk-db` commit and
+verifies its SHA-256 before importing.  Characters are stored separately, so
+regenerating the world bank never touches player data.  A legacy combined
+`data/world.db` is migrated automatically on the first split startup: any
+characters, items, spells and quest logs it contains are copied into
+`data/characters.db`, and the old file is left untouched.
 
 The worldserver also creates and migrates the character, creature and spell tables when it starts, so a checkout made before a schema addition still works without re-running `init_db.py`.
 
@@ -298,17 +318,28 @@ The default mirror is a public 3.3.5a extract; `--source` accepts another mirror
 
 ### Importing the CMaNGOS 3.3.5a world database
 
-The world dump can be downloaded from the [cmangos/wotlk-db](https://github.com/cmangos/wotlk-db) repository (`Full_DB/WoTLKDB_*.sql`).
+`data/world.db` is not shipped.  The importer downloads the pinned
+[cmangos/wotlk-db](https://github.com/cmangos/wotlk-db) release itself, keeps
+it under `data/cache/` (gitignored), verifies the SHA-256 and only then imports,
+so every checkout generates the same world bank:
 
 ```bash
-# Stop the worldserver first; the import replaces the demo NPC population.
-python tools/import_wotlk_db.py --dump C:\path\to\WoTLKDB.sql
+# Stop the worldserver first.  The dump is downloaded and verified once.
+python tools/import_wotlk_db.py
 
 # Optional client DBCs that are not part of the SQL dump:
-python tools/import_wotlk_db.py --dump C:\path\to\WoTLKDB.sql \
+python tools/import_wotlk_db.py \
     --rune-cost-dbc "C:\path\to\client\DBFilesClient\SpellRuneCost.dbc" \
     --spell-duration-dbc "C:\path\to\client\DBFilesClient\SpellDuration.dbc"
+
+# Offline machine: download WoTLKDB_*.sql.gz yourself and pass it explicitly.
+python tools/import_wotlk_db.py --dump C:\path\to\WoTLKDB_1_9_14092.sql.gz
 ```
+
+The pinned commit/file/hash live at the top of `tools/import_wotlk_db.py`
+(`CMANGOS_COMMIT`, `CMANGOS_DUMP_FILE`, `CMANGOS_DUMP_SHA256`); bump all of
+them together when intentionally upgrading.  `--refresh-dump` re-downloads a
+cached copy, and `--cache-dir` picks another cache location.
 
 The importer reads the MySQL dump dependency-free and prints how many rows it loaded plus the number of visible spawns at every race's starting point.  `SpellDuration.dbc` fills the `spell_duration` table used by summoning (warlock pets are permanent via index 21); without it the server falls back to a small built-in duration table.
 

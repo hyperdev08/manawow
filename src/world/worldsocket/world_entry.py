@@ -8,6 +8,7 @@ import time
 
 from src.protocol.opcodes import Opcodes
 from src.world import character_db
+from src.world import databases
 from src.world import creature
 from src.world import gameobject
 from src.world import login_packets
@@ -227,7 +228,7 @@ class WorldEntryMixin:
         self._apply_combat_stats()
         self.character["health"] = int(self.character["max_health"])
         self.character["power"] = self._power_after_reset()
-        con = sqlite3.connect(self.config.database.world_path)
+        con = databases.connect_character(self.config.database.world_path)
         try:
             con.execute(
                 "UPDATE characters SET map = ?, zone = ?, x = ?, y = ?, z = ?, o = ?"

@@ -9,6 +9,7 @@ import time
 
 from src.protocol.opcodes import Opcodes
 from src.world import creature
+from src.world import databases
 from src.world import spells
 
 from .constants import (
@@ -390,7 +391,7 @@ class CombatMixin:
         return result
 
     def _equipped_weapon_stats(self, slot: int, fallback: bool):
-        con = sqlite3.connect(self.config.database.world_path)
+        con = databases.connect_character(self.config.database.world_path)
         try:
             row = con.execute(
                 "SELECT it.damage_min1, it.damage_max1, it.delay "
@@ -461,7 +462,7 @@ class CombatMixin:
         is stored in ``spellppmRate_N`` (procs per minute).  A ppm of zero is
         treated as "not configured" and skipped.
         """
-        con = sqlite3.connect(self.config.database.world_path)
+        con = databases.connect_character(self.config.database.world_path)
         con.row_factory = sqlite3.Row
         try:
             row = con.execute(
@@ -594,7 +595,7 @@ class CombatMixin:
         """Reload ``enchantment_2`` temporary weapon enchants after login."""
         if not self.player_guid:
             return
-        con = sqlite3.connect(self.config.database.world_path)
+        con = databases.connect_character(self.config.database.world_path)
         con.row_factory = sqlite3.Row
         try:
             rows = con.execute(

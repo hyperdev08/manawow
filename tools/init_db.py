@@ -11,9 +11,12 @@ sys.path.insert(0, os.path.join(root, "src"))
 sys.path.insert(0, root)
 
 from src.common.config import Config
-from src.world.character_db import init_character_db
+from src.world import databases
+from src.world.character_db import (configure as configure_character_db,
+                                    init_character_db,
+                                    init_split_databases)
 from src.world.creature import init_creature_db
-from src.world.quests import init_quest_db
+from src.world.quests import init_quest_db, init_world_quest_db
 from src.world.gameobject import init_gameobject_db
 
 
@@ -84,7 +87,11 @@ def init_auth_schema(con: sqlite3.Connection) -> None:
 
 
 def init_databases(cfg: Config) -> None:
-    for path in (cfg.database.auth_path, cfg.database.world_path):
+    character_path = getattr(cfg.database, "character_path", "")
+    for path in (cfg.database.auth_path, cfg.database.world_path,
+                 character_path):
+        if not path:
+            continue
         parent = os.path.dirname(path)
         if parent:
             os.makedirs(parent, exist_ok=True)
@@ -114,9 +121,14 @@ def init_databases(cfg: Config) -> None:
     finally:
         con.close()
 
+    configure_character_db(cfg.database.world_path, character_path)
     init_creature_db(cfg.database.world_path)
-    init_character_db(cfg.database.world_path)
-    init_quest_db(cfg.database.world_path)
+    if databases.is_split():
+        init_split_databases(cfg.database.world_path, character_path)
+        init_world_quest_db(cfg.database.world_path)
+    else:
+        init_character_db(cfg.database.world_path)
+        init_quest_db(cfg.database.world_path)
     init_gameobject_db(cfg.database.world_path)
 
 
@@ -134,6 +146,8 @@ def main() -> None:
     init_databases(cfg)
     print(f"Initialized auth database:  {cfg.database.auth_path}")
     print(f"Initialized world database: {cfg.database.world_path}")
+    if getattr(cfg.database, "character_path", ""):
+        print(f"Initialized character db:   {cfg.database.character_path}")
 
 
 if __name__ == "__main__":
