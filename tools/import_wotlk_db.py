@@ -12,6 +12,7 @@ Usage::
     python tools/import_wotlk_db.py --dump WoTLKDB.sql --vendors-only
     python tools/import_wotlk_db.py --dump WoTLKDB.sql --gameobjects-only
     python tools/import_wotlk_db.py --dump WoTLKDB.sql --events-only
+    python tools/import_wotlk_db.py --dump WoTLKDB.sql --loot-only
 
 ``--quests-only`` refreshes just the quest tables (``quest_template`` and the
 creature/area-trigger quest relations) of an existing database.
@@ -331,6 +332,50 @@ CREATURE_LOOT_TEMPLATE_MAP = (
 )
 
 REFERENCE_LOOT_TEMPLATE_MAP = CREATURE_LOOT_TEMPLATE_MAP
+GAMEOBJECT_LOOT_TEMPLATE_MAP = CREATURE_LOOT_TEMPLATE_MAP
+# ``ChanceOrQuestChance`` is a float in the dump (0.5, 6.4011...).  Storing it
+# as an integer turned every sub-1% drop into "never" (or, inside a group,
+# into "equal chance").
+LOOT_FLOAT_COLUMNS = frozenset(("chance_or_quest_chance",))
+LOOT_TEXT_COLUMNS = frozenset(("comments",))
+LOOT_TABLES = (
+    ("creature_loot_template", CREATURE_LOOT_TEMPLATE_MAP),
+    ("reference_loot_template", REFERENCE_LOOT_TEMPLATE_MAP),
+    ("gameobject_loot_template", GAMEOBJECT_LOOT_TEMPLATE_MAP),
+)
+
+
+def insert_loot_table(con, table: str, raw_rows) -> int:
+    """Replace one ``*_loot_template`` table with the dump rows."""
+    pairs = dict(LOOT_TABLES)[table]
+    con.execute(f"DELETE FROM {table}")
+    return _insert_mapped(con, table, pairs, raw_rows,
+                          float_columns=LOOT_FLOAT_COLUMNS,
+                          text_columns=LOOT_TEXT_COLUMNS)
+
+
+def import_loot(dump_path: str, db_path: str) -> dict[str, int]:
+    """``--loot-only``: re-import every loot table (fixes truncated chances)."""
+    import sqlite3
+
+    from src.world import gameobject
+    from src.world.creature import init_creature_db
+
+    started = time.time()
+    text = wotlk_dump.read_dump(dump_path)
+    raw = {table: wotlk_dump.rows(text, table)[1] for table, _ in LOOT_TABLES}
+    del text
+    init_creature_db(db_path)
+    con = sqlite3.connect(db_path)
+    try:
+        con.executescript(gameobject.CREATE_GAMEOBJECT_SQL)
+        counts = {table: insert_loot_table(con, table, raw[table]) for table, _ in LOOT_TABLES}
+        con.commit()
+    finally:
+        con.close()
+    print("imported " + ", ".join(f"{n:,} {t} rows" for t, n in counts.items())
+          + f" in {time.time() - started:.1f}s")
+    return counts
 
 CREATURE_EQUIP_TEMPLATE_MAP = (
     ("entry", "entry"), ("equipentry1", "equipentry1"),
@@ -1076,14 +1121,10 @@ def import_world(dump_path: str, db_path: str, clear: bool = True,
                 PLAYER_LEVELSTATS_MAP,
                 raw_player_levelstats,
             ),
-            "creature_loot_template": _insert_mapped(
-                con, "creature_loot_template", CREATURE_LOOT_TEMPLATE_MAP,
-                raw_creature_loot_template, text_columns=frozenset(("comments",)),
-            ),
-            "reference_loot_template": _insert_mapped(
-                con, "reference_loot_template", REFERENCE_LOOT_TEMPLATE_MAP,
-                raw_reference_loot_template, text_columns=frozenset(("comments",)),
-            ),
+            "creature_loot_template": insert_loot_table(
+                con, "creature_loot_template", raw_creature_loot_template),
+            "reference_loot_template": insert_loot_table(
+                con, "reference_loot_template", raw_reference_loot_template),
             "creature_equip_template": _insert_mapped(
                 con, "creature_equip_template", CREATURE_EQUIP_TEMPLATE_MAP,
                 raw_creature_equip_template,
@@ -1155,7 +1196,10 @@ def import_world(dump_path: str, db_path: str, clear: bool = True,
         go_templates, go_spawns, _go_skipped = build_gameobject_rows(gameobject_tables)
         counts.update(insert_gameobject_rows(
             con, go_templates, go_spawns,
-            build_gameobject_event_rows(gameobject_tables, go_spawns)))
+            build_gameobject_event_rows(gameobject_tables, go_spawns),
+            gameobject_tables.get("gameobject_loot_template") or ()))
+        counts["gameobject_pool_members"] = insert_gameobject_pool_rows(
+            con, build_gameobject_pool_rows(gameobject_tables, go_spawns))
 
         con.commit()
         con.execute("PRAGMA optimize")
@@ -1215,7 +1259,9 @@ def import_world(dump_path: str, db_path: str, clear: bool = True,
 
 
 GAMEOBJECT_DUMP_TABLES = ("gameobject_template", "gameobject", "gameobject_addon",
-                          "gameobject_spawn_entry", "game_event_gameobject")
+                          "gameobject_spawn_entry", "game_event_gameobject",
+                          "gameobject_loot_template", "pool_gameobject",
+                          "pool_gameobject_template", "pool_template", "pool_pool")
 
 # CMaNGOS gameobject_template column -> server column.
 _GO_TEMPLATE_DUMP = {
@@ -1292,6 +1338,49 @@ def import_events(dump_path: str, db_path: str) -> dict[str, int]:
     return counts
 
 
+def build_gameobject_pool_rows(tables: dict, spawn_rows) -> dict[str, list[tuple]]:
+    """Pool membership for the kept spawns, plus the pool tree.
+
+    ``pool_gameobject`` names spawns directly; ``pool_gameobject_template``
+    puts every spawn of a template into a pool (a direct row wins).
+    """
+    entry_of = {row[0]: row[1] for row in spawn_rows}
+    members: dict[int, tuple] = {}
+    by_template: dict[int, tuple[int, float]] = {}
+    for r in tables.get("pool_gameobject_template") or []:
+        by_template[_sqlite_int(r.get("id"))] = (
+            _sqlite_int(r.get("pool_entry")), _sqlite_float(r.get("chance")))
+    for guid, entry in entry_of.items():
+        if entry in by_template:
+            pool, chance = by_template[entry]
+            members[guid] = (guid, pool, chance)
+    for r in tables.get("pool_gameobject") or []:
+        guid = _sqlite_int(r.get("guid"))
+        if guid in entry_of:
+            members[guid] = (guid, _sqlite_int(r.get("pool_entry")),
+                             _sqlite_float(r.get("chance")))
+    templates = sorted({
+        (_sqlite_int(r.get("entry")), _sqlite_int(r.get("max_limit")),
+         _text_or_empty(r.get("description")))
+        for r in tables.get("pool_template") or []})
+    pools = sorted({
+        (_sqlite_int(r.get("pool_id")), _sqlite_int(r.get("mother_pool")),
+         _sqlite_float(r.get("chance")))
+        for r in tables.get("pool_pool") or []})
+    return {"gameobject_pool_members": sorted(members.values()),
+            "pool_templates": templates, "pool_pools": pools}
+
+
+def insert_gameobject_pool_rows(con, rows: dict) -> int:
+    for table, columns in (("gameobject_pool_members", "guid, pool, chance"),
+                           ("pool_templates", "entry, max_limit, description"),
+                           ("pool_pools", "pool_id, mother_pool, chance")):
+        con.execute(f"DELETE FROM {table}")
+        con.executemany(f"INSERT OR REPLACE INTO {table}({columns}) VALUES(?, ?, ?)",
+                        rows.get(table, ()))
+    return len(rows.get("gameobject_pool_members", ()))
+
+
 def build_gameobject_rows(tables: dict) -> tuple[list[tuple], list[tuple], dict]:
     """Turn the CMaNGOS game object tables into template and spawn rows.
 
@@ -1359,7 +1448,7 @@ def build_gameobject_rows(tables: dict) -> tuple[list[tuple], list[tuple], dict]
 
 
 def insert_gameobject_rows(con, template_rows, spawn_rows,
-                           event_rows=()) -> dict[str, int]:
+                           event_rows=(), loot_rows=()) -> dict[str, int]:
     """Replace the game object tables with the given rows."""
     from src.world import gameobject
 
@@ -1378,9 +1467,11 @@ def insert_gameobject_rows(con, template_rows, spawn_rows,
             f"VALUES({', '.join('?' for _ in columns)})",
             rows,
         )
+    loot = insert_loot_table(con, "gameobject_loot_template", loot_rows)
     return {"gameobject_templates": len(template_rows),
             "gameobject_spawns": len(spawn_rows),
-            "gameobject_events": len(event_rows)}
+            "gameobject_events": len(event_rows),
+            "gameobject_loot_template": loot}
 
 
 def import_gameobjects(dump_path: str, db_path: str) -> dict[str, int]:
@@ -1395,14 +1486,19 @@ def import_gameobjects(dump_path: str, db_path: str) -> dict[str, int]:
     event_rows = build_gameobject_event_rows(tables, spawn_rows)
     con = sqlite3.connect(db_path)
     try:
-        counts = insert_gameobject_rows(con, template_rows, spawn_rows, event_rows)
+        counts = insert_gameobject_rows(con, template_rows, spawn_rows, event_rows,
+                                        tables.get("gameobject_loot_template") or ())
+        counts["gameobject_pool_members"] = insert_gameobject_pool_rows(
+            con, build_gameobject_pool_rows(tables, spawn_rows))
         con.commit()
     finally:
         con.close()
     print(
         f"imported {counts['gameobject_templates']:,} game object templates and "
         f"{counts['gameobject_spawns']:,} spawns ({counts['gameobject_events']:,} "
-        f"tied to world events) in {time.time() - started:.1f}s "
+        f"tied to world events, {counts['gameobject_pool_members']:,} pooled, "
+        f"{counts['gameobject_loot_template']:,} loot rows) "
+        f"in {time.time() - started:.1f}s "
         f"(skipped {skipped['missing_template']:,} without a template, "
         f"{skipped['spawn_mask']:,} non-normal spawn mask, "
         f"{skipped['phase']:,} outside phase 1)"
@@ -1545,6 +1641,9 @@ def main() -> None:
                         help="only refresh npc_vendor and item buy counts")
     parser.add_argument("--gameobjects-only", action="store_true",
                         help="only (re)import the game object templates and spawns")
+    parser.add_argument("--loot-only", action="store_true",
+                        help="only re-import the creature/reference/game object "
+                             "loot tables")
     parser.add_argument("--events-only", action="store_true",
                         help="only refresh which creature/object spawns belong "
                              "to world events")
@@ -1570,6 +1669,9 @@ def main() -> None:
         return
     if args.events_only:
         import_events(args.dump, db_path)
+        return
+    if args.loot_only:
+        import_loot(args.dump, db_path)
         return
 
     import_world(args.dump, db_path, clear=not args.keep_existing,

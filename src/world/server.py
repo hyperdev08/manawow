@@ -29,6 +29,8 @@ class WorldServer:
         self.creature_combat = WorldCombatManager(self)
         # Party/raid membership (session-scoped until persisted group support).
         self.groups = GroupManager(self)
+        # Runtime state of game objects (opened doors, looted chests).
+        self.gameobjects = gameobject.GameObjectRuntime()
         self.packet_log = get_packet_log()
         self.packet_log.Initialize(config.logging.log_dir)
         # WAL + synchronous=NORMAL: rollback-journal commits blocked the event

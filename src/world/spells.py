@@ -81,6 +81,8 @@ SPELL_EFFECT_THREAT = 63
 SPELL_EFFECT_TRIGGER_SPELL = 64
 SPELL_EFFECT_INTERRUPT_CAST = 68
 SPELL_EFFECT_SUMMON_OBJECT_WILD = 76
+# Opening, Herb Gathering, Mining, Pick Lock: unlock and use a game object.
+SPELL_EFFECT_OPEN_LOCK = 33
 SPELL_EFFECT_ATTACK = 78
 SPELL_EFFECT_ADD_COMBO_POINTS = 80
 SPELL_EFFECT_LEAP = 29
@@ -1347,12 +1349,14 @@ def _target_data(target_guid: int, cast: Optional["SpellCast"] = None) -> bytes:
     """
     flags = 0
     if target_guid:
-        flags |= 0x02
+        # Game objects (0xF110 high guid) go in the same packed-guid slot but
+        # under TARGET_FLAG_GAMEOBJECT, or the client looks for a unit.
+        flags |= 0x800 if (int(target_guid) >> 48) == 0xF110 else 0x02
     has_dest = bool(cast is not None and cast.has_dest)
     if has_dest:
         flags |= 0x40
     out = bytearray(struct.pack("<I", flags))
-    if flags & 0x02:
+    if flags & 0x802:
         out += pack_guid(target_guid)
     if has_dest:
         out += b"\x00"                      # empty transport guid

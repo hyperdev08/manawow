@@ -67,6 +67,9 @@ class QuestsMixin:
             stored.update(fields)
         if hasattr(self, "_send_player_fields"):
             await self._send_player_fields(fields)
+        # Quest chests start or stop glittering for this player.
+        if hasattr(self, "refresh_gameobject_quest_flags"):
+            await self.refresh_gameobject_quest_flags()
 
     def _save_quest(self, quest_id: int, entry: dict) -> None:
         Q.save_quest(self.config.database.world_path, int(self.player_guid),

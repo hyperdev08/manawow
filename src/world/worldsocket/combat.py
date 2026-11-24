@@ -125,6 +125,8 @@ class CombatMixin:
         if now - combat["last_respawn_scan"] >= RESPAWN_SCAN_INTERVAL:
             combat["last_respawn_scan"] = now
             await self._respawn_corpses(now)
+            if hasattr(self, "_gameobject_tick"):
+                await self._gameobject_tick(now)
 
         # 8. nothing is fighting us any more: clear the combat icon
         if not combat["aggro"] and not combat["auto_attacking"] \
