@@ -50,6 +50,9 @@ class LogConfig:
     level: str = "INFO"
     log_dir: str = "./logs"
     console: bool = True
+    # Write logs/packets_*.log.  Buffered and flushed in the background; set
+    # false to disable packet dumps entirely.
+    packet_log: bool = True
 
 
 @dataclass
@@ -120,5 +123,6 @@ class Config:
             level=str(get(raw, "logging", "level", default="INFO")),
             log_dir=str(get(raw, "logging", "log_dir", default="./logs")),
             console=bool(get(raw, "logging", "console", default=True)),
+            packet_log=bool(get(raw, "logging", "packet_log", default=True)),
         )
         return cls(authserver=auth, worldserver=world, database=db, logging=log)

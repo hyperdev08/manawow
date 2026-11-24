@@ -265,6 +265,17 @@ python run_servers.py --watchdog 0.25   # or pick the threshold
 
 Each stall is appended to `logs/stalls.log` with the stack of the loop thread at that moment (the line that is blocking, repeated every 2 s while it lasts) and its total duration once the loop answers again. The worldserver log gets a one-line warning per stall. `run_world.py` takes the same flag.
 
+### Packet logs
+
+Every session writes a `logs/packets_<timestamp>.log` dump by default. Records are queued from the asyncio thread and written by a background thread, which flushes once per second; shutdown (including Ctrl+C and the `run_*.py` exit path) drains the queue and flushes, so a crash still leaves the useful tail of the log. Packet logging previously called `flush()` after every packet, which the stall watchdog caught blocking the loop for up to 6.7 s on slow Windows disks.
+
+Disable it when you do not need packet-level debugging:
+
+```yaml
+logging:
+  packet_log: false
+```
+
 ### Stopping the servers
 
 ```bash

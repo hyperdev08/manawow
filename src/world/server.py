@@ -35,7 +35,9 @@ class WorldServer:
         # Which pooled creatures exist (rare spawns); loaded on first use.
         self.creature_pools = None
         self.packet_log = get_packet_log()
-        self.packet_log.Initialize(config.logging.log_dir)
+        self.packet_log.Initialize(
+            config.logging.log_dir,
+            enabled=getattr(config.logging, "packet_log", True))
         # Characters live in their own database when one is configured; every
         # character_db/quests call still receives the world path and is routed
         # by src.world.databases.

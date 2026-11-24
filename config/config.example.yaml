@@ -36,6 +36,9 @@ logging:
   level: INFO
   log_dir: "./logs"
   console: true
+  # Write logs/packets_*.log.  Records are queued and flushed by a background
+  # thread once per second, so this no longer stalls the game loop.
+  packet_log: true
 
 security:
   # Do not use real passwords on public network; this is experimental
