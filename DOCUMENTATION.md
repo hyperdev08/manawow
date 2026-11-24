@@ -107,10 +107,12 @@ A real 3.3.5a client can now log in, pick a character and **enter the world**:
 - On death the server stores a corpse at the death position, records `death_state` (`1` dead, `2` ghost) and sends `SMSG_DEATH_RELEASE_LOC` with the nearest usable graveyard.
 - Graveyards come from the CMaNGOS `world_safe_locs` and `game_graveyard_zone` tables, imported by `tools/import_wotlk_db.py` (including `--graveyards-only`). Selection mirrors `Player::GetClosestGraveYard`: zone + team first, then neutral zone links, then the nearest same-map graveyard.
 - `CMSG_REPOP_REQUEST` teleports the player to that graveyard as a ghost: `PLAYER_FLAGS_GHOST`, one health point, `SMSG_PRE_RESURRECT`, `SMSG_CORPSE_RECLAIM_DELAY` and the usual worldport handshake. The ghost can walk around but cannot fight, loot or cast.
-- `CMSG_RECLAIM_CORPSE` resurrects at the corpse (same map and within 39 yards) after the 30-second reclaim delay, at 50% health/mana. `CMSG_SPIRIT_HEALER_ACTIVATE` (or the spirit healer gossip option) resurrects at the graveyard with 50% health/mana, 25% durability loss and Resurrection Sickness (no sickness below level 11, one minute per level from 11–19, ten minutes from 20).
+- `CMSG_RECLAIM_CORPSE` resurrects at the corpse (same map within 39 yards, or at the instance entrance graveyard for a cross-map corpse) after the 30-second reclaim delay, at 50% health/mana. `CMSG_SPIRIT_HEALER_ACTIVATE` (or the spirit healer gossip option) resurrects at the graveyard with 50% health/mana, 25% durability loss and Resurrection Sickness (no sickness below level 11, one minute per level from 11–19, ten minutes from 20).
 - `MSG_CORPSE_QUERY` returns the corpse's `(map, x, y, z)`, and `SMSG_DEATH_RELEASE_LOC` is cleared with map `-1` on resurrection.
+- The corpse is also a real `TYPEID_CORPSE` object (`HighGuid::Corpse`, `CORPSE_FIELD_*`): it is broadcast to other players in range, appears when they log in or walk nearby, and is destroyed on resurrection.
+- Cross-map instance corpses can be reclaimed while standing at the corpse's entrance graveyard; the server switches to the corpse map through the normal `SMSG_NEW_WORLD` worldport handshake.
 - The ghost flag and corpse survive logout/relogin; the character list marks ghosts with `CHARACTER_FLAG_GHOST`.
-- Limitations: no separate visible corpse object for other players, no PvP corpse reclaim tiers (30/60/120 s), and battleground spirit guides/resurrect queues are not implemented.
+- Limitations: no PvP corpse reclaim tiers (30/60/120 s), and battleground spirit guides/resurrect queues are not implemented.
 
 ### Auras (buffs, debuffs, control and mitigation)
 - A real aura registry for players (`combat["auras"]`) and creatures (`combat["creature_auras"]`), keyed by spell so a recast refreshes the duration and stacks up to `Spell.dbc` `StackAmount`

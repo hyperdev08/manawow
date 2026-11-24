@@ -147,6 +147,8 @@ class WorldEntryMixin:
             await self._send_all_auras()
         if hasattr(self, "_send_login_death_location"):
             await self._send_login_death_location()
+        if hasattr(self, "_send_login_corpse_spawns"):
+            await self._send_login_corpse_spawns()
 
     async def handle_logout_request(self, data: bytes):
         if self.in_world:
@@ -395,6 +397,8 @@ class WorldEntryMixin:
         """
         if not self.in_world or not self.character:
             return
+        if hasattr(self, "refresh_corpse_visibility"):
+            await self.refresh_corpse_visibility(force=force)
         await self.refresh_gameobject_visibility(force=force)
         point = self._creature_scan_point()
         if point is None:

@@ -3,8 +3,10 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
+import time
 
 from src.common.config import AuthConfig, Config, DBConfig, LogConfig, WorldConfig
+from src.protocol.opcodes import Opcodes
 from src.world import character_db, graveyard
 from src.world.realmsocket import WorldSocket
 
@@ -97,6 +99,81 @@ def test_death_release_and_reclaim(tmp_path):
     asyncio.run(flow())
 
 
+def test_corpse_create_block_uses_the_corpse_guid_and_fields():
+    from src.world import object_update
+    from src.world import update_fields as F
+
+    corpse = {
+        "owner_guid": 42, "map": 0, "x": 1.0, "y": 2.0, "z": 3.0, "o": 4.0,
+        "display_id": 49, "items": [25] + [0] * 18,
+        "bytes1": 0x04030201, "bytes2": 7, "guild": 9,
+    }
+    opcode, payload = object_update.build_corpse_update(corpse)
+    if opcode == Opcodes.SMSG_COMPRESSED_UPDATE_OBJECT:
+        import struct
+        import zlib
+        size = struct.unpack_from("<I", payload, 0)[0]
+        payload = zlib.decompress(payload[4:])
+        assert len(payload) == size
+    offset = 0
+    assert payload[offset] == 1                  # one block
+    offset += 4
+    assert payload[offset] == 3                  # UPDATETYPE_CREATE_OBJECT2
+    offset += 1
+    mask = payload[offset]
+    offset += 1
+    for bit in range(8):
+        if mask & (1 << bit):
+            offset += 1
+    assert payload[offset] == 7                  # TYPEID_CORPSE
+    offset += 1
+    flags = int.from_bytes(payload[offset:offset + 2], "little")
+    assert flags == 0x150
+    offset += 2
+    assert payload[offset] == 0                  # no transport
+    offset += 1 + 8 * 4 + 4                      # position, duplicate, low guid
+    blocks = payload[offset]
+    offset += 1
+    mask_bytes = payload[offset:offset + blocks * 4]
+    offset += blocks * 4
+    values = {}
+    for index in range(blocks * 32):
+        if mask_bytes[(index // 32) * 4 + (index % 32) // 8] \
+                & (1 << (index % 8)):
+            values[index] = int.from_bytes(payload[offset:offset + 4], "little")
+            offset += 4
+    assert values[F.OBJECT_FIELD_GUID] == 42 & 0xFFFFFFFF
+    assert values[F.OBJECT_FIELD_GUID + 1] == object_update.corpse_guid(42) >> 32
+    assert values[F.OBJECT_FIELD_TYPE] == (
+        F.TYPEMASK_OBJECT | F.TYPEMASK_CORPSE)
+    assert values[F.CORPSE_FIELD_OWNER] == 42
+    assert values[F.CORPSE_FIELD_DISPLAY_ID] == 49
+    assert values[F.CORPSE_FIELD_ITEM] == 25
+    assert values[F.CORPSE_FIELD_BYTES_1] == 0x04030201
+    assert values[F.CORPSE_FIELD_GUILD] == 9
+
+
+def test_corpse_query_finds_appearance_and_equipment(tmp_path):
+    cfg, guid = _make_world(tmp_path)
+    db = cfg.database.world_path
+    con = sqlite3.connect(db)
+    try:
+        con.execute(
+            "INSERT INTO character_items(character_guid, item_entry, slot,"
+            " stack_count) VALUES(?,?,?,?)", (guid, 25, 0, 1))
+        con.commit()
+    finally:
+        con.close()
+    character_db.save_character_corpse(
+        db, guid, 0, 12, -8935.0, -188.0, 80.0, 1.0)
+    rows = character_db.get_corpses_near(db, 0, -8935.0, -188.0, 80.0, 100)
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["character_guid"] == guid
+    assert row["race"] == 1
+    assert row["items"][0] == 25
+
+
 def test_login_restores_a_persisted_ghost(tmp_path):
     cfg, guid = _make_world(tmp_path)
     db = cfg.database.world_path
@@ -116,6 +193,46 @@ def test_login_restores_a_persisted_ghost(tmp_path):
         assert combat["ghost"] is True
         assert int(socket.character["health"]) == 1
         assert combat["corpse"]["x"] == -100.0
+
+    asyncio.run(flow())
+
+
+def test_instance_corpse_reclaims_from_the_entrance_graveyard(tmp_path):
+    cfg, guid = _make_world(tmp_path)
+    db = cfg.database.world_path
+    con = sqlite3.connect(db)
+    try:
+        con.execute(
+            "INSERT INTO graveyard_locations(id, map, x, y, z, o, name)"
+            " VALUES(4, 0, 100.0, 200.0, 10.0, 0.0, 'Instance Entrance')")
+        con.execute(
+            "INSERT INTO graveyard_zones(id, ghost_loc, link_kind, faction)"
+            " VALUES(4, 999, 0, 469)")
+        con.commit()
+    finally:
+        con.close()
+    character_db.save_character_corpse(
+        db, guid, 1, 999, 500.0, 600.0, 20.0, 1.0)
+    character_db.mark_character_corpse_released(
+        db, guid, int(time.time()) - 60)
+    character_db.set_character_death_state(db, guid, 2)
+
+    async def flow():
+        socket = WorldSocket(asyncio.StreamReader(), FakeWriter(), cfg)
+        socket.in_world = True
+        socket.player_guid = guid
+        socket.character = dict(character_db.get_character(db, 1, guid))
+        socket._apply_combat_stats()
+        socket.character.update({"map": 0, "x": 100.0, "y": 200.0,
+                                 "z": 10.0, "death_state": 2})
+        socket._get_combat_state()["dead"] = True
+        socket._get_combat_state()["ghost"] = True
+        await socket.handle_reclaim_corpse(b"")
+        assert socket.character["map"] == 1
+        assert socket.character["death_state"] == 0
+        assert socket._get_combat_state()["dead"] is False
+        assert getattr(socket, "_repop_pending", False) is True
+        assert character_db.get_character_corpse(db, guid) is None
 
     asyncio.run(flow())
 

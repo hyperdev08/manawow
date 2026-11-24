@@ -18,6 +18,7 @@ from src.world import object_update
 
 CORPSE_RECLAIM_RADIUS = 39.0
 CORPSE_RECLAIM_DELAY = 30.0
+CORPSE_VISIBILITY_RADIUS = 100.0
 SPIRIT_HEALER_INTERACT_RANGE = 30.0
 SPIRIT_HEALER_NPC_FLAG = 0x4000
 SPIRIT_HEAL_RESURRECT_PERCENT = 0.5
@@ -51,6 +52,9 @@ class DeathMixin:
         corpse = await asyncio.to_thread(
             character_db.get_character_corpse,
             self.config.database.world_path, guid)
+        if corpse is not None:
+            corpse = dict(corpse)
+            corpse.setdefault("owner_guid", int(corpse["character_guid"]))
         combat["corpse"] = corpse
         return corpse
 
@@ -78,6 +82,139 @@ class DeathMixin:
         return {"id": 0, "map": map_id, "zone": zone, "x": x, "y": y,
                 "z": z, "o": o, "name": "Starting graveyard"}
 
+    def _corpse_object_data(self, row) -> dict:
+        """Build the client-facing corpse object from a character/corpse row."""
+        owner = int(row.get("owner_guid")
+                    or row.get("character_guid")
+                    or row.get("guid") or 0)
+        items = row.get("items")
+        if items is None:
+            inventory = (row.get("inventory")
+                         if row is self.character else None)
+            if inventory:
+                items = []
+                for slot in range(19):
+                    item = inventory.get(slot)
+                    items.append(int(item.get("item_entry") or 0) if item else 0)
+            else:
+                items = character_db.get_equipment_entries(
+                    self.config.database.world_path, owner)
+        skin = int(row.get("skin", 0) or 0) & 0xFF
+        face = int(row.get("face", 0) or 0) & 0xFF
+        hair = int(row.get("hair_style", 0) or 0) & 0xFF
+        color = int(row.get("hair_color", 0) or 0) & 0xFF
+        return {
+            "owner_guid": owner,
+            "map": int(row.get("map", 0) or 0),
+            "x": float(row.get("x", 0.0) or 0.0),
+            "y": float(row.get("y", 0.0) or 0.0),
+            "z": float(row.get("z", 0.0) or 0.0),
+            "o": float(row.get("o", 0.0) or 0.0),
+            "display_id": object_update.player_display_id(row),
+            "items": list(items or []),
+            "bytes1": skin | (face << 8) | (hair << 16) | (color << 24),
+            "bytes2": int(row.get("facial_style", 0) or 0) & 0xFF,
+            "guild": int(row.get("guild_id", 0) or 0),
+        }
+
+    async def _broadcast_corpse_create(self, corpse: dict) -> None:
+        server = getattr(self, "server", None)
+        sessions = getattr(server, "sessions", ()) if server is not None else ()
+        for session in list(sessions):
+            if session is self or not getattr(session, "in_world", False):
+                continue
+            character = getattr(session, "character", None)
+            if not character or int(character.get("map", 0) or 0) != int(
+                    corpse["map"]):
+                continue
+            if math.dist(
+                    (float(character.get("x", 0.0) or 0.0),
+                     float(character.get("y", 0.0) or 0.0),
+                     float(character.get("z", 0.0) or 0.0)),
+                    (corpse["x"], corpse["y"], corpse["z"])) \
+                    > CORPSE_VISIBILITY_RADIUS:
+                continue
+            try:
+                opcode, payload = object_update.build_corpse_update(corpse)
+                await session.send_packet(opcode, payload)
+                visible = getattr(session, "_visible_corpses", None)
+                if visible is None:
+                    visible = {}
+                    session._visible_corpses = visible
+                visible[int(corpse["owner_guid"])] = (
+                    object_update.corpse_guid(int(corpse["owner_guid"])))
+            except Exception:
+                pass
+
+    async def _broadcast_corpse_destroy(self, corpse: dict) -> None:
+        server = getattr(self, "server", None)
+        sessions = getattr(server, "sessions", ()) if server is not None else ()
+        owner_guid = int(corpse.get("owner_guid")
+                         or corpse.get("character_guid") or 0)
+        guid = object_update.corpse_guid(owner_guid)
+        payload = struct.pack("<QB", guid, 0)
+        for session in list(sessions):
+            if session is self or not getattr(session, "in_world", False):
+                continue
+            try:
+                await session.send_packet(
+                    Opcodes.SMSG_DESTROY_OBJECT, payload)
+                visible = getattr(session, "_visible_corpses", None)
+                if visible is not None:
+                    visible.pop(owner_guid, None)
+            except Exception:
+                pass
+
+    async def _send_login_corpse_spawns(self) -> None:
+        """Show nearby other players' corpses to a newly arrived session."""
+        await self.refresh_corpse_visibility(force=True)
+
+    async def refresh_corpse_visibility(self, force: bool = False) -> None:
+        """Create/destroy nearby player-corpse objects as the player moves."""
+        if not self.in_world or not self.character:
+            return
+        point = (float(self.character.get("x", 0.0) or 0.0),
+                 float(self.character.get("y", 0.0) or 0.0),
+                 float(self.character.get("z", 0.0) or 0.0))
+        last = getattr(self, "_corpse_scan_pos", None)
+        if not force and last is not None:
+            if math.dist(point, last) < 20.0:
+                return
+        rows = await asyncio.to_thread(
+            character_db.get_corpses_near,
+            self.config.database.world_path,
+            int(self.character.get("map", 0) or 0),
+            point[0], point[1], point[2], CORPSE_VISIBILITY_RADIUS)
+        current = {}
+        for row in rows:
+            owner = int(row.get("character_guid") or 0)
+            if not owner or owner == int(self.player_guid or 0):
+                continue
+            current[owner] = row
+        previous = getattr(self, "_visible_corpses", {})
+        for owner, row in current.items():
+            if owner in previous:
+                continue
+            corpse = self._corpse_object_data(row)
+            try:
+                opcode, payload = object_update.build_corpse_update(corpse)
+                await self.send_packet(opcode, payload)
+            except Exception:
+                pass
+        for owner in previous.keys() - current.keys():
+            try:
+                await self.send_packet(
+                    Opcodes.SMSG_DESTROY_OBJECT,
+                    struct.pack("<QB",
+                                object_update.corpse_guid(owner), 0))
+            except Exception:
+                pass
+        self._visible_corpses = {
+            owner: object_update.corpse_guid(owner)
+            for owner in current
+        }
+        self._corpse_scan_pos = point
+
     async def _record_death(self) -> None:
         """Create the corpse, persist death state and send the release loc."""
         if not self.character:
@@ -90,8 +227,8 @@ class DeathMixin:
         z = float(self.character.get("z", 0.0) or 0.0)
         o = float(self.character.get("o", 0.0) or 0.0)
         guid = int(self.player_guid or 0)
-        corpse = {"character_guid": guid, "map": map_id, "zone": zone,
-                  "x": x, "y": y, "z": z, "o": o, "released": 0}
+        corpse = self._corpse_object_data(self.character)
+        corpse.update({"character_guid": guid, "zone": zone, "released": 0})
         combat["corpse"] = corpse
         grave = await self._nearest_graveyard()
         grave = self._grave_or_start(grave)
@@ -110,6 +247,7 @@ class DeathMixin:
             struct.pack("<Ifff", int(grave["map"]), float(grave["x"]),
                         float(grave["y"]), float(grave["z"])),
         )
+        await self._broadcast_corpse_create(corpse)
 
     async def _restore_death_state(self) -> None:
         """Restore a ghost/dead character after login."""
@@ -129,6 +267,9 @@ class DeathMixin:
             corpse = await asyncio.to_thread(
                 character_db.get_character_corpse,
                 self.config.database.world_path, guid)
+            if corpse is not None:
+                corpse = dict(corpse)
+                corpse.setdefault("owner_guid", int(corpse["character_guid"]))
             combat["corpse"] = corpse
         combat["death_graveyard"] = await self._nearest_graveyard()
 
@@ -218,6 +359,7 @@ class DeathMixin:
         corpse = combat.get("corpse") or await self._corpse()
         if at_corpse and corpse is None:
             return False
+        old_map = int(self.character.get("map", 0) or 0)
         if at_corpse:
             map_id = int(corpse["map"])
             zone = int(corpse.get("zone") or 0)
@@ -271,7 +413,24 @@ class DeathMixin:
         await run_db_write(
             character_db.delete_character_corpse,
             self.config.database.world_path, guid)
+        if corpse is not None:
+            await self._broadcast_corpse_destroy(corpse)
         combat["corpse"] = None
+        cross_map = (at_corpse and corpse is not None
+                     and int(corpse["map"]) != old_map)
+        if cross_map:
+            # Instance death: the corpse is on another map.  Resurrect into
+            # the corpse's map and let the worldport ack rebuild the client.
+            self._repop_pending = True
+            self.movement_info = None
+            await self._send_system_message("You have been resurrected.")
+            await self.send_packet(
+                Opcodes.SMSG_NEW_WORLD,
+                login_packets.build_login_verify_world(self.character))
+            self.log.info(
+                f"'{self.character.get('name')}' reclaimed an instance "
+                f"corpse on map {map_id}")
+            return True
         if at_corpse and hasattr(self, "_teleport_nearby"):
             await self._teleport_nearby(x, y, z, o)
         await self.send_packet(
@@ -345,14 +504,34 @@ class DeathMixin:
         corpse = await self._corpse()
         if corpse is None:
             return
-        if int(corpse["map"]) != int(self.character.get("map", 0) or 0):
-            await self._send_system_message("Your corpse is too far away.")
-            return
-        distance = math.dist(
-            (float(self.character.get("x", 0.0)),
-             float(self.character.get("y", 0.0)),
-             float(self.character.get("z", 0.0))),
-            (float(corpse["x"]), float(corpse["y"]), float(corpse["z"])))
+        corpse_map = int(corpse["map"])
+        current_map = int(self.character.get("map", 0) or 0)
+        if corpse_map != current_map:
+            # Instance corpse: the ghost may reclaim from the instance
+            # entrance (the graveyard nearest the corpse) without walking the
+            # whole instance.  The new-world handshake then moves the client
+            # into the instance map.
+            entrance = await asyncio.to_thread(
+                graveyard.closest_graveyard,
+                self.config.database.world_path, corpse_map,
+                int(corpse.get("zone") or 0), float(corpse["x"]),
+                float(corpse["y"]), float(corpse["z"]),
+                int(self.character.get("race", 1) or 1))
+            if entrance is None or int(entrance["map"]) != current_map:
+                await self._send_system_message("Your corpse is too far away.")
+                return
+            distance = math.dist(
+                (float(self.character.get("x", 0.0)),
+                 float(self.character.get("y", 0.0)),
+                 float(self.character.get("z", 0.0))),
+                (float(entrance["x"]), float(entrance["y"]),
+                 float(entrance["z"])))
+        else:
+            distance = math.dist(
+                (float(self.character.get("x", 0.0)),
+                 float(self.character.get("y", 0.0)),
+                 float(self.character.get("z", 0.0))),
+                (float(corpse["x"]), float(corpse["y"]), float(corpse["z"])))
         if distance > CORPSE_RECLAIM_RADIUS:
             await self._send_system_message("Your corpse is too far away.")
             return

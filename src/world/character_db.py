@@ -1002,6 +1002,63 @@ def get_character_corpse(path: str, guid: int) -> Optional[Dict[str, object]]:
     return dict(row) if row is not None else None
 
 
+def get_equipment_entries(path: str, guid: int) -> List[int]:
+    """Return the 19 equipped item entries in INVSLOT order (0 when empty)."""
+    result = [0] * 19
+    con = _connect(path)
+    try:
+        for slot, entry in con.execute(
+                "SELECT slot, item_entry FROM character_items"
+                " WHERE character_guid = ? AND slot BETWEEN 0 AND 18",
+                (int(guid),)):
+            if 0 <= int(slot) < 19:
+                result[int(slot)] = int(entry)
+    except sqlite3.Error:
+        pass
+    finally:
+        con.close()
+    return result
+
+
+def get_corpses_near(path: str, map_id: int, x: float, y: float, z: float,
+                     radius: float) -> List[Dict[str, object]]:
+    """Corpses on ``map_id`` within ``radius`` yards, with owner appearance."""
+    radius = max(0.0, float(radius))
+    if radius <= 0.0:
+        return []
+    x, y, z = float(x), float(y), float(z)
+    con = _connect(path)
+    con.row_factory = sqlite3.Row
+    try:
+        rows = con.execute(
+            "SELECT c.*, ch.race, ch.gender, ch.skin, ch.face,"
+            " ch.hair_style, ch.hair_color, ch.facial_style, ch.guild_id,"
+            " ch.char_flags"
+            " FROM character_corpses c"
+            " JOIN characters ch ON ch.guid = c.character_guid"
+            " WHERE c.map = ? AND c.x BETWEEN ? AND ?"
+            " AND c.y BETWEEN ? AND ?",
+            (int(map_id), x - radius, x + radius, y - radius, y + radius),
+        ).fetchall()
+        result = []
+        limit = radius * radius
+        for row in rows:
+            dx = float(row["x"]) - x
+            dy = float(row["y"]) - y
+            dz = float(row["z"]) - z
+            if dx * dx + dy * dy + dz * dz > limit:
+                continue
+            corpse = dict(row)
+            corpse["owner_guid"] = int(row["character_guid"])
+            corpse["items"] = get_equipment_entries(path, int(row["character_guid"]))
+            result.append(corpse)
+    except sqlite3.Error:
+        result = []
+    finally:
+        con.close()
+    return result
+
+
 def delete_character_corpse(path: str, guid: int) -> None:
     con = _connect(path)
     try:
