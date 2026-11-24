@@ -16,6 +16,7 @@ from src.world.character_db import (configure as configure_character_db,
                                     init_character_db,
                                     init_split_databases)
 from src.world.creature import init_creature_db
+from src.world.graveyard import init_graveyard_db
 from src.world.quests import init_quest_db, init_world_quest_db
 from src.world.gameobject import init_gameobject_db
 
@@ -123,6 +124,7 @@ def init_databases(cfg: Config) -> None:
 
     configure_character_db(cfg.database.world_path, character_path)
     init_creature_db(cfg.database.world_path)
+    init_graveyard_db(cfg.database.world_path)
     if databases.is_split():
         init_split_databases(cfg.database.world_path, character_path)
         init_world_quest_db(cfg.database.world_path)

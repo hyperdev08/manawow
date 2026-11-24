@@ -880,19 +880,14 @@ class StatsMixin:
         combat["target_guid"] = 0
         for low_guid in list(combat["aggro"]):
             await self._reset_creature(low_guid)
+        if hasattr(self, "dismiss_all_summons"):
+            await self.dismiss_all_summons()
 
-        # UNIT_FIELD_HEALTH is already 0; PLAYER_FLAGS/GHOST is not needed for
-        # the client to show the death screen, it only needs the location.
-        await self.send_packet(
-            Opcodes.SMSG_DEATH_RELEASE_LOC,
-            struct.pack(
-                "<Ifff",
-                int(self.character["map"]),
-                float(self.character["x"]),
-                float(self.character["y"]),
-                float(self.character["z"]),
-            ),
-        )
+        combat["ghost"] = False
+        # Persist the corpse, record death state and show the closest
+        # graveyard's release marker.
+        if hasattr(self, "_record_death"):
+            await self._record_death()
         await self._send_system_message("You have died.")
         self.log.info(f"'{self.character['name']}' was killed by {source}")
 

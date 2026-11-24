@@ -108,6 +108,7 @@ UNIT_END = 148
 # PLAYER_START = UNIT_END = 148, giving absolute index 148 + 176 = 324.
 PLAYER_START = UNIT_END
 PLAYER_FLAGS = 150
+PLAYER_FLAGS_GHOST = 0x00000010
 PLAYER_BYTES = 153                  # skin | face<<8 | hair style<<16 | hair colour<<24
 PLAYER_BYTES_2 = 154                # facial style in the low byte
 PLAYER_BYTES_3 = 155                # gender in the low byte

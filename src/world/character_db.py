@@ -41,7 +41,9 @@ CREATE TABLE IF NOT EXISTS characters(
   pet_family INTEGER NOT NULL DEFAULT 0,
   equipment TEXT NOT NULL DEFAULT '',
   bytes1 INTEGER NOT NULL DEFAULT 0,
-  bytes2 INTEGER NOT NULL DEFAULT 0
+  bytes2 INTEGER NOT NULL DEFAULT 0,
+  -- 0 alive, 1 dead (corpse not released), 2 ghost.
+  death_state INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_characters_account ON characters(account_id);
 
@@ -220,6 +222,21 @@ CREATE TABLE IF NOT EXISTS character_items(
 );
 CREATE INDEX IF NOT EXISTS idx_character_items_character ON character_items(character_guid);
 
+-- The player's corpse while dead/ghost.  One row per character.  A new death
+-- replaces the old corpse.  ``zone`` is kept for corpses in instances whose
+-- graveyard lives on another map.
+CREATE TABLE IF NOT EXISTS character_corpses(
+  character_guid INTEGER PRIMARY KEY,
+  map INTEGER NOT NULL DEFAULT 0,
+  zone INTEGER NOT NULL DEFAULT 0,
+  x REAL NOT NULL DEFAULT 0.0,
+  y REAL NOT NULL DEFAULT 0.0,
+  z REAL NOT NULL DEFAULT 0.0,
+  o REAL NOT NULL DEFAULT 0.0,
+  created INTEGER NOT NULL DEFAULT 0,
+  released INTEGER NOT NULL DEFAULT 0
+);
+
 -- Character spells: one row per spell known by a character.
 CREATE TABLE IF NOT EXISTS character_spells(
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -285,7 +302,7 @@ def _schema_subset(sql: str, tables: set[str]) -> str:
 # retained for tests/tools that explicitly create a self-contained database.
 CREATE_CHARACTER_TABLES_SQL = _schema_subset(
     CREATE_CHARACTERS_SQL, {"characters", "character_items",
-                            "character_spells"})
+                            "character_spells", "character_corpses"})
 CREATE_WORLD_TEMPLATE_SQL = _schema_subset(
     CREATE_CHARACTERS_SQL, {"item_templates", "player_classlevelstats",
                             "player_levelstats"})
@@ -351,6 +368,7 @@ CHARACTER_TABLES = (
     "characters",
     "character_items",
     "character_spells",
+    "character_corpses",
     "character_quests",
     "character_quests_rewarded",
 )
@@ -373,11 +391,24 @@ def _migrate_character_columns(con: sqlite3.Connection) -> None:
         "bytes2": "INTEGER NOT NULL DEFAULT 0",
         "xp": "INTEGER NOT NULL DEFAULT 0",
         "money": "INTEGER NOT NULL DEFAULT 0",
+        "death_state": "INTEGER NOT NULL DEFAULT 0",
     }
     for name, declaration in additions.items():
         if name not in columns:
             con.execute(
                 f"ALTER TABLE characters ADD COLUMN {name} {declaration}")
+
+
+def _migrate_corpse_columns(con: sqlite3.Connection) -> None:
+    try:
+        columns = {row[1] for row in con.execute(
+            "PRAGMA table_info(character_corpses)")}
+    except sqlite3.Error:
+        return
+    if columns and "released" not in columns:
+        con.execute(
+            "ALTER TABLE character_corpses ADD COLUMN released INTEGER"
+            " NOT NULL DEFAULT 0")
 
 
 def init_character_store(path: str) -> None:
@@ -386,6 +417,7 @@ def init_character_store(path: str) -> None:
     try:
         con.executescript(CREATE_CHARACTER_TABLES_SQL)
         _migrate_character_columns(con)
+        _migrate_corpse_columns(con)
         _migrate_start_positions(con)
         con.commit()
     finally:
@@ -479,6 +511,8 @@ _NAME_RE = re.compile(r"^[A-Za-z]{2,12}$")
 # the 4 bag slots.  Sending only 19 truncates every record and the client
 # silently discards the whole SMSG_CHAR_ENUM (empty character list).
 _EQUIPMENT_SLOTS = 23
+# ``SMSG_CHAR_ENUM`` character flags.
+CHARACTER_FLAG_GHOST = 0x00000010
 
 # Player starting positions, copied row-for-row from the 3.3.5a world database
 # (``playercreateinfo``).  Keyed by (race, class) because death knights get the
@@ -614,6 +648,7 @@ def init_character_db(path: str) -> None:
     try:
         con.executescript(CREATE_CHARACTERS_SQL)
         _migrate_character_columns(con)
+        _migrate_corpse_columns(con)
         _migrate_item_template_columns(con)
         _migrate_start_positions(con)
         _seed_starter_items(con)
@@ -855,6 +890,14 @@ def delete_character(path: str, account_id: int, guid: int) -> bool:
         if cur.rowcount > 0:
             from src.world import quests
             quests.delete_character_quests(con, guid)
+            for table in ("character_items", "character_spells",
+                          "character_corpses"):
+                try:
+                    con.execute(
+                        f"DELETE FROM {table} WHERE character_guid = ?",
+                        (int(guid),))
+                except sqlite3.OperationalError:
+                    pass
         con.commit()
         return cur.rowcount > 0
     finally:
@@ -903,6 +946,72 @@ def update_character_position(path: str, guid: int, x: float, y: float, z: float
         con.close()
 
 
+def set_character_death_state(path: str, guid: int, state: int) -> None:
+    """Persist ``0`` alive, ``1`` dead or ``2`` ghost."""
+    con = _connect(path)
+    try:
+        con.execute("UPDATE characters SET death_state = ? WHERE guid = ?",
+                    (int(state), int(guid)))
+        con.commit()
+    finally:
+        con.close()
+
+
+def save_character_corpse(path: str, guid: int, map_id: int, zone: int,
+                          x: float, y: float, z: float, o: float) -> None:
+    import time as _time
+    con = _connect(path)
+    try:
+        con.execute(
+            "INSERT OR REPLACE INTO character_corpses("
+            "character_guid, map, zone, x, y, z, o, created)"
+            " VALUES(?,?,?,?,?,?,?,?)",
+            (int(guid), int(map_id), int(zone), float(x), float(y), float(z),
+             float(o), int(_time.time())),
+        )
+        con.commit()
+    finally:
+        con.close()
+
+
+def mark_character_corpse_released(path: str, guid: int,
+                                   released: int) -> None:
+    con = _connect(path)
+    try:
+        con.execute(
+            "UPDATE character_corpses SET released = ? "
+            "WHERE character_guid = ?",
+            (int(released), int(guid)))
+        con.commit()
+    finally:
+        con.close()
+
+
+def get_character_corpse(path: str, guid: int) -> Optional[Dict[str, object]]:
+    con = _connect(path)
+    con.row_factory = sqlite3.Row
+    try:
+        row = con.execute(
+            "SELECT * FROM character_corpses WHERE character_guid = ?",
+            (int(guid),),
+        ).fetchone()
+    except sqlite3.Error:
+        row = None
+    finally:
+        con.close()
+    return dict(row) if row is not None else None
+
+
+def delete_character_corpse(path: str, guid: int) -> None:
+    con = _connect(path)
+    try:
+        con.execute("DELETE FROM character_corpses WHERE character_guid = ?",
+                    (int(guid),))
+        con.commit()
+    finally:
+        con.close()
+
+
 def build_char_enum_payload(characters: List[sqlite3.Row], equipment: Optional[Dict[int, List[Tuple[int, int, int]]]] = None) -> bytes:
     """Serialize ``SMSG_CHAR_ENUM`` for 3.3.5a.
     
@@ -931,12 +1040,19 @@ def build_char_enum_payload(characters: List[sqlite3.Row], equipment: Optional[D
         out += struct.pack("<I", int(char["map"]))
         out += struct.pack("<fff", float(char["x"]), float(char["y"]), float(char["z"]))
         out += struct.pack("<I", int(char["guild_id"]))
-        out += struct.pack("<I", int(char["char_flags"]))
+        death_state = (int(char["death_state"])
+                       if "death_state" in char.keys() else 0)
+        char_flags = int(char["char_flags"])
+        if death_state == 2:
+            char_flags |= CHARACTER_FLAG_GHOST
+        out += struct.pack("<I", char_flags)
         out += struct.pack("<I", int(char["customize_flags"]))
         out.append(1 if int(char["first_login"]) else 0)
-        out += struct.pack("<I", int(char["pet_display_id"]))
-        out += struct.pack("<I", int(char["pet_level"]))
-        out += struct.pack("<I", int(char["pet_family"]))
+        # A ghost has no active pet in the character list.
+        ghost = death_state == 2
+        out += struct.pack("<I", 0 if ghost else int(char["pet_display_id"]))
+        out += struct.pack("<I", 0 if ghost else int(char["pet_level"]))
+        out += struct.pack("<I", 0 if ghost else int(char["pet_family"]))
 
         # 23 equipment entries (19 equipment + 4 bags): display id, inventory
         # type, enchant visual.

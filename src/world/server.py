@@ -14,6 +14,7 @@ from src.world import creature
 from src.world import databases
 from src.world import gameobject
 from src.world import geometry
+from src.world import graveyard
 from src.world import quests
 from src.world.groups import GroupManager
 from src.world.world_combat import WorldCombatManager
@@ -50,6 +51,7 @@ class WorldServer:
         # Creature/spell tables (including the bundled 3.3.5a starter spells)
         # come first so the character backfill can read them.
         creature.init_creature_db(world_path)
+        graveyard.init_graveyard_db(world_path)
         if databases.is_split():
             character_db.init_split_databases(world_path, character_path)
             quests.init_world_quest_db(world_path)

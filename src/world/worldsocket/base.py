@@ -382,6 +382,16 @@ class SocketBase:
                 await self.handle_sell_item(data)
             elif opcode == Opcodes.CMSG_REPOP_REQUEST:
                 await self.handle_repop_request(data)
+            elif opcode == Opcodes.CMSG_RECLAIM_CORPSE:
+                await self.handle_reclaim_corpse(data)
+            elif opcode == Opcodes.CMSG_SPIRIT_HEALER_ACTIVATE:
+                await self.handle_spirit_healer_activate(data)
+            elif opcode == Opcodes.CMSG_GHOST:
+                await self.handle_ghost(data)
+            elif opcode == Opcodes.MSG_CORPSE_QUERY:
+                await self.handle_corpse_query(data)
+            elif opcode == Opcodes.CMSG_CORPSE_MAP_POSITION_QUERY:
+                await self.handle_corpse_map_position_query(data)
             elif opcode == Opcodes.MSG_MOVE_WORLDPORT_ACK:
                 await self.handle_worldport_ack(data)
             elif opcode in MOVEMENT_OPCODES:

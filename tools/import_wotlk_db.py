@@ -21,6 +21,7 @@ Usage::
     python tools/import_wotlk_db.py --loot-only
     python tools/import_wotlk_db.py --pools-only
     python tools/import_wotlk_db.py --spawn-entries-only
+    python tools/import_wotlk_db.py --graveyards-only
 
 The world bank is separate from ``data/characters.db``; character rows are
 never written to it.  ``--quests-only`` refreshes just the quest tables
@@ -659,7 +660,65 @@ def _insert_spell_durations(con, rows) -> int:
         "id, duration, duration_per_level, max_duration) VALUES(?,?,?,?)",
         rows,
     )
+    # The SPIRIT_HEALER activation casts Resurrection Sickness (15007), whose
+    # SpellDuration.dbc row 427 is not part of the SQL dump.  Seed the known
+    # ten-minute duration even when no DBC was supplied.
+    con.execute(
+        "INSERT OR IGNORE INTO spell_duration(id, duration, duration_per_level,"
+        " max_duration) VALUES(427, 600000, 0, 600000)")
     return len(rows)
+
+
+def build_graveyard_rows(safe_rows, zone_rows):
+    """Return ``(locations, links)`` tuples for the two graveyard tables."""
+    locations = []
+    for raw in safe_rows:
+        gid = _sqlite_int(raw.get("id"))
+        if not gid:
+            continue
+        locations.append((
+            gid,
+            _sqlite_int(raw.get("map")),
+            _sqlite_float(raw.get("x")),
+            _sqlite_float(raw.get("y")),
+            _sqlite_float(raw.get("z")),
+            _sqlite_float(raw.get("o")),
+            _text_or_empty(raw.get("name")),
+        ))
+    links = []
+    for raw in zone_rows:
+        gid = _sqlite_int(raw.get("id"))
+        ghost_loc = _sqlite_int(raw.get("ghost_loc"))
+        if not gid or not ghost_loc:
+            continue
+        links.append((
+            gid,
+            ghost_loc,
+            _sqlite_int(raw.get("link_kind")),
+            _sqlite_int(raw.get("faction")),
+        ))
+    return locations, links
+
+
+def insert_graveyard_rows(con, safe_rows, zone_rows) -> dict[str, int]:
+    from src.world import graveyard
+
+    con.executescript(graveyard.CREATE_GRAVEYARD_SQL)
+    locations, links = build_graveyard_rows(safe_rows, zone_rows)
+    con.execute("DELETE FROM graveyard_locations")
+    con.execute("DELETE FROM graveyard_zones")
+    con.executemany(
+        "INSERT OR REPLACE INTO graveyard_locations("
+        "id, map, x, y, z, o, name) VALUES(?,?,?,?,?,?,?)",
+        locations,
+    )
+    con.executemany(
+        "INSERT OR REPLACE INTO graveyard_zones("
+        "id, ghost_loc, link_kind, faction) VALUES(?,?,?,?)",
+        links,
+    )
+    return {"graveyard_locations": len(locations),
+            "graveyard_zones": len(links)}
 
 
 def _insert_mapped(con, table, pairs, raw_rows, float_columns=frozenset(),
@@ -979,6 +1038,8 @@ def import_world(dump_path: str, db_path: str, clear: bool = True,
     quest_tables = read_quest_tables(text)
     _, raw_npc_vendor = wotlk_dump.rows(text, "npc_vendor")
     _, raw_npc_vendor_template = wotlk_dump.rows(text, "npc_vendor_template")
+    _, raw_safe_locs = wotlk_dump.rows(text, "world_safe_locs")
+    _, raw_graveyard_zones = wotlk_dump.rows(text, "game_graveyard_zone")
     gameobject_tables = read_gameobject_tables(text)
     _, raw_game_event_creature = wotlk_dump.rows(text, "game_event_creature")
     creature_pool_tables = {t: wotlk_dump.rows(text, t)[1] for t in (
@@ -1231,6 +1292,8 @@ def import_world(dump_path: str, db_path: str, clear: bool = True,
                                   raw_templates),
             ),
         }
+        counts.update(insert_graveyard_rows(
+            con, raw_safe_locs, raw_graveyard_zones))
 
         # CMaNGOS spell_template only ships SchoolMask, while the server stores
         # the single school index used by the client packets.  Derive it from
@@ -1301,6 +1364,8 @@ def import_world(dump_path: str, db_path: str, clear: bool = True,
         "gameobject_templates": counts["gameobject_templates"],
         "gameobject_spawns": counts["gameobject_spawns"],
         "creature_events": counts["creature_events"],
+        "graveyard_locations": counts["graveyard_locations"],
+        "graveyard_zones": counts["graveyard_zones"],
     }
     print(
         f"imported {stats['templates']:,} templates, {stats['spawns']:,} spawns, "
@@ -1316,6 +1381,7 @@ def import_world(dump_path: str, db_path: str, clear: bool = True,
         f"{stats['quests']:,} quests, {stats['vendor_items']:,} vendor items, "
         f"{stats['gameobject_templates']:,} game object templates, "
         f"{stats['gameobject_spawns']:,} game object spawns, "
+        f"{stats['graveyard_locations']:,} graveyard locations, "
         f"{stats['creature_events']:,} world-event creatures "
         f"in {time.time() - started:.1f}s"
     )
@@ -1998,6 +2064,31 @@ def report_start_zones(db_path: str, radius: float = 150.0) -> None:
         con.close()
 
 
+def import_graveyards(dump_path: str, db_path: str) -> dict[str, int]:
+    """``--graveyards-only``: refresh ``world_safe_locs``/ghost links."""
+    import sqlite3
+
+    from src.world import graveyard
+
+    started = time.time()
+    text = wotlk_dump.read_dump(dump_path)
+    _, safe_rows = wotlk_dump.rows(text, "world_safe_locs")
+    _, zone_rows = wotlk_dump.rows(text, "game_graveyard_zone")
+    del text
+    graveyard.init_graveyard_db(db_path)
+    con = sqlite3.connect(db_path)
+    try:
+        counts = insert_graveyard_rows(con, safe_rows, zone_rows)
+        con.commit()
+    finally:
+        con.close()
+    print(
+        f"imported {counts['graveyard_locations']:,} graveyard locations and "
+        f"{counts['graveyard_zones']:,} zone links in {time.time() - started:.1f}s"
+    )
+    return counts
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dump", help="CMaNGOS/TrinityCore world .sql (or .sql.gz) "
@@ -2032,6 +2123,8 @@ def main() -> None:
     parser.add_argument("--events-only", action="store_true",
                         help="only refresh which creature/object spawns belong "
                              "to world events")
+    parser.add_argument("--graveyards-only", action="store_true",
+                        help="only refresh world_safe_locs and graveyard links")
     args = parser.parse_args()
 
     from src.common.config import Config
@@ -2062,6 +2155,9 @@ def main() -> None:
         return
     if args.events_only:
         import_events(dump_path, db_path)
+        return
+    if args.graveyards_only:
+        import_graveyards(dump_path, db_path)
         return
     if args.loot_only:
         import_loot(dump_path, db_path)

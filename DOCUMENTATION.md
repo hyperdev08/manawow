@@ -103,6 +103,15 @@ A real 3.3.5a client can now log in, pick a character and **enter the world**:
 - Loot rights belong to the tagger's group; only one member can have a corpse's loot window open at a time to prevent duplicate item takes
 - Limitations: groups are session-scoped (no MySQL persistence/offline members yet); need/greed/master loot, raid markers, ready checks and LFG are not implemented
 
+### Death, ghosts, corpses and spirit healers
+- On death the server stores a corpse at the death position, records `death_state` (`1` dead, `2` ghost) and sends `SMSG_DEATH_RELEASE_LOC` with the nearest usable graveyard.
+- Graveyards come from the CMaNGOS `world_safe_locs` and `game_graveyard_zone` tables, imported by `tools/import_wotlk_db.py` (including `--graveyards-only`). Selection mirrors `Player::GetClosestGraveYard`: zone + team first, then neutral zone links, then the nearest same-map graveyard.
+- `CMSG_REPOP_REQUEST` teleports the player to that graveyard as a ghost: `PLAYER_FLAGS_GHOST`, one health point, `SMSG_PRE_RESURRECT`, `SMSG_CORPSE_RECLAIM_DELAY` and the usual worldport handshake. The ghost can walk around but cannot fight, loot or cast.
+- `CMSG_RECLAIM_CORPSE` resurrects at the corpse (same map and within 39 yards) after the 30-second reclaim delay, at 50% health/mana. `CMSG_SPIRIT_HEALER_ACTIVATE` (or the spirit healer gossip option) resurrects at the graveyard with 50% health/mana, 25% durability loss and Resurrection Sickness (no sickness below level 11, one minute per level from 11–19, ten minutes from 20).
+- `MSG_CORPSE_QUERY` returns the corpse's `(map, x, y, z)`, and `SMSG_DEATH_RELEASE_LOC` is cleared with map `-1` on resurrection.
+- The ghost flag and corpse survive logout/relogin; the character list marks ghosts with `CHARACTER_FLAG_GHOST`.
+- Limitations: no separate visible corpse object for other players, no PvP corpse reclaim tiers (30/60/120 s), and battleground spirit guides/resurrect queues are not implemented.
+
 ### Auras (buffs, debuffs, control and mitigation)
 - A real aura registry for players (`combat["auras"]`) and creatures (`combat["creature_auras"]`), keyed by spell so a recast refreshes the duration and stacks up to `Spell.dbc` `StackAmount`
 - Components implemented: periodic damage/heal/leech/energize, stun, root, fear, confuse, charm, silence, pacify, sleep/polymorph/banish/shackle mechanics, movement increase/decrease, primary stats and percentage/total-stat modifiers, health/energy (flat and percent), armor/resistances (flat and percent), attack power/ranged AP (flat and percent), spell/healing power and percent, melee/ranged/spell haste, hit/crit/dodge/parry/block ratings, damage-done and damage-taken modifiers, damage shields/Thorns, spell reflection, school/mechanic/effect/dispel immunities and school absorb shields

@@ -26,6 +26,7 @@ from src.world.worldsocket.constants import __all__ as _CONSTANT_NAMES
 from src.world.worldsocket.creature_ai import CreatureAIMixin
 from src.world.worldsocket.creature_movement import CreatureMovementMixin
 from src.world.worldsocket.creatures import CreaturesMixin
+from src.world.worldsocket.death import DeathMixin
 from src.world.worldsocket.gameobjects import GameObjectsMixin
 from src.world.worldsocket.groups import GroupsMixin
 from src.world.worldsocket.inventory import InventoryMixin
@@ -53,6 +54,7 @@ class WorldSocket(
     ChatMixin,
     StatsMixin,
     AurasMixin,
+    DeathMixin,
     RunesMixin,
     SpellsMixin,
     CombatMixin,

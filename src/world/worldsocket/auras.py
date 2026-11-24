@@ -287,11 +287,17 @@ class AurasMixin:
                                       caster_guid: int, target_guid: int,
                                       caster_level: int,
                                       combo_points: int = 0,
-                                      target_kind: str | None = None) -> bool:
-        """Apply the modifier components of one ``SPELL_EFFECT_APPLY_AURA``."""
-        duration_ms = spells.spell_duration_ms(
-            self.config.database.world_path, template.duration_index,
-            caster_level)
+                                      target_kind: str | None = None,
+                                      duration_ms: int | None = None) -> bool:
+        """Apply the modifier components of one ``SPELL_EFFECT_APPLY_AURA``.
+
+        ``duration_ms`` overrides the DBC duration for hard-coded effects such
+        as Resurrection Sickness, whose SpellDuration row is not in the dump.
+        """
+        if duration_ms is None:
+            duration_ms = spells.spell_duration_ms(
+                self.config.database.world_path, template.duration_index,
+                caster_level)
         if duration_ms < 0 or (duration_ms == 0 and template.is_passive()):
             duration_ms = PERMANENT_AURA_SECONDS * 1000
         if duration_ms <= 0:

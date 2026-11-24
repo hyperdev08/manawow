@@ -5,7 +5,6 @@ import asyncio
 import struct
 import time
 
-from src.common.db_io import run_db_write
 from src.protocol.opcodes import Opcodes
 from src.world import character_db
 from src.world import creature
@@ -80,6 +79,8 @@ class WorldEntryMixin:
             del self._combat_state
         self._get_combat_state()
         self._apply_combat_stats()
+        if hasattr(self, "_restore_death_state"):
+            await self._restore_death_state()
         if hasattr(self, "_load_quest_state"):
             # Before the create block: it carries the PLAYER_QUEST_LOG fields.
             self._load_quest_state()
@@ -144,6 +145,8 @@ class WorldEntryMixin:
         await self.announce_self_to_peers()
         if hasattr(self, "_send_all_auras"):
             await self._send_all_auras()
+        if hasattr(self, "_send_login_death_location"):
+            await self._send_login_death_location()
 
     async def handle_logout_request(self, data: bytes):
         if self.in_world:
@@ -212,37 +215,10 @@ class WorldEntryMixin:
         """
         if not self.in_world or not self.character:
             return
-        combat = self._get_combat_state()
-        if not combat["dead"]:
+        if not self._get_combat_state()["dead"]:
             return
-        map_id, zone, x, y, z, o = character_db.start_position(
-            int(self.character["race"]), int(self.character["class"])
-        )
-        self.character["map"] = map_id
-        self.character["zone"] = zone
-        self.character["x"] = x
-        self.character["y"] = y
-        self.character["z"] = z
-        self.character["o"] = o
-        self._apply_combat_stats()
-        self.character["health"] = int(self.character["max_health"])
-        self.character["power"] = self._power_after_reset()
-        await run_db_write(
-            character_db.update_character_position,
-            self.config.database.world_path, int(self.player_guid),
-            x, y, z, o, map_id=map_id, zone=zone,
-        )
-
-        self._repop_pending = True
-        self.movement_info = None
-        await self.send_packet(
-            Opcodes.SMSG_NEW_WORLD,
-            login_packets.build_login_verify_world(self.character),
-        )
-        self.log.info(
-            f"'{self.character['name']}' released spirit at "
-            f"map {map_id} zone {zone}, awaiting worldport ack"
-        )
+        if hasattr(self, "_release_spirit"):
+            await self._release_spirit()
 
     async def handle_worldport_ack(self, data: bytes):
         """``MSG_MOVE_WORLDPORT_ACK``: the client finished loading the new map.
@@ -261,10 +237,23 @@ class WorldEntryMixin:
         # the world is rebuilt so the stale coordinates are not re-sent.
         await self.dismiss_all_summons()
 
-        # Leaving the death state before re-sending the world keeps the combat
-        # tick from immediately killing the player again.
         combat = self._get_combat_state()
-        combat["dead"] = False
+        ghost = bool(combat.get("ghost"))
+        if ghost:
+            # Still a ghost at the graveyard.  Keep the death state and the
+            # ghost flag; only the world around the player is rebuilt.
+            combat["dead"] = True
+            combat["ghost"] = True
+            self.character["health"] = 1
+            self.character["power"] = 0
+            self.character["player_flags"] = F.PLAYER_FLAGS_GHOST
+            self.character["death_state"] = 2
+        else:
+            # A non-release worldport (kept for future teleport paths).
+            combat["dead"] = False
+            combat["ghost"] = False
+            self.character["player_flags"] = 0
+            self.character["death_state"] = 0
         combat["in_combat"] = False
         combat["auto_attacking"] = False
         combat["target_guid"] = 0
@@ -278,7 +267,7 @@ class WorldEntryMixin:
         combat["aggro"].clear()
         # CMaNGOS resurrects with a full rune set; re-init and resync so the
         # client does not keep the cooldowns from before the death.
-        if self._is_death_knight():
+        if not ghost and self._is_death_knight():
             self._init_runes()
         await self._close_loot()
 
@@ -306,10 +295,11 @@ class WorldEntryMixin:
         )
         await self._send_player_fields({
             F.UNIT_FIELD_HEALTH: int(self.character["health"]),
+            F.PLAYER_FLAGS: int(self.character.get("player_flags", 0) or 0),
             self._power_field(F.UNIT_FIELD_POWER1): int(self.character["power"]),
             self._power_field(F.UNIT_FIELD_MAXPOWER1): int(self.character["max_power"]),
         })
-        if self._is_death_knight():
+        if not ghost and self._is_death_knight():
             await self._send_resync_runes()
         await self.send_packet(
             Opcodes.SMSG_INIT_WORLD_STATES,
@@ -320,12 +310,24 @@ class WorldEntryMixin:
             login_packets.build_login_set_time_speed(),
         )
         await self.send_packet(Opcodes.SMSG_TIME_SYNC_REQ, struct.pack("<I", 0))
-        # uint32(-1) removes the spirit-healer marker from the minimap, exactly
-        # like CMaNGOS ``Player::ResurrectPlayer``.
-        await self.send_packet(
-            Opcodes.SMSG_DEATH_RELEASE_LOC,
-            struct.pack("<Ifff", 0xFFFFFFFF, 0.0, 0.0, 0.0),
-        )
+        if ghost:
+            grave = combat.get("death_graveyard")
+            if grave is None:
+                grave = await self._nearest_graveyard()
+            if grave is not None:
+                await self.send_packet(
+                    Opcodes.SMSG_DEATH_RELEASE_LOC,
+                    struct.pack("<Ifff", int(grave["map"]),
+                                float(grave["x"]), float(grave["y"]),
+                                float(grave["z"])),
+                )
+        else:
+            # uint32(-1) removes the spirit-healer marker from the minimap,
+            # exactly like CMaNGOS ``Player::ResurrectPlayer``.
+            await self.send_packet(
+                Opcodes.SMSG_DEATH_RELEASE_LOC,
+                struct.pack("<Ifff", 0xFFFFFFFF, 0.0, 0.0, 0.0),
+            )
         await self.refresh_creature_visibility(force=True)
         await self.announce_self_to_peers()
         self.log.info(

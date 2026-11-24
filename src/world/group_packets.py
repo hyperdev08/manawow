@@ -35,8 +35,11 @@ def member_status(session) -> int:
         return MEMBER_STATUS_ZONE_OUT
     status |= MEMBER_STATUS_ONLINE
     try:
-        if session._get_combat_state().get("dead"):
+        combat = session._get_combat_state()
+        if combat.get("dead"):
             status |= MEMBER_STATUS_DEAD
+        if combat.get("ghost"):
+            status |= MEMBER_STATUS_GHOST
     except Exception:
         pass
     return status

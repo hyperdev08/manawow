@@ -443,7 +443,7 @@ def build_player_values(char: Mapping, peer: bool = False) -> Dict[int, int]:
             values[F.UNIT_FIELD_POWER_REGEN_INTERRUPTED_FLAT_MODIFIER + 0] = \
                 interrupted_bits
 
-    values[F.PLAYER_FLAGS] = 0
+    values[F.PLAYER_FLAGS] = int(_char_get(char, "player_flags", 0)) & 0xFFFFFFFF
     values[F.PLAYER_BYTES] = (
         (skin & 0xFF) | ((face & 0xFF) << 8)
         | ((hair_style & 0xFF) << 16) | ((hair_color & 0xFF) << 24)

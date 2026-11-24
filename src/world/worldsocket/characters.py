@@ -317,6 +317,12 @@ class CharactersMixin:
         if int(option["option_type"]) == vendor.GOSSIP_OPTION_VENDOR:
             await self._open_vendor_from_gossip(guid)
             return
+        if int(option["option_type"]) == 6:      # GOSSIP_OPTION_SPIRITHEALER
+            await self.send_packet(Opcodes.SMSG_GOSSIP_COMPLETE, b"")
+            if hasattr(self, "handle_spirit_healer_activate"):
+                await self.handle_spirit_healer_activate(
+                    struct.pack("<Q", int(guid)))
+            return
 
         action_menu_id = int(option["action_menu_id"])
         action_text_id = int(option["action_text_id"])

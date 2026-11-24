@@ -29,6 +29,8 @@ class LootMixin:
             return
         target_guid = struct.unpack_from("<Q", data, 0)[0]
         combat = self._get_combat_state()
+        if combat.get("dead"):
+            return
         low_guid = creature.creature_low_guid(target_guid)
         spawn = self._get_creature_spawn(low_guid)
         if spawn is None:
@@ -343,7 +345,7 @@ class LootMixin:
             return
         list_id = data[0]
         combat = self._get_combat_state()
-        if not combat["loot_target"]:
+        if combat.get("dead") or not combat["loot_target"]:
             return
         if list_id >= len(combat["loot_items"]):
             return
@@ -410,7 +412,7 @@ class LootMixin:
             return
         combat = self._get_combat_state()
         money = int(combat.get("loot_money") or 0)
-        if not combat["loot_target"] or money <= 0:
+        if combat.get("dead") or not combat["loot_target"] or money <= 0:
             return
         combat["loot_money"] = 0
         total = int(self.character.get("money", 0)) + money
