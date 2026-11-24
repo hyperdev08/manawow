@@ -19,6 +19,9 @@ worldserver:
   port: 8085
   realm_id: 1
   motd: "Welcome to ManaWoW (experimental)"
+  # Copper granted to every new character (CMaNGOS StartPlayerMoney).
+  # 100 = one silver; the cheapest class trainer spell costs 10 copper.
+  start_money: 0
   # Extracted client collision data. Populate it with
   #   python tools/fetch_client_data.py --preset starter
   # Leave empty to disable terrain/LOS/navmesh and use straight-line movement.

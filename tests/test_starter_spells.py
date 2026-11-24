@@ -29,7 +29,7 @@ CLASS_ABILITIES = {
         59879, 59921, 6603},
     7: {331, 403, 6603},
     8: {133, 168, 5009, 5019, 6603},
-    9: {686, 687, 688, 6603},
+    9: {686, 687, 6603},
     11: {5176, 5185, 6603},
 }
 
@@ -99,8 +99,6 @@ def test_every_race_class_gets_the_authentic_spellbook(world_db):
                     "SELECT spell FROM playercreateinfo_spell"
                     " WHERE race = ? AND class = ?", (race, cls))
             }
-            if cls == 9:
-                expected.add(688)   # deliberate no-trainer Summon Imp
             assert granted == expected, (race, cls,
                                          sorted(expected - granted),
                                          sorted(granted - expected))

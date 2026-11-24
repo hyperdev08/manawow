@@ -37,6 +37,8 @@ class WorldConfig:
     # 3.3.5a keeps the party available for a short reconnect window.
     # 0 disables the offline expiry.
     group_offline_expiry: int = 300
+    # Copper granted to new characters (CMaNGOS StartPlayerMoney, default 0).
+    start_money: int = 0
 
 
 @dataclass

@@ -249,6 +249,75 @@ _LANGUAGE_SKILLS_BY_RACE = {
 }
 
 
+def language_skill_count(char: Mapping) -> int:
+    race = int(_char_get(char, "race", 1) or 1)
+    return len(_LANGUAGE_SKILLS_BY_RACE.get(race, _ALL_LANGUAGE_SKILLS))
+
+
+def assign_skill_slots(char: Mapping) -> None:
+    """Give every learned skill a stable PLAYER_SKILL_INFO slot.
+
+    Language skills occupy the first slots in the client's array; professions
+    and weapon skills must never overwrite them.
+    """
+    skills = _char_get(char, "skills", None)
+    if not skills:
+        return
+    start = language_skill_count(char)
+    used = set()
+    next_slot = start
+    for skill_id in sorted(skills):
+        data = skills[skill_id]
+        slot = int(data.get("slot", -1) or -1)
+        if slot >= start and slot not in used:
+            used.add(slot)
+            next_slot = max(next_slot, slot + 1)
+        else:
+            data["slot"] = None
+    for skill_id in sorted(skills):
+        data = skills[skill_id]
+        if data.get("slot") is not None:
+            continue
+        while next_slot in used:
+            next_slot += 1
+        data["slot"] = next_slot
+        used.add(next_slot)
+        next_slot += 1
+
+
+def next_skill_slot(char: Mapping) -> int:
+    assign_skill_slots(char)
+    skills = _char_get(char, "skills", None) or {}
+    if not skills:
+        return language_skill_count(char)
+    return max(int(data.get("slot", 0) or 0) for data in skills.values()) + 1
+
+
+def skill_field_values(char: Mapping, skill_id: int) -> Dict[int, int]:
+    """Return the three PLAYER_SKILL_INFO fields for one skill line."""
+    skills = _char_get(char, "skills", None) or {}
+    data = skills.get(int(skill_id))
+    if not data:
+        return {}
+    slot = int(data.get("slot", -1) or -1)
+    if slot < 0 or slot >= F.PLAYER_SKILL_COUNT:
+        return {}
+    base = F.PLAYER_SKILL_INFO_1_1 + slot * 3
+    step = max(0, int(data.get("step", 0) or 0)) & 0xFFFF
+    value = max(0, int(data.get("value", 0) or 0)) & 0xFFFF
+    maximum = max(0, int(data.get("max_value", 0) or 0)) & 0xFFFF
+    return {
+        base: (int(skill_id) & 0xFFFF) | (step << 16),
+        base + 1: value | (maximum << 16),
+        base + 2: 0,
+    }
+
+
+def skill_value(char: Mapping, skill_id: int) -> int:
+    skills = _char_get(char, "skills", None) or {}
+    return int((skills.get(int(skill_id)) or {}).get("value", 0) or 0)
+
+
 # UNIT_FLAG_PLAYER_CONTROLLED in 3.3.5 (called UNIT_FLAG_PVP_ATTACKABLE in
 # TrinityCore): every real player object carries it.  Without it the client
 # treats the character as a plain unit that is not player-controlled.
@@ -472,12 +541,17 @@ def build_player_values(char: Mapping, peer: bool = False) -> Dict[int, int]:
     race = int(char["race"])
     language_skills = _LANGUAGE_SKILLS_BY_RACE.get(race, [(98, 300, 300)])
     for i, (skill_id, rank, max_rank) in enumerate(language_skills):
-        if i >= 128:
+        if i >= F.PLAYER_SKILL_COUNT:
             break
         base = F.PLAYER_SKILL_INFO_1_1 + i * 3
         values[base] = skill_id | (0 << 16)          # skillId | step
         values[base + 1] = rank | (max_rank << 16)   # rank | maxRank
         values[base + 2] = 0                         # tempBonus | permBonus
+
+    # Learned professions/weapon skills follow the language entries.
+    assign_skill_slots(char)
+    for skill_id in sorted(_char_get(char, "skills", None) or {}):
+        values.update(skill_field_values(char, skill_id))
 
     # Inventory: populate visible items + inv slots if we have character items.
     # The caller is expected to set ``char["inventory"]`` = {slot: item dict}.

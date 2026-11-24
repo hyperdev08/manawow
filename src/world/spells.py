@@ -11,6 +11,7 @@ import time
 import random
 import struct
 import sqlite3
+import threading
 from functools import lru_cache
 from typing import Dict, List, Optional, Tuple, Any, Mapping
 
@@ -477,6 +478,7 @@ class SpellTemplate:
     def __init__(self, row: Mapping):
         self.id = int(_row_get(row, "id", _row_get(row, "Id", 0)))
         self.name = str(_row_get(row, "name", _row_get(row, "SpellName", "")))
+        self.rank = str(_row_get(row, "rank", _row_get(row, "Rank", "")) or "")
         self.school = int(_row_get(row, "school", _row_get(row, "School", 0)))
         self.mana_cost = int(_row_get(row, "mana_cost", _row_get(row, "ManaCost", 0)))
         self.mana_cost_per_level = int(_row_get(row, "mana_cost_per_level", 0))
@@ -526,6 +528,10 @@ class SpellTemplate:
         self.dmg_class = int(_row_get(row, "dmg_class", 0))
         self.spell_family = int(_row_get(row, "spell_family_name", 0))
         self.spell_visual = int(_row_get(row, "spell_visual", 0))
+        # Weapon/armour proficiency spells (SMSG_SET_PROFICIENCY).
+        self.equipped_item_class = int(_row_get(row, "equipped_item_class", 0))
+        self.equipped_item_subclass_mask = int(
+            _row_get(row, "equipped_item_subclass_mask", 0))
         # ``RuneCostID`` points into ``SpellRuneCost.dbc``.  It is only set for
         # death knight abilities (and a few NPC spells that reuse the field).
         self.rune_cost_id = int(_row_get(row, "rune_cost_id", 0))
@@ -935,7 +941,22 @@ class SpellResult:
         self.spell_id = 0
 
 
-@lru_cache(maxsize=8192)
+_SPELL_TEMPLATE_CACHE: Dict[Tuple[str, int], Optional[SpellTemplate]] = {}
+_SPELL_TEMPLATE_LOCK = threading.RLock()
+_SPELL_TEMPLATE_LIMIT = 8192
+
+
+def _cache_spell_template(key: Tuple[str, int],
+                          template: Optional[SpellTemplate]) -> None:
+    with _SPELL_TEMPLATE_LOCK:
+        if key not in _SPELL_TEMPLATE_CACHE \
+                and len(_SPELL_TEMPLATE_CACHE) >= _SPELL_TEMPLATE_LIMIT:
+            # Cheap FIFO eviction: enough to bound memory for a client dataset
+            # with tens of thousands of spells.
+            _SPELL_TEMPLATE_CACHE.pop(next(iter(_SPELL_TEMPLATE_CACHE)))
+        _SPELL_TEMPLATE_CACHE[key] = template
+
+
 def get_spell_template(path: str, spell_id: int) -> Optional[SpellTemplate]:
     """Fetch a spell template from the database (cached).
 
@@ -944,6 +965,10 @@ def get_spell_template(path: str, spell_id: int) -> Optional[SpellTemplate]:
     second; opening a fresh SQLite connection for each lookup measured 6-8 ms
     on Windows and produced visible combat pauses.
     """
+    key = (path, int(spell_id))
+    with _SPELL_TEMPLATE_LOCK:
+        if key in _SPELL_TEMPLATE_CACHE:
+            return _SPELL_TEMPLATE_CACHE[key]
     con = sqlite3.connect(path)
     con.row_factory = sqlite3.Row
     try:
@@ -952,9 +977,42 @@ def get_spell_template(path: str, spell_id: int) -> Optional[SpellTemplate]:
         ).fetchone()
     finally:
         con.close()
-    if row is None:
-        return None
-    return SpellTemplate(row)
+    template = SpellTemplate(row) if row is not None else None
+    _cache_spell_template(key, template)
+    return template
+
+
+def warm_spell_templates(path: str, spell_ids) -> None:
+    """Load many spell templates in one query and put them in the cache.
+
+    Opening the trainer window needs every spell in the list; doing that as
+    dozens of separate connections was a visible first-open pause.
+    """
+    wanted = sorted({int(spell_id) for spell_id in spell_ids if spell_id})
+    if not wanted:
+        return
+    with _SPELL_TEMPLATE_LOCK:
+        missing = [spell_id for spell_id in wanted
+                   if (path, spell_id) not in _SPELL_TEMPLATE_CACHE]
+    if not missing:
+        return
+    con = sqlite3.connect(path)
+    con.row_factory = sqlite3.Row
+    try:
+        found: Dict[int, SpellTemplate] = {}
+        for start in range(0, len(missing), 500):
+            chunk = missing[start:start + 500]
+            placeholders = ",".join("?" for _ in chunk)
+            rows = con.execute(
+                f"SELECT * FROM spell_templates WHERE id IN ({placeholders})",
+                chunk,
+            ).fetchall()
+            for row in rows:
+                found[int(row["id"])] = SpellTemplate(row)
+        for spell_id in missing:
+            _cache_spell_template((path, spell_id), found.get(spell_id))
+    finally:
+        con.close()
 
 
 # ``SpellDuration.dbc`` values used when the table has not been imported from
@@ -1329,7 +1387,9 @@ def get_creature_base_mana(path: str, level: int, unit_class: int) -> int:
 
 def clear_caches() -> None:
     """Drop cached client data (used by tests and data-import tools)."""
-    for cached in (get_spell_template, get_spell_duration,
+    with _SPELL_TEMPLATE_LOCK:
+        _SPELL_TEMPLATE_CACHE.clear()
+    for cached in (get_spell_duration,
                    _creature_spells_cached, _creature_spell_list_cached,
                    _creature_cooldowns_cached,
                    _creature_spell_list_entry_cached,

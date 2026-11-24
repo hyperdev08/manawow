@@ -45,7 +45,9 @@ class WorldServer:
         # by src.world.databases.
         world_path = config.database.world_path
         character_path = getattr(config.database, "character_path", "")
-        character_db.configure(world_path, character_path)
+        character_db.configure(
+            world_path, character_path,
+            int(getattr(config.worldserver, "start_money", 0) or 0))
         # WAL + synchronous=NORMAL: rollback-journal commits blocked the event
         # loop for seconds on Windows (see src/common/sqlite_tuning.py).
         sqlite_tuning.install(world_path, character_path or None)

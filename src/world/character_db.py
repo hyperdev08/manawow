@@ -281,6 +281,29 @@ CREATE TABLE IF NOT EXISTS character_spells(
 );
 CREATE INDEX IF NOT EXISTS idx_character_spells_character ON character_spells(character_guid);
 
+-- Character skill lines (professions, weapon skills, riding).  The value/max
+-- pair uses PLAYER_SKILL_VALUE semantics and slot is the 0-based position in
+-- the client's PLAYER_SKILL_INFO array after the language skills.
+CREATE TABLE IF NOT EXISTS character_skills(
+  character_guid INTEGER NOT NULL,
+  skill INTEGER NOT NULL,
+  slot INTEGER NOT NULL DEFAULT 0,
+  value INTEGER NOT NULL DEFAULT 0,
+  max_value INTEGER NOT NULL DEFAULT 0,
+  step INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY(character_guid, skill)
+);
+CREATE INDEX IF NOT EXISTS idx_character_skills_character
+  ON character_skills(character_guid);
+
+-- Weapon/armour proficiency masks taught by trainers.
+CREATE TABLE IF NOT EXISTS character_proficiencies(
+  character_guid INTEGER NOT NULL,
+  item_class INTEGER NOT NULL,
+  subclass_mask INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY(character_guid, item_class)
+);
+
 -- Player per-class/per-level base HP/mana from CMaNGOS player_classlevelstats.
 -- Used for correct starting mana/HP and level-up calculations.
 CREATE TABLE IF NOT EXISTS player_classlevelstats(
@@ -335,7 +358,8 @@ def _schema_subset(sql: str, tables: set[str]) -> str:
 # retained for tests/tools that explicitly create a self-contained database.
 CREATE_CHARACTER_TABLES_SQL = _schema_subset(
     CREATE_CHARACTERS_SQL, {"characters", "character_items",
-                            "character_spells", "character_corpses",
+                            "character_spells", "character_skills",
+                            "character_proficiencies", "character_corpses",
                             "groups", "group_members"})
 CREATE_WORLD_TEMPLATE_SQL = _schema_subset(
     CREATE_CHARACTERS_SQL, {"item_templates", "player_classlevelstats",
@@ -344,8 +368,14 @@ CREATE_WORLD_TEMPLATE_SQL = _schema_subset(
 WORLD_VIEW_TABLES = databases.CHARACTER_WORLD_VIEWS
 
 
-def configure(world_path: str, character_path: Optional[str] = None) -> None:
-    """Route character-database calls to a separate file when configured."""
+_START_PLAYER_MONEY = 0
+
+
+def configure(world_path: str, character_path: Optional[str] = None,
+              start_money: int = 0) -> None:
+    """Route character-database calls and set the new-character balance."""
+    global _START_PLAYER_MONEY
+    _START_PLAYER_MONEY = max(0, int(start_money or 0))
     databases.configure(world_path, character_path)
 
 
@@ -413,6 +443,8 @@ CHARACTER_TABLES = (
     "characters",
     "character_items",
     "character_spells",
+    "character_skills",
+    "character_proficiencies",
     "character_corpses",
     "character_quests",
     "character_quests_rewarded",
@@ -739,9 +771,6 @@ def _starter_spells_for(con: sqlite3.Connection, race: int,
     spells = [int(row[0]) for row in rows]
     if not spells:
         spells = list(_STARTER_SPELLS_BY_CLASS.get(int(char_class), []))
-    for spell_id in _EXTRA_STARTER_SPELLS_BY_CLASS.get(int(char_class), []):
-        if spell_id not in spells:
-            spells.append(spell_id)
     return spells
 
 
@@ -928,10 +957,12 @@ def create_character(path: str, account_id: int, name: str, race: int, char_clas
     try:
         cur = con.execute(
             "INSERT INTO characters(account_id, name, race, class, gender, skin, face, "
-            "hair_style, hair_color, facial_style, level, map, zone, x, y, z, o) "
-            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "hair_style, hair_color, facial_style, level, map, zone, x, y, z, o,"
+            " money) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (account_id, name, race, char_class, gender, skin, face,
-             hair_style, hair_color, facial_style, level, map_id, zone, x, y, z, o),
+             hair_style, hair_color, facial_style, level, map_id, zone, x, y, z, o,
+             int(_START_PLAYER_MONEY)),
         )
         guid = int(cur.lastrowid)
         _grant_starter_spells(con, guid, race, char_class)
@@ -2131,14 +2162,6 @@ _STARTER_SPELLS_BY_CLASS = {
     ],
 }
 
-# Abilities a level-1 class trainer would teach but ``playercreateinfo_spell``
-# does not grant.  This server has no trainers, so summoning would otherwise be
-# unreachable for a warlock; the exception is deliberately kept tiny.
-_EXTRA_STARTER_SPELLS_BY_CLASS = {
-    9: [688],   # Summon Imp (level-1 trainer spell)
-}
-
-
 def _grant_starter_spells(con: sqlite3.Connection, character_guid: int,
                           race: int, char_class: int) -> None:
     """Grant the authentic starter spellbook to a new character."""
@@ -2240,6 +2263,114 @@ def get_character_spells(path: str, character_guid: int) -> List[sqlite3.Row]:
             "SELECT spell FROM character_spells WHERE character_guid = ? AND active = 1",
             (character_guid,),
         ).fetchall()
+    finally:
+        con.close()
+
+
+def set_character_money(path: str, character_guid: int, money: int) -> None:
+    """Persist the copper amount to the character bank (split-aware)."""
+    con = _connect(path)
+    try:
+        con.execute(
+            "UPDATE characters SET money = ? WHERE guid = ?",
+            (max(0, int(money)), int(character_guid)),
+        )
+        con.commit()
+    finally:
+        con.close()
+
+
+def get_character_skills(path: str, character_guid: int) -> List[sqlite3.Row]:
+    """Fetch the character's persisted skill lines."""
+    con = _connect(path)
+    con.row_factory = sqlite3.Row
+    try:
+        return con.execute(
+            "SELECT skill, slot, value, max_value, step"
+            " FROM character_skills WHERE character_guid = ? ORDER BY slot",
+            (int(character_guid),),
+        ).fetchall()
+    finally:
+        con.close()
+
+
+def learn_character_spell(path: str, character_guid: int, spell: int,
+                          superseded=()) -> None:
+    """Persist one learned spell and remove the ranks it supersedes."""
+    con = _connect(path)
+    try:
+        for old_spell in superseded:
+            con.execute(
+                "DELETE FROM character_spells"
+                " WHERE character_guid = ? AND spell = ?",
+                (int(character_guid), int(old_spell)),
+            )
+        con.execute(
+            "INSERT OR IGNORE INTO character_spells"
+            "(character_guid, spell, active) VALUES(?,?,1)",
+            (int(character_guid), int(spell)),
+        )
+        con.commit()
+    finally:
+        con.close()
+
+
+def set_character_skill(path: str, character_guid: int, skill: int,
+                        slot: int, value: int, max_value: int,
+                        step: int) -> None:
+    """Insert or update one skill line."""
+    con = _connect(path)
+    try:
+        con.execute(
+            "INSERT INTO character_skills"
+            "(character_guid, skill, slot, value, max_value, step)"
+            " VALUES(?,?,?,?,?,?)"
+            " ON CONFLICT(character_guid, skill) DO UPDATE SET"
+            " slot = excluded.slot, value = excluded.value,"
+            " max_value = excluded.max_value, step = excluded.step",
+            (int(character_guid), int(skill), int(slot), int(value),
+             int(max_value), int(step)),
+        )
+        con.commit()
+    finally:
+        con.close()
+
+
+def get_character_proficiencies(path: str,
+                                character_guid: int) -> List[sqlite3.Row]:
+    """Fetch persisted weapon/armour proficiency masks."""
+    con = _connect(path)
+    con.row_factory = sqlite3.Row
+    try:
+        return con.execute(
+            "SELECT item_class, subclass_mask FROM character_proficiencies"
+            " WHERE character_guid = ? ORDER BY item_class",
+            (int(character_guid),),
+        ).fetchall()
+    finally:
+        con.close()
+
+
+def add_character_proficiency(path: str, character_guid: int,
+                              item_class: int, subclass_mask: int) -> None:
+    """Merge one subclass mask into the character's persisted proficiency."""
+    con = _connect(path)
+    try:
+        row = con.execute(
+            "SELECT subclass_mask FROM character_proficiencies"
+            " WHERE character_guid = ? AND item_class = ?",
+            (int(character_guid), int(item_class)),
+        ).fetchone()
+        mask = int(row[0] or 0) | int(subclass_mask or 0) if row else int(
+            subclass_mask or 0)
+        con.execute(
+            "INSERT INTO character_proficiencies"
+            "(character_guid, item_class, subclass_mask) VALUES(?,?,?)"
+            " ON CONFLICT(character_guid, item_class) DO UPDATE SET"
+            " subclass_mask = excluded.subclass_mask",
+            (int(character_guid), int(item_class), mask),
+        )
+        con.commit()
     finally:
         con.close()
 

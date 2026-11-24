@@ -11,6 +11,7 @@ from src.world import creature
 from src.world import gameobject
 from src.world import login_packets
 from src.world import object_update
+from src.world import trainer
 from src.world import update_fields as F
 
 from .constants import (
@@ -69,6 +70,26 @@ class WorldEntryMixin:
                 item_dict["owner_guid"] = guid
                 mutable_inventory[slot] = item_dict
             self.character["inventory"] = mutable_inventory
+        # Profession/weapon/riding skill lines for the client's skill array and
+        # the trainer requirement checks.
+        skill_rows = character_db.get_character_skills(
+            self.config.database.world_path, guid)
+        self.character["skills"] = {
+            int(row["skill"]): {
+                "slot": int(row["slot"] or 0),
+                "value": int(row["value"] or 0),
+                "max_value": int(row["max_value"] or 0),
+                "step": int(row["step"] or 0),
+            }
+            for row in skill_rows
+        }
+        object_update.assign_skill_slots(self.character)
+        proficiency_rows = character_db.get_character_proficiencies(
+            self.config.database.world_path, guid)
+        self.character["proficiencies"] = {
+            int(row["item_class"]): int(row["subclass_mask"] or 0)
+            for row in proficiency_rows
+        }
         self.movement_info = None
         self.active_mover_guid = guid
         self._last_position_save = time.monotonic()
@@ -131,6 +152,14 @@ class WorldEntryMixin:
             known_spell_ids, action_buttons,
         ):
             await self.send_packet(opcode, payload)
+        # Trainer-taught weapon/armour proficiencies are server state and must
+        # be re-sent after every login (the client only mirrors the packet).
+        for item_class, subclass_mask in self.character.get(
+                "proficiencies", {}).items():
+            if subclass_mask:
+                await self.send_packet(
+                    Opcodes.SMSG_SET_PROFICIENCY,
+                    trainer.build_proficiency(item_class, subclass_mask))
         if self._is_death_knight():
             await self._send_resync_runes()
 

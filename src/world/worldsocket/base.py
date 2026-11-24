@@ -396,6 +396,10 @@ class SocketBase:
                 await self.handle_buy_item(data, in_slot=True)
             elif opcode == Opcodes.CMSG_SELL_ITEM:
                 await self.handle_sell_item(data)
+            elif opcode == Opcodes.CMSG_TRAINER_LIST:
+                await self.handle_trainer_list(data)
+            elif opcode == Opcodes.CMSG_TRAINER_BUY_SPELL:
+                await self.handle_trainer_buy_spell(data)
             elif opcode == Opcodes.CMSG_REPOP_REQUEST:
                 await self.handle_repop_request(data)
             elif opcode == Opcodes.CMSG_RECLAIM_CORPSE:

@@ -79,6 +79,37 @@ CREATE TABLE IF NOT EXISTS npc_vendor(
   condition_id INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY(entry, item, extended_cost)
 );
+CREATE TABLE IF NOT EXISTS npc_trainer(
+  entry INTEGER NOT NULL,
+  spell INTEGER NOT NULL,
+  spellcost INTEGER NOT NULL DEFAULT 0,
+  reqskill INTEGER NOT NULL DEFAULT 0,
+  reqskillvalue INTEGER NOT NULL DEFAULT 0,
+  reqlevel INTEGER NOT NULL DEFAULT 0,
+  reqability1 INTEGER,
+  reqability2 INTEGER,
+  reqability3 INTEGER,
+  condition_id INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY(entry, spell)
+);
+CREATE INDEX IF NOT EXISTS idx_npc_trainer_entry ON npc_trainer(entry);
+CREATE TABLE IF NOT EXISTS npc_trainer_template(
+  entry INTEGER NOT NULL,
+  spell INTEGER NOT NULL,
+  spellcost INTEGER NOT NULL DEFAULT 0,
+  reqskill INTEGER NOT NULL DEFAULT 0,
+  reqskillvalue INTEGER NOT NULL DEFAULT 0,
+  reqlevel INTEGER NOT NULL DEFAULT 0,
+  reqability1 INTEGER,
+  reqability2 INTEGER,
+  reqability3 INTEGER,
+  condition_id INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY(entry, spell)
+);
+CREATE TABLE IF NOT EXISTS trainer_greeting(
+  entry INTEGER PRIMARY KEY,
+  text TEXT NOT NULL DEFAULT ''
+);
 CREATE TABLE IF NOT EXISTS creature_templates(
   entry INTEGER PRIMARY KEY,
   name TEXT NOT NULL DEFAULT '',
@@ -126,6 +157,12 @@ CREATE TABLE IF NOT EXISTS creature_templates(
   melee_attack_speed INTEGER NOT NULL DEFAULT 2000,
   ranged_attack_speed INTEGER NOT NULL DEFAULT 3000,
   crit_chance REAL NOT NULL DEFAULT 0.0,
+  -- Trainer: CMaNGOS creature_template TrainerType/Spell/Class/Race/TemplateId.
+  trainer_type INTEGER NOT NULL DEFAULT 0,
+  trainer_spell INTEGER NOT NULL DEFAULT 0,
+  trainer_class INTEGER NOT NULL DEFAULT 0,
+  trainer_race INTEGER NOT NULL DEFAULT 0,
+  trainer_template_id INTEGER NOT NULL DEFAULT 0,
   -- AI
   ai_name TEXT NOT NULL DEFAULT '',
   aggro_radius REAL NOT NULL DEFAULT 20.0,
@@ -944,6 +981,8 @@ SELECT s.guid, s.entry, s.map, s.zone, s.x, s.y, s.z, s.o,
        t.respawn_time, t.aggro_radius, t.loot_id,
        t.min_loot_gold, t.max_loot_gold,
        t.spell_list_id, t.ai_name, t.chase_distance,
+       t.trainer_type, t.trainer_spell, t.trainer_class, t.trainer_race,
+       t.trainer_template_id,
        t.speed_walk, t.speed_run, t.min_damage, t.max_damage,
        t.attack_power, t.ranged_attack_power, t.armor,
        t.melee_attack_speed, t.ranged_attack_speed, t.crit_chance

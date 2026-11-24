@@ -247,6 +247,9 @@ TEMPLATE_COLUMNS = (
     "speed_walk", "speed_run", "min_damage", "max_damage",
     "attack_power", "ranged_attack_power", "armor",
     "melee_attack_speed", "ranged_attack_speed", "crit_chance",
+    # Trainer selection (CMaNGOS creature_template Trainer* columns).
+    "trainer_type", "trainer_spell", "trainer_class", "trainer_race",
+    "trainer_template_id",
 )
 
 SPAWN_COLUMNS = ("guid", "entry", "map", "zone", "x", "y", "z", "o",
@@ -513,6 +516,16 @@ PLAYERCREATEINFO_ACTION_MAP = (
     ("race", "race"), ("class", "class"), ("button", "button"),
     ("action", "action"), ("type", "type"),
 )
+
+TRAINER_MAP = (
+    ("entry", "entry"), ("spell", "spell"), ("spellcost", "spellcost"),
+    ("reqskill", "reqskill"), ("reqskillvalue", "reqskillvalue"),
+    ("reqlevel", "reqlevel"), ("reqability1", "ReqAbility1"),
+    ("reqability2", "ReqAbility2"), ("reqability3", "ReqAbility3"),
+    ("condition_id", "condition_id"),
+)
+TRAINER_TEMPLATE_MAP = TRAINER_MAP
+TRAINER_GREETING_MAP = (("entry", "Entry"), ("text", "Text"))
 
 
 def read_rune_cost_dbc(path: str) -> list[tuple[int, int, int, int, int]]:
@@ -889,6 +902,11 @@ def _template_row(template: dict) -> tuple:
         int(template.get("MeleeBaseAttackTime") or 2000),
         int(template.get("RangedBaseAttackTime") or 3000),
         0.0,
+        int(template.get("TrainerType") or 0),
+        int(template.get("TrainerSpell") or 0),
+        int(template.get("TrainerClass") or 0),
+        int(template.get("TrainerRace") or 0),
+        int(template.get("TrainerTemplateId") or 0),
     )
 
 
@@ -995,6 +1013,65 @@ def import_vendors(dump_path: str, db_path: str) -> dict[str, int]:
     return {"vendor_items": vendor_items, "vendors": vendors, "items_added": added_items}
 
 
+def import_trainers(dump_path: str, db_path: str) -> dict[str, int]:
+    """Refresh the three CMaNGOS trainer tables and template trainer columns.
+
+    This is the focused variant for an already imported world database; the
+    full :func:`import_world` does the same work from data it has already read.
+    """
+    text = wotlk_dump.read_dump(dump_path)
+    _, raw_trainers = wotlk_dump.rows(text, "npc_trainer")
+    _, raw_templates = wotlk_dump.rows(text, "npc_trainer_template")
+    _, raw_greetings = wotlk_dump.rows(text, "trainer_greeting")
+    _, raw_creatures = wotlk_dump.rows(text, "creature_template")
+
+    from src.world.creature import init_creature_db
+
+    init_creature_db(db_path)
+    import sqlite3
+
+    con = sqlite3.connect(db_path)
+    try:
+        con.execute("PRAGMA synchronous=OFF")
+        con.execute("DELETE FROM npc_trainer")
+        con.execute("DELETE FROM npc_trainer_template")
+        con.execute("DELETE FROM trainer_greeting")
+        counts = {
+            "npc_trainer": _insert_mapped(
+                con, "npc_trainer", TRAINER_MAP, raw_trainers),
+            "npc_trainer_template": _insert_mapped(
+                con, "npc_trainer_template", TRAINER_TEMPLATE_MAP,
+                raw_templates),
+            "trainer_greeting": _insert_mapped(
+                con, "trainer_greeting", TRAINER_GREETING_MAP, raw_greetings,
+                text_columns=frozenset(("text",))),
+        }
+        updates = [
+            (
+                int(row.get("TrainerType") or 0),
+                int(row.get("TrainerSpell") or 0),
+                int(row.get("TrainerClass") or 0),
+                int(row.get("TrainerRace") or 0),
+                int(row.get("TrainerTemplateId") or 0),
+                int(row.get("Entry") or 0),
+            )
+            for row in raw_creatures
+            if int(row.get("Entry") or 0)
+        ]
+        con.executemany(
+            "UPDATE creature_templates SET trainer_type = ?,"
+            " trainer_spell = ?, trainer_class = ?, trainer_race = ?,"
+            " trainer_template_id = ? WHERE entry = ?",
+            updates,
+        )
+        counts["creature_trainers"] = len(updates)
+        con.commit()
+        con.execute("PRAGMA optimize")
+    finally:
+        con.close()
+    return counts
+
+
 def import_world(dump_path: str, db_path: str, clear: bool = True,
                  include_instances: bool = True,
                  rune_cost_dbc: str | None = None,
@@ -1038,6 +1115,9 @@ def import_world(dump_path: str, db_path: str, clear: bool = True,
     quest_tables = read_quest_tables(text)
     _, raw_npc_vendor = wotlk_dump.rows(text, "npc_vendor")
     _, raw_npc_vendor_template = wotlk_dump.rows(text, "npc_vendor_template")
+    _, raw_npc_trainer = wotlk_dump.rows(text, "npc_trainer")
+    _, raw_npc_trainer_template = wotlk_dump.rows(text, "npc_trainer_template")
+    _, raw_trainer_greeting = wotlk_dump.rows(text, "trainer_greeting")
     _, raw_safe_locs = wotlk_dump.rows(text, "world_safe_locs")
     _, raw_graveyard_zones = wotlk_dump.rows(text, "game_graveyard_zone")
     gameobject_tables = read_gameobject_tables(text)
@@ -1157,6 +1237,9 @@ def import_world(dump_path: str, db_path: str, clear: bool = True,
             con.execute("DELETE FROM gossip_options")
             con.execute("DELETE FROM gossip_menus")
             con.execute("DELETE FROM npc_text")
+            con.execute("DELETE FROM npc_trainer")
+            con.execute("DELETE FROM npc_trainer_template")
+            con.execute("DELETE FROM trainer_greeting")
             con.execute("DELETE FROM creature_templates")
 
         template_sql = (
@@ -1291,6 +1374,14 @@ def import_world(dump_path: str, db_path: str, clear: bool = True,
                 build_vendor_rows(raw_npc_vendor, raw_npc_vendor_template,
                                   raw_templates),
             ),
+            "npc_trainer": _insert_mapped(
+                con, "npc_trainer", TRAINER_MAP, raw_npc_trainer),
+            "npc_trainer_template": _insert_mapped(
+                con, "npc_trainer_template", TRAINER_TEMPLATE_MAP,
+                raw_npc_trainer_template),
+            "trainer_greeting": _insert_mapped(
+                con, "trainer_greeting", TRAINER_GREETING_MAP,
+                raw_trainer_greeting, text_columns=frozenset(("text",))),
         }
         counts.update(insert_graveyard_rows(
             con, raw_safe_locs, raw_graveyard_zones))

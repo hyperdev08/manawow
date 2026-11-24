@@ -343,9 +343,8 @@ class InventoryMixin:
         total = max(0, min(int(self.character.get("money", 0)) + int(delta), 0x7FFFFFFF))
         self.character["money"] = total
         await run_db_write(
-            execute_write, self.config.database.world_path,
-            "UPDATE characters SET money = ? WHERE guid = ?",
-            (total, int(self.player_guid)),
+            character_db.set_character_money,
+            self.config.database.world_path, int(self.player_guid), total,
         )
         await self._send_player_fields({F.PLAYER_FIELD_COINAGE: total & 0xFFFFFFFF})
         return total

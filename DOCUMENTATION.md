@@ -56,7 +56,7 @@ A real 3.3.5a client can now log in, pick a character and **enter the world**:
 ### Combat + spells (real 3.3.5a layouts)
 - `character_spells` stores the spells a character knows; each race/class combination gets the exact 3.3.5a level-1 spellbook from CMaNGOS `playercreateinfo_spell` (2919 rows across all 62 legal pairs), including racials, languages, armor and weapon proficiencies
 - The default action bar comes from `playercreateinfo_action` (351 rows): Attack, the class's first ability, racials, and the second bar page; the default Attack macros become a normal Attack button because this server has no macro storage
-- `Summon Imp` (688) is the only deliberate addition to the authentic list: it is trainer-taught at level 1 and this server has no class trainers, so warlocks would otherwise have no summon
+- Class trainers teach the abilities that CMaNGOS does not grant in `playercreateinfo_spell` (for example `Summon Imp`, 688); the starter spellbook stays exactly as imported. `worldserver.start_money` mirrors CMaNGOS `StartPlayerMoney` (copper, default 0) so a new character can afford the first 10-copper trainer spell if the server increases it
 - `SMSG_LOGIN_VERIFY_WORLD` is the first world packet, followed by `SMSG_INITIAL_SPELLS` and `SMSG_ACTION_BUTTONS`
 - `CMSG_CAST_SPELL` / `CMSG_CANCEL_CAST` use imported `spell_templates`: cast time, range, power cost, GCD (`StartRecoveryTime`), school, damage/heal rolls and effect/aura enums
 - Melee auto-attack, weapon damage/delay, creature aggro + chase + leash AI (a creature evades when its victim is more than 60 yards from the spawn, `Creature::CanCreatureAttack`; its own position does not count, so low-health humanoids can flee without resetting), creature melee, death, respawn, XP and level-up
@@ -222,6 +222,14 @@ A real 3.3.5a client can now log in, pick a character and **enter the world**:
 - Hidden from the list: other-faction items and bind-on-pickup gear for other classes
 - Not implemented yet: honor/token prices (`ExtendedCost`, those items are hidden), buyback, repair, reputation discounts, `condition_id`
 - Upgrade an existing `world.db` with `python tools/import_wotlk_db.py --vendors-only`
+
+### Spell trainers
+- `npc_trainer` (18,146 rows), shared `npc_trainer_template` (2,812 rows), `trainer_greeting` (698 rows) and the `TrainerType`/`TrainerSpell`/`TrainerClass`/`TrainerRace`/`TrainerTemplateId` columns of `creature_templates` are imported from CMaNGOS. All four trainer types are handled: class, mount, tradeskill and pet trainers, including the shared template lists used by 421 creatures
+- `CMSG_GOSSIP_HELLO` exposes the CMaNGOS "Train me." option (type 5) only when `Creature::IsTrainerOf` passes: matching class for class trainers, hunter for pet trainers, matching race for mount trainers and the required specialization spell for tradeskill trainers. `CMSG_TRAINER_LIST` works directly as well
+- `SMSG_TRAINER_LIST` uses the 3.3.5a 38-byte row layout (spell, green/red/gray state, cost, primary-profession flag, required level/skill/value and three required abilities), the CMaNGOS greeting text and the list-derived trainer type
+- `CMSG_TRAINER_BUY_SPELL` validates the row, state, level, skill, ability and rank-chain prerequisites, charges the listed copper cost, sends the trainer/player visual effects, `SMSG_LEARNED_SPELL`/`SMSG_SUPERCEDED_SPELL` and `SMSG_TRAINER_BUY_SUCCEEDED`. Profession and riding wrappers (`SPELL_EFFECT_LEARN_SPELL` plus `SPELL_EFFECT_SKILL_STEP`) learn the real spell and update the character's skill line (Apprentice 75 ... Grand Master 450), persisted in `character_skills` and included in the player skill array. Weapon/armour proficiency spells send and persist the merged mask (`character_proficiencies`), re-sent on every login
+- Not implemented yet: reputation price discounts, the two-primary-profession slot limit, GM trainer overrides, `condition_id` rows and pet-talent training (`TRAINER_TYPE_PETS` has no spell rows in CMaNGOS; the talent window is separate)
+- Upgrade an existing `world.db` with `python tools/import_wotlk_trainers.py`
 
 ### Game objects
 - `gameobject_templates` (19,555) and `gameobject_spawns` (100,337) imported from CMaNGOS `gameobject_template` / `gameobject`, with `gameobject_addon` start states and animation progress and `gameobject_spawn_entry` for spawns without a fixed entry

@@ -804,12 +804,8 @@ def test_spell_template_lookup_is_cached():
     spells.clear_caches()
     first = spells.get_spell_template(WORLD_DB, 133)     # Fireball
     assert first is not None
-    before = spells.get_spell_template.cache_info()
     second = spells.get_spell_template(WORLD_DB, 133)
-    after = spells.get_spell_template.cache_info()
     assert second is first
-    assert after.hits == before.hits + 1
-    assert after.misses == before.misses
 
 
 @_async_test

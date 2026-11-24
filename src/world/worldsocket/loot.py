@@ -678,9 +678,8 @@ class LootMixin:
         total = int(self.character.get("money", 0)) + money
         self.character["money"] = total
         await run_db_write(
-            execute_write, self.config.database.world_path,
-            "UPDATE characters SET money = ? WHERE guid = ?",
-            (total, int(self.player_guid)),
+            character_db.set_character_money,
+            self.config.database.world_path, int(self.player_guid), total,
         )
         await self._send_player_fields({F.PLAYER_FIELD_COINAGE: total & 0xFFFFFFFF})
         await self.send_packet(

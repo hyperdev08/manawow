@@ -7,6 +7,7 @@ import struct
 from src.protocol.opcodes import Opcodes
 from src.world import character_db
 from src.world import creature
+from src.world import trainer
 from src.world import vendor
 from src.world import login_packets
 
@@ -218,13 +219,24 @@ class CharactersMixin:
         )
 
     async def _send_gossip_menu(self, guid: int, menu_id: int, quests=(),
-                                vendor_option: bool = False) -> bool:
+                                vendor_option: bool = False,
+                                spawn=None) -> bool:
         menu = creature.get_gossip_menu(self.config.database.world_path, menu_id)
         if menu is None:
             return False
         options = list(creature.get_gossip_options(
             self.config.database.world_path, menu_id
         ))
+        if spawn is not None:
+            # CMaNGOS hides the trainer option for a player who cannot use the
+            # trainer (wrong class, wrong mount race, missing specialization).
+            options = [
+                option for option in options
+                if int(option["option_type"]) != trainer.GOSSIP_OPTION_TRAINER
+                or trainer.can_offer_trainer(
+                    self.config.database.world_path, spawn, self.character,
+                    getattr(self, "known_spell_ids", ()))
+            ]
         if vendor_option and not any(
             int(o["option_type"]) == vendor.GOSSIP_OPTION_VENDOR for o in options
         ):
@@ -264,7 +276,7 @@ class CharactersMixin:
             if await self._send_quest_menu(guid, spawn):
                 return
         if menu_id and await self._send_gossip_menu(
-                guid, menu_id, quests, vendor_option=is_vendor):
+                guid, menu_id, quests, vendor_option=is_vendor, spawn=spawn):
             self.log.info(
                 f"Opened gossip menu {menu_id} for creature "
                 f"'{spawn['name']}' ({guid})"
@@ -314,6 +326,17 @@ class CharactersMixin:
             await self.send_packet(Opcodes.SMSG_GOSSIP_COMPLETE, b"")
             return
 
+        if int(option["option_type"]) == trainer.GOSSIP_OPTION_TRAINER:
+            # CMaNGOS sends only SMSG_TRAINER_LIST here; the trainer window
+            # replaces the gossip window on the client.  Sending
+            # SMSG_GOSSIP_COMPLETE first makes the 3.3.5 client drop the
+            # interaction and ignore the following trainer list.
+            spawn = self._trainer_spawn(guid)
+            if spawn is not None and self._can_use_trainer(spawn):
+                await self._send_trainer_list(guid, spawn)
+            else:
+                await self.send_packet(Opcodes.SMSG_GOSSIP_COMPLETE, b"")
+            return
         if int(option["option_type"]) == vendor.GOSSIP_OPTION_VENDOR:
             await self._open_vendor_from_gossip(guid)
             return
@@ -326,7 +349,10 @@ class CharactersMixin:
 
         action_menu_id = int(option["action_menu_id"])
         action_text_id = int(option["action_text_id"])
-        if action_menu_id and await self._send_gossip_menu(guid, action_menu_id):
+        submenu_spawn = (self._trainer_spawn(guid)
+                         if hasattr(self, "_trainer_spawn") else None)
+        if action_menu_id and await self._send_gossip_menu(
+                guid, action_menu_id, spawn=submenu_spawn):
             self.log.info(
                 f"Gossip menu {menu_id} option {option_index} -> menu "
                 f"{action_menu_id}"

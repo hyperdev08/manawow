@@ -201,7 +201,9 @@ async def test_player_speed_root_and_stun_packets():
     speed_packets = [payload for opcode, payload in fake.sent
                      if opcode == int(Opcodes.SMSG_FORCE_RUN_SPEED_CHANGE)]
     assert speed_packets
-    assert abs(struct.unpack_from("<f", speed_packets[-1], 6)[0] - 10.5) < 0.01
+    # packed guid, uint32 counter, uint8 track-run, then float speed.
+    assert len(speed_packets[-1]) == 7 + 4
+    assert abs(struct.unpack_from("<f", speed_packets[-1], 7)[0] - 10.5) < 0.01
     await fake._tick_auras(time.monotonic() + 16.0)
     assert fake._player_aura_mods()["speed_mult"] == 1.0
 
@@ -273,4 +275,4 @@ async def test_creature_casts_slow_on_player():
     speeds = [payload for opcode, payload in fake.sent
               if opcode == int(Opcodes.SMSG_FORCE_RUN_SPEED_CHANGE)]
     assert speeds
-    assert abs(struct.unpack_from("<f", speeds[-1], 6)[0] - 4.2) < 0.01
+    assert abs(struct.unpack_from("<f", speeds[-1], 7)[0] - 4.2) < 0.01
