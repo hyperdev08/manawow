@@ -243,6 +243,17 @@ python run_auth.py
 python run_world.py
 ```
 
+### Finding event-loop stalls
+
+Every session runs on one asyncio loop, so a blocking call freezes all players at once. Start the servers with the stall watchdog to find them:
+
+```bash
+python run_servers.py --watchdog        # report stalls of 1 s or more
+python run_servers.py --watchdog 0.25   # or pick the threshold
+```
+
+Each stall is appended to `logs/stalls.log` with the stack of the loop thread at that moment (the line that is blocking, repeated every 2 s while it lasts) and its total duration once the loop answers again. The worldserver log gets a one-line warning per stall. `run_world.py` takes the same flag.
+
 ### Stopping the servers
 
 ```bash
