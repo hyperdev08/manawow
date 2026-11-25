@@ -68,6 +68,7 @@ SPELL_EFFECT_APPLY_AURA = 6
 SPELL_EFFECT_HEALTH_LEECH = 9
 SPELL_EFFECT_HEAL = 10
 SPELL_EFFECT_WEAPON_DAMAGE_NOSCHOOL = 17
+SPELL_EFFECT_CREATE_ITEM = 24
 SPELL_EFFECT_PERSISTENT_AREA_AURA = 27
 SPELL_EFFECT_SUMMON = 28
 SPELL_EFFECT_ENERGIZE = 30
@@ -77,6 +78,9 @@ SPELL_EFFECT_TELEPORT_UNITS = 5
 SPELL_EFFECT_RESURRECT_OLD = 18
 SPELL_EFFECT_ENCHANT_ITEM = 53
 SPELL_EFFECT_ENCHANT_ITEM_TEMPORARY = 54
+SPELL_EFFECT_LEARN_SPELL = 36
+SPELL_EFFECT_SKILL_STEP = 44
+SPELL_EFFECT_PROFICIENCY = 60
 SPELL_EFFECT_SUMMON_PET = 56
 SPELL_EFFECT_WEAPON_DAMAGE = 58
 SPELL_EFFECT_THREAT = 63
@@ -535,6 +539,15 @@ class SpellTemplate:
         # ``RuneCostID`` points into ``SpellRuneCost.dbc``.  It is only set for
         # death knight abilities (and a few NPC spells that reuse the field).
         self.rune_cost_id = int(_row_get(row, "rune_cost_id", 0))
+        # Reagent requirements, used by crafting/item-creation spells.  The
+        # consumable path is not wired into casting yet, so item creation is
+        # deliberately limited to spells without reagents.
+        self.reagents = []
+        for i in range(1, 9):
+            reagent = int(_row_get(row, f"reagent{i}", 0))
+            count = int(_row_get(row, f"reagent_count{i}", 0))
+            if reagent:
+                self.reagents.append((reagent, max(1, count)))
         # Effects
         self.effects = []
         for i in (1, 2, 3):

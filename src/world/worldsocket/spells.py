@@ -1605,6 +1605,35 @@ class SpellsMixin:
                             min(self._max_power(), current + amount))
                 await self._send_spell_energize_log(
                     victim, player_guid, template.id, power_type, amount)
+            elif etype == spells.SPELL_EFFECT_CREATE_ITEM:
+                item_entry = int(effect.get("item_type") or 0)
+                if not item_entry:
+                    continue
+                # Reagent-consuming crafts need the inventory consumption path
+                # before they can safely create their product.
+                if getattr(template, "reagents", ()):
+                    continue
+                count = max(1, int(effect.get("base_points") or 0) + 1)
+                changes = await run_db_write(
+                    character_db.add_item_to_inventory,
+                    self.config.database.world_path, int(self.player_guid),
+                    item_entry, count)
+                if changes:
+                    if hasattr(self, "_deliver_item_changes"):
+                        await self._deliver_item_changes(item_entry, changes)
+                elif hasattr(self, "_send_inventory_failure"):
+                    await self._send_inventory_failure(
+                        int(getattr(self, "INVENTORY_FULL", 50)))
+            elif etype == spells.SPELL_EFFECT_LEARN_SPELL:
+                learned = int(effect.get("trigger_spell") or 0)
+                if learned and hasattr(self, "_learn_spell"):
+                    await self._learn_spell(learned)
+            elif etype == spells.SPELL_EFFECT_SKILL_STEP:
+                if hasattr(self, "_apply_trainer_skill"):
+                    await self._apply_trainer_skill(template)
+            elif etype == spells.SPELL_EFFECT_PROFICIENCY:
+                if hasattr(self, "_apply_trainer_proficiency"):
+                    await self._apply_trainer_proficiency(template)
             elif etype == spells.SPELL_EFFECT_TRIGGER_SPELL:
                 triggered = int(effect["trigger_spell"])
                 if triggered:

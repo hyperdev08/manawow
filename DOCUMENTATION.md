@@ -59,6 +59,8 @@ A real 3.3.5a client can now log in, pick a character and **enter the world**:
 - Class trainers teach the abilities that CMaNGOS does not grant in `playercreateinfo_spell` (for example `Summon Imp`, 688); the starter spellbook stays exactly as imported. `worldserver.start_money` mirrors CMaNGOS `StartPlayerMoney` (copper, default 0) so a new character can afford the first 10-copper trainer spell if the server increases it
 - `SMSG_LOGIN_VERIFY_WORLD` is the first world packet, followed by `SMSG_INITIAL_SPELLS` and `SMSG_ACTION_BUTTONS`
 - `CMSG_CAST_SPELL` / `CMSG_CANCEL_CAST` use imported `spell_templates`: cast time, range, power cost, GCD (`StartRecoveryTime`), school, damage/heal rolls and effect/aura enums
+- `SPELL_EFFECT_CREATE_ITEM` (for reagent-free conjures), `LEARN_SPELL`, `SKILL_STEP` and `PROFICIENCY` are handled through the same item, trainer-skill and proficiency paths used by loot and trainers; reagent-consuming crafts wait for the reagent-consumption phase
+- `python tools/spell_coverage.py` audits every imported spell against the implemented effect/aura families and prints unsupported families with example spells; the current dataset has 50,889 templates and 23,301 fully covered spells
 - Melee auto-attack, weapon damage/delay, creature aggro + chase + leash AI (a creature evades when its victim is more than 60 yards from the spawn, `Creature::CanCreatureAttack`; its own position does not count, so low-health humanoids can flee without resetting), creature melee, death, respawn, XP and level-up
 - `SMSG_SPELL_START` / `SMSG_SPELL_GO` / `SMSG_CAST_FAILED` with miss/crit flags
 - `SMSG_SPELLHEALLOG`, `SMSG_SPELLENERGIZELOG`, `SMSG_LOG_XPGAIN` and `SMSG_LEVELUP_INFO`

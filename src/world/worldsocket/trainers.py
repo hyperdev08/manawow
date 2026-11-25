@@ -114,6 +114,25 @@ class TrainersMixin:
         self.log.info(
             f"Learned skill {skill_id} rank {step} ({value}/{maximum})")
 
+    async def _apply_trainer_proficiency(self, template) -> None:
+        """Apply ``SPELL_EFFECT_PROFICIENCY`` (weapon/armour masks)."""
+        if template is None:
+            return
+        item_class, subclass_mask = trainer.proficiency_from_template(template)
+        if not item_class or not subclass_mask:
+            return
+        proficiencies = self.character.setdefault("proficiencies", {})
+        combined = int(proficiencies.get(item_class, 0) or 0) | subclass_mask
+        proficiencies[item_class] = combined
+        await run_db_write(
+            character_db.add_character_proficiency,
+            self.config.database.world_path, int(self.player_guid),
+            item_class, combined,
+        )
+        await self.send_packet(
+            Opcodes.SMSG_SET_PROFICIENCY,
+            trainer.build_proficiency(item_class, combined))
+
     # ------------------------------------------------------------------
     # Opcode handlers
     # ------------------------------------------------------------------
@@ -196,19 +215,7 @@ class TrainersMixin:
 
         wrapper = spells.get_spell_template(path, int(trainer_spell.spell))
         await self._apply_trainer_skill(wrapper)
-        item_class, subclass_mask = trainer.proficiency_from_template(wrapper)
-        if item_class and subclass_mask:
-            proficiencies = self.character.setdefault("proficiencies", {})
-            combined = int(proficiencies.get(item_class, 0) or 0) | subclass_mask
-            proficiencies[item_class] = combined
-            await run_db_write(
-                character_db.add_character_proficiency,
-                self.config.database.world_path, int(self.player_guid),
-                item_class, combined,
-            )
-            await self.send_packet(
-                Opcodes.SMSG_SET_PROFICIENCY,
-                trainer.build_proficiency(item_class, combined))
+        await self._apply_trainer_proficiency(wrapper)
 
         await self.send_packet(
             Opcodes.SMSG_TRAINER_BUY_SUCCEEDED,
