@@ -238,6 +238,13 @@ CREATE TABLE IF NOT EXISTS character_corpses(
   released INTEGER NOT NULL DEFAULT 0
 );
 
+-- Flight nodes each character has discovered (src/world/taxi.py).
+CREATE TABLE IF NOT EXISTS character_taxi_nodes(
+  guid INTEGER NOT NULL,
+  node INTEGER NOT NULL,
+  PRIMARY KEY (guid, node)
+);
+
 -- Persistent party/raid groups.  Mirrors TrinityCore's `groups` and
 -- `group_member` tables: a group and its members survive logout/restart, so
 -- offline members are still listed when the group comes back online.
@@ -997,6 +1004,12 @@ def delete_character(path: str, account_id: int, guid: int) -> bool:
                         (int(guid),))
                 except sqlite3.OperationalError:
                     pass
+            try:
+                con.execute(
+                    "DELETE FROM character_taxi_nodes WHERE guid = ?",
+                    (int(guid),))
+            except sqlite3.OperationalError:
+                pass
             try:
                 con.execute(
                     "DELETE FROM group_members WHERE character_guid = ?",

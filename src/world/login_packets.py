@@ -593,9 +593,14 @@ def build_npc_text_update(text_id: int, text=None) -> bytes:
     and three (uint32 delay, uint32 emote) pairs.  The client's ``Unpack``
     always consumes all eight records, so a single seeded text is padded with
     seven empty records.
+
+    An unknown ``text_id`` still gets a full record with a generic greeting,
+    like ``WorldSession::HandleNpcTextQueryOpcode`` does: a bare "not found"
+    id leaves the client waiting for the text, so the gossip window that
+    asked for it never opens.
     """
     if text is None:
-        return struct.pack("<I", (int(text_id) & 0x7FFFFFFF) | 0x80000000)
+        text = {"text": "Greetings, $N.", "female_text": "Greetings, $N."}
 
     def field(name: str, default: int = 0) -> int:
         try:

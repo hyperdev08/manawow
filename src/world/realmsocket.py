@@ -38,6 +38,7 @@ from src.world.worldsocket.runes import RunesMixin
 from src.world.worldsocket.spells import SpellsMixin
 from src.world.worldsocket.stats import StatsMixin
 from src.world.worldsocket.summons import SummonsMixin
+from src.world.worldsocket.taxi import TaxiMixin
 from src.world.worldsocket.trainers import TrainersMixin
 from src.world.worldsocket.vendors import VendorsMixin
 from src.world.worldsocket.world_entry import WorldEntryMixin
@@ -48,6 +49,7 @@ __all__ = ["WorldSocket", "Opcodes", *_CONSTANT_NAMES]
 class WorldSocket(
     SocketBase,
     AuthMixin,
+    TaxiMixin,
     PeersMixin,
     CharactersMixin,
     WorldEntryMixin,

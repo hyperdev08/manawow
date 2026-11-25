@@ -269,6 +269,16 @@ class SocketBase:
                 await self.handle_gossip_hello(data)
             elif opcode == Opcodes.CMSG_GOSSIP_SELECT_OPTION:
                 await self.handle_gossip_select_option(data)
+            elif opcode == Opcodes.CMSG_TAXINODE_STATUS_QUERY:
+                await self.handle_taxinode_status_query(data)
+            elif opcode == Opcodes.CMSG_TAXIQUERYAVAILABLENODES:
+                await self.handle_taxi_query_available_nodes(data)
+            elif opcode == Opcodes.CMSG_ACTIVATETAXI:
+                await self.handle_activate_taxi(data)
+            elif opcode == Opcodes.CMSG_ACTIVATETAXIEXPRESS:
+                await self.handle_activate_taxi_express(data)
+            elif opcode == Opcodes.CMSG_CANCEL_MOUNT_AURA:
+                await self.handle_cancel_mount_aura(data)
             elif opcode == Opcodes.CMSG_NPC_TEXT_QUERY:
                 await self.handle_npc_text_query(data)
             elif opcode == Opcodes.CMSG_QUESTGIVER_STATUS_QUERY:
