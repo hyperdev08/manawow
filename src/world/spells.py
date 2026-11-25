@@ -87,7 +87,11 @@ SPELL_EFFECT_SUMMON_PET = 56
 SPELL_EFFECT_WEAPON_DAMAGE = 58
 SPELL_EFFECT_THREAT = 63
 SPELL_EFFECT_TRIGGER_SPELL = 64
+SPELL_EFFECT_FORCE_CAST = 140
+SPELL_EFFECT_FORCE_CAST_WITH_VALUE = 141
+SPELL_EFFECT_FORCE_CAST_2 = 160
 SPELL_EFFECT_INTERRUPT_CAST = 68
+SPELL_EFFECT_APPLY_GLYPH = 74
 SPELL_EFFECT_SUMMON_OBJECT_WILD = 76
 SPELL_EFFECT_SEND_EVENT = 61
 # Opening, Herb Gathering, Mining, Pick Lock: unlock and use a game object.
@@ -140,6 +144,8 @@ SPELL_AURA_MOD_INCREASE_MOUNTED_SPEED = 32
 SPELL_AURA_MOD_DECREASE_SPEED = 33
 SPELL_AURA_PROC_TRIGGER_SPELL = 42
 SPELL_AURA_MOUNTED = 78
+SPELL_AURA_ADD_FLAT_MODIFIER = 107
+SPELL_AURA_ADD_PCT_MODIFIER = 108
 SPELL_AURA_MOD_RATING = 189
 SPELL_AURA_MELEE_SLOW = 193
 SPELL_AURA_MOD_INCREASE_HEALTH = 34
@@ -184,6 +190,25 @@ SPELL_AURA_MOD_RANGED_ATTACK_POWER_PCT = 167
 SPELL_AURA_HASTE_SPELLS = 216
 SPELL_AURA_MECHANIC_DURATION_MOD = 232
 SPELL_AURA_MOD_MECHANIC_DAMAGE_TAKEN_PERCENT = 255
+
+# ``SpellModOp`` (SpellDefines.h).  Aura 107/108 stores one of these in its
+# MiscValue and the affected spell-family mask in EffectSpellClassMask.
+SPELLMOD_DAMAGE = 0
+SPELLMOD_DURATION = 1
+SPELLMOD_THREAT = 2
+SPELLMOD_EFFECT1 = 3
+SPELLMOD_RANGE = 5
+SPELLMOD_RADIUS = 6
+SPELLMOD_CRITICAL_CHANCE = 7
+SPELLMOD_ALL_EFFECTS = 8
+SPELLMOD_CASTING_TIME = 10
+SPELLMOD_COOLDOWN = 11
+SPELLMOD_EFFECT2 = 12
+SPELLMOD_IGNORE_ARMOR = 13
+SPELLMOD_COST = 14
+SPELLMOD_EFFECT3 = 23
+SPELLMOD_GLOBAL_COOLDOWN = 21
+SPELLMOD_DAMAGE_MULTIPLIER = 20
 # 3.3.5 Death and Decay uses this periodic dummy aura for its ground ticks.
 SPELL_AURA_PERIODIC_DUMMY = 226
 SPELL_AURA_PERIODIC_TRIGGER_SPELL_WITH_VALUE = 227
@@ -547,6 +572,11 @@ class SpellTemplate:
             _row_get(row, "channel_interrupt_flags", 0))
         self.dmg_class = int(_row_get(row, "dmg_class", 0))
         self.spell_family = int(_row_get(row, "spell_family_name", 0))
+        self.spell_family_flags = (
+            int(_row_get(row, "spell_family_flags", 0)),
+            int(_row_get(row, "spell_family_flags2", 0)),
+            0,
+        )
         self.spell_visual = int(_row_get(row, "spell_visual", 0))
         # Weapon/armour proficiency spells (SMSG_SET_PROFICIENCY).
         self.equipped_item_class = int(_row_get(row, "equipped_item_class", 0))
@@ -584,6 +614,9 @@ class SpellTemplate:
             points_per_combo = float(_row_get(row, f"effect_points_per_combo_point{i}", 0.0))
             points_per_level = float(_row_get(row, f"effect_real_points_per_level{i}", 0.0))
             bonus_coefficient = float(_row_get(row, f"effect_bonus_coefficient{i}", 0.0))
+            class_mask = tuple(
+                int(_row_get(row, f"effect_spell_class_mask{i}_{j}", 0))
+                for j in (1, 2, 3))
             self.effects.append({
                 "effect": effect_type,
                 "base_points": base_points,
@@ -598,6 +631,7 @@ class SpellTemplate:
                 "amplitude": amplitude,
                 "trigger_spell": trigger_spell,
                 "chain_targets": chain_targets,
+                "class_mask": class_mask,
                 "item_type": item_type,
                 "points_per_combo": points_per_combo,
                 "points_per_level": points_per_level,
@@ -1285,6 +1319,35 @@ def get_spell_target_position(path: str, spell_id: int) -> Optional[dict]:
     }
 
 
+@lru_cache(maxsize=1024)
+def _glyph_properties_cached(path: str, glyph_id: int):
+    con = sqlite3.connect(path)
+    con.row_factory = sqlite3.Row
+    try:
+        row = con.execute(
+            "SELECT id, spell_id, slot_flags, icon_id"
+            " FROM glyph_properties WHERE id = ?", (int(glyph_id),)
+        ).fetchone()
+    except sqlite3.OperationalError:
+        row = None
+    finally:
+        con.close()
+    return row
+
+
+def get_glyph_properties(path: str, glyph_id: int) -> Optional[dict]:
+    """Return GlyphProperties.dbc data for an effect-74 glyph id."""
+    row = _glyph_properties_cached(path, int(glyph_id))
+    if row is None:
+        return None
+    return {
+        "id": int(row["id"]),
+        "spell_id": int(row["spell_id"]),
+        "slot_flags": int(row["slot_flags"]),
+        "icon_id": int(row["icon_id"]),
+    }
+
+
 def get_creature_spells(path: str, entry: int) -> List[int]:
     """Fetch the spell IDs a creature can cast.
 
@@ -1455,6 +1518,7 @@ def clear_caches() -> None:
                    _creature_spell_list_entry_cached,
                    _creature_spell_targeting_cached,
                    _spell_target_position_cached,
+                   _glyph_properties_cached,
                    get_creature_base_mana, get_rune_cost):
         cached.cache_clear()
 

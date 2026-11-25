@@ -95,6 +95,26 @@ def _socket(tmp_path):
             "INSERT OR REPLACE INTO spell_duration"
             "(id, duration, duration_per_level, max_duration)"
             " VALUES(1, 10000, 0, 10000)")
+        # Spell-modifier aura: +20 to effect 1 of family-3 flag-1 spells.
+        con.execute(
+            "INSERT OR REPLACE INTO spell_templates"
+            "(id, name, effect1, effect_apply_aura_name1,"
+            " effect_base_points1, effect_misc_value1,"
+            " effect_spell_class_mask1_1, spell_family_name, duration_index)"
+            " VALUES(406, 'Spell Mod Aura', 6, 107, 20, 3, 1, 3, 1)")
+        con.execute(
+            "INSERT OR REPLACE INTO spell_templates"
+            "(id, name, effect1, effect_base_points1, spell_family_name,"
+            " spell_family_flags)"
+            " VALUES(407, 'Modified Damage', 2, 100, 3, 1)")
+        con.execute(
+            "INSERT OR REPLACE INTO spell_templates"
+            "(id, name, effect1, effect_misc_value1)"
+            " VALUES(408, 'Apply Test Glyph', 74, 141)")
+        con.execute(
+            "INSERT OR REPLACE INTO spell_templates"
+            "(id, name, effect1, effect_trigger_spell1)"
+            " VALUES(409, 'Force Cast Test', 140, 200)")
         con.execute(
             "INSERT OR REPLACE INTO gameobject_templates"
             "(entry, type, display_id, name, size, faction, flags)"
@@ -179,6 +199,34 @@ def test_skill_step_and_proficiency_effects_persist(tmp_path):
             con.close()
         assert skill == (1,)
         assert proficiency == (32,)
+
+    asyncio.run(flow())
+
+
+def test_spell_modifier_force_cast_and_glyph_effects(tmp_path):
+    async def flow():
+        socket, db, _sent, _delivered = _socket(tmp_path)
+        await socket._apply_spell_effects(
+            None, spells.get_spell_template(db, 406), socket.player_guid)
+        target = spells.get_spell_template(db, 407)
+        effect = target.effects[0]
+        assert socket._spell_effect_value(
+            target, 0, effect, 1) == 122
+
+        triggered = []
+
+        async def fake_trigger(spell_id, target_guid):
+            triggered.append((int(spell_id), int(target_guid)))
+
+        socket._cast_triggered = fake_trigger
+        await socket._apply_spell_effects(
+            None, spells.get_spell_template(db, 408), 0)
+        assert triggered[-1][0] == 54292
+
+        triggered.clear()
+        await socket._apply_spell_effects(
+            None, spells.get_spell_template(db, 409), 0)
+        assert triggered[-1] == (200, socket.player_guid)
 
     asyncio.run(flow())
 

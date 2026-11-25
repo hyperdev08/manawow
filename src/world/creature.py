@@ -495,6 +495,13 @@ CREATE TABLE IF NOT EXISTS spell_templates(
   attributes_serverside INTEGER NOT NULL DEFAULT 0
 );
 
+CREATE TABLE IF NOT EXISTS glyph_properties(
+  id INTEGER PRIMARY KEY,
+  spell_id INTEGER NOT NULL DEFAULT 0,
+  slot_flags INTEGER NOT NULL DEFAULT 0,
+  icon_id INTEGER NOT NULL DEFAULT 0
+);
+
 CREATE TABLE IF NOT EXISTS creature_template_spells(
   entry INTEGER NOT NULL DEFAULT 0,
   set_id INTEGER NOT NULL DEFAULT 0,
@@ -843,6 +850,8 @@ _PLAYERCREATEINFO_SQL = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "playercreateinfo.sql")
 _SPELL_ENCHANT_SQL = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "spell_item_enchantment.sql")
+_GLYPH_PROPERTIES_SQL = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "glyph_properties.sql")
 
 
 def _seed_spell_item_enchantment(con: sqlite3.Connection) -> None:
@@ -861,6 +870,18 @@ def _seed_spell_item_enchantment(con: sqlite3.Connection) -> None:
         con.executescript(handle.read())
     con.commit()
 
+
+
+def _seed_glyph_properties(con: sqlite3.Connection) -> None:
+    """Load the bundled GlyphProperties.dbc rows (glyph effect -> spell)."""
+    count = con.execute("SELECT COUNT(*) FROM glyph_properties").fetchone()[0]
+    if count:
+        return
+    if not os.path.exists(_GLYPH_PROPERTIES_SQL):
+        return
+    with open(_GLYPH_PROPERTIES_SQL, encoding="utf-8") as handle:
+        con.executescript(handle.read())
+    con.commit()
 
 
 def _seed_playercreateinfo(con: sqlite3.Connection) -> None:
@@ -920,6 +941,7 @@ def init_creature_db(path: str) -> None:
         # table, so seed them before the demo-population early return.
         _seed_playercreateinfo(con)
         _seed_spell_item_enchantment(con)
+        _seed_glyph_properties(con)
         if con.execute("SELECT COUNT(*) FROM creature_spawns").fetchone()[0]:
             con.commit()
             return

@@ -117,6 +117,8 @@ SUPPORTED_AURA_TYPES = frozenset((
     spells.SPELL_AURA_MECHANIC_DURATION_MOD,
     spells.SPELL_AURA_MOD_MECHANIC_DAMAGE_TAKEN_PERCENT,
     spells.SPELL_AURA_PROC_TRIGGER_SPELL,
+    spells.SPELL_AURA_ADD_FLAT_MODIFIER,
+    spells.SPELL_AURA_ADD_PCT_MODIFIER,
     spells.SPELL_AURA_MOD_RATING,
     spells.SPELL_AURA_MELEE_SLOW,
 ))
@@ -271,6 +273,8 @@ class AurasMixin:
             "misc_b": int(effect.get("misc_value_b") or 0),
             "amplitude": int(effect.get("amplitude") or 0),
             "trigger_spell": int(effect.get("trigger_spell") or 0),
+            "class_mask": tuple(effect.get("class_mask") or (0, 0, 0)),
+            "family": int(getattr(template, "spell_family", 0) or 0),
             "index": int(index),
         }
 
@@ -315,6 +319,9 @@ class AurasMixin:
             duration_ms = spells.spell_duration_ms(
                 self.config.database.world_path, template.duration_index,
                 caster_level)
+        if (duration_ms > 0 and hasattr(self, "_spell_mod_value")):
+            duration_ms = max(1, int(self._spell_mod_value(
+                template, spells.SPELLMOD_DURATION, duration_ms)))
         if duration_ms < 0 or (duration_ms == 0 and template.is_passive()):
             duration_ms = PERMANENT_AURA_SECONDS * 1000
         if duration_ms <= 0:

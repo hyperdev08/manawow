@@ -179,7 +179,7 @@ class SpellsMixin:
         # and within reach (the spells' range is the interaction distance).
         go_target = bool(target_guid) and gameobject.is_gameobject_guid(target_guid)
         if go_target:
-            reach = max(template.get_range(), gameobject.GAMEOBJECT_USE_DISTANCE)
+            reach = max(self._spell_range(template), gameobject.GAMEOBJECT_USE_DISTANCE)
             if self._usable_gameobject(target_guid, max_distance=reach) is None:
                 await self._cast_failed(cast_id, spell_id, SPELL_FAILED_BAD_TARGETS)
                 return
@@ -199,7 +199,7 @@ class SpellsMixin:
             await self._cast_failed(cast_id, spell_id, SPELL_FAILED_BAD_TARGETS)
             return
         if target_peer is not None and target_peer.character:
-            spell_range = template.get_range()
+            spell_range = self._spell_range(template)
             if spell_range < 49000.0:
                 spell_range = max(spell_range, 0.5)
                 peer_pos = (
@@ -211,7 +211,7 @@ class SpellsMixin:
                                             SPELL_FAILED_OUT_OF_RANGE)
                     return
         if spawn is not None:
-            spell_range = template.get_range()
+            spell_range = self._spell_range(template)
             if spell_range < 49000.0:
                 spell_range = max(spell_range, 0.5)
                 if (self._distance(self._player_position(),
@@ -220,7 +220,7 @@ class SpellsMixin:
                     await self._cast_failed(cast_id, spell_id, SPELL_FAILED_OUT_OF_RANGE)
                     return
         if dest is not None:
-            spell_range = template.get_range()
+            spell_range = self._spell_range(template)
             if spell_range < 49000.0:
                 spell_range = max(spell_range, 0.5)
                 if self._distance(self._player_position(), dest) > spell_range + 0.5:
@@ -408,9 +408,75 @@ class SpellsMixin:
             con.close()
         return row is not None
 
+    _SPELL_EFFECT_MOD_OP = {
+        0: spells.SPELLMOD_EFFECT1,
+        1: spells.SPELLMOD_EFFECT2,
+        2: spells.SPELLMOD_EFFECT3,
+    }
+
+    def _spell_mod_totals(self, template) -> dict:
+        """Aggregate active talent spell modifiers that affect ``template``."""
+        totals: dict[int, list[float]] = {}
+        for aura in self._get_combat_state().get("auras", ()):
+            for component in aura.get("components", ()):
+                kind = int(component.get("type") or 0)
+                if kind not in (spells.SPELL_AURA_ADD_FLAT_MODIFIER,
+                                spells.SPELL_AURA_ADD_PCT_MODIFIER):
+                    continue
+                family = int(component.get("family") or 0)
+                if family and family != int(template.spell_family):
+                    continue
+                mask = tuple(component.get("class_mask") or (0, 0, 0))
+                if any(mask):
+                    flags = getattr(template, "spell_family_flags",
+                                    (0, 0, 0))
+                    if not any(int(mask[i]) & int(flags[i])
+                               for i in range(3)):
+                        continue
+                op = int(component.get("misc") or 0)
+                slot = totals.setdefault(op, [0.0, 0.0])
+                amount = float(component.get("amount") or 0)
+                if kind == spells.SPELL_AURA_ADD_FLAT_MODIFIER:
+                    slot[0] += amount
+                else:
+                    slot[1] += amount
+        return totals
+
+    def _spell_mod_value(self, template, op: int, value: float,
+                         effect_index: int | None = None,
+                         include_damage: bool = False) -> float:
+        totals = self._spell_mod_totals(template)
+        keys = {int(op)}
+        if effect_index is not None:
+            mapped = self._SPELL_EFFECT_MOD_OP.get(int(effect_index))
+            if mapped is not None:
+                keys.add(mapped)
+            keys.add(spells.SPELLMOD_ALL_EFFECTS)
+        if include_damage:
+            keys.add(spells.SPELLMOD_DAMAGE)
+        flat = sum(totals.get(key, (0.0, 0.0))[0] for key in keys)
+        pct = sum(totals.get(key, (0.0, 0.0))[1] for key in keys)
+        return (float(value) + flat) * (1.0 + pct / 100.0)
+
+    def _spell_effect_value(self, template, index: int, effect: dict,
+                            caster_level: int, combo_points: int = 0,
+                            damage: bool = False) -> int:
+        amount = int(template.effect_value(index, caster_level, combo_points))
+        return int(self._spell_mod_value(
+            template, spells.SPELLMOD_ALL_EFFECTS, amount,
+            effect_index=index, include_damage=damage))
+
+    def _spell_range(self, template) -> float:
+        return max(0.0, float(self._spell_mod_value(
+            template, spells.SPELLMOD_RANGE, template.get_range())))
+
     def _spell_cast_time_ms(self, template) -> int:
         """Cast time after spell haste, preserving instant casts."""
         base = int(template.get_casting_time_ms())
+        if base <= 0:
+            return 0
+        base = max(0, int(self._spell_mod_value(
+            template, spells.SPELLMOD_CASTING_TIME, base)))
         if base <= 0:
             return 0
         haste = float(self.character.get("spell_haste", 0.0) or 0.0)
@@ -638,6 +704,8 @@ class SpellsMixin:
             else:
                 basis = 0
             cost += int(basis * percentage / 100.0)
+        cost = int(self._spell_mod_value(
+            template, spells.SPELLMOD_COST, cost))
         return max(0, cost)
 
     async def _take_power(self, template) -> bool:
@@ -693,10 +761,16 @@ class SpellsMixin:
         cooldown_ms = max(int(template.recovery_time),
                           int(template.category_recovery))
         if cooldown_ms > 0:
-            combat["cooldowns"][template.id] = now + cooldown_ms / 1000.0
+            cooldown_ms = max(0, int(self._spell_mod_value(
+                template, spells.SPELLMOD_COOLDOWN, cooldown_ms)))
+            if cooldown_ms > 0:
+                combat["cooldowns"][template.id] = now + cooldown_ms / 1000.0
         gcd_ms = int(template.start_recovery_time)
         if gcd_ms > 0:
-            combat["gcd_until"] = now + gcd_ms / 1000.0
+            gcd_ms = max(0, int(self._spell_mod_value(
+                template, spells.SPELLMOD_GLOBAL_COOLDOWN, gcd_ms)))
+            if gcd_ms > 0:
+                combat["gcd_until"] = now + gcd_ms / 1000.0
 
     def _spell_target_kind(self, target_guid: int) -> str:
         if self._is_player_guid(target_guid):
@@ -796,6 +870,8 @@ class SpellsMixin:
             return result
         crit_chance = max(0.0, float(
             self.character.get("spell_crit_chance", 0.0) or 0.0))
+        crit_chance = max(0.0, float(self._spell_mod_value(
+            template, spells.SPELLMOD_CRITICAL_CHANCE, crit_chance)))
         if crit_chance and random.uniform(0.0, 100.0) < crit_chance:
             result["crit"] = True
         return result
@@ -1456,7 +1532,9 @@ class SpellsMixin:
             if etype == spells.SPELL_EFFECT_SCHOOL_DAMAGE:
                 if not target_guid:
                     continue
-                amount = template.effect_value(index, caster_level, combo_points)
+                amount = self._spell_effect_value(
+                    template, index, effect, caster_level, combo_points,
+                    damage=True)
                 amount += self._spell_power_bonus(effect)
                 amount = self._apply_damage_done(
                     int(template.school), max(0, amount))
@@ -1512,8 +1590,8 @@ class SpellsMixin:
                 if etype == spells.SPELL_EFFECT_HEAL_MAX_HEALTH:
                     amount = self._max_health()
                 else:
-                    amount = template.effect_value(
-                        index, caster_level, combo_points)
+                    amount = self._spell_effect_value(
+                        template, index, effect, caster_level, combo_points)
                     amount += self._spell_power_bonus(effect, healing=True)
                 amount = int(amount * (
                     1.0 + float(self.character.get("healing_pct", 0.0) or 0.0)
@@ -1541,7 +1619,9 @@ class SpellsMixin:
             elif etype == spells.SPELL_EFFECT_HEALTH_LEECH:
                 if not target_guid:
                     continue
-                amount = template.effect_value(index, caster_level, combo_points)
+                amount = self._spell_effect_value(
+                    template, index, effect, caster_level, combo_points,
+                    damage=True)
                 amount += self._spell_power_bonus(effect)
                 if critical:
                     amount = int(amount * 2.0)
@@ -1561,8 +1641,10 @@ class SpellsMixin:
                         player_guid)
             elif etype == spells.SPELL_EFFECT_THREAT:
                 if target_guid and not self._is_player_guid(target_guid):
-                    amount = template.effect_value(
-                        index, caster_level, combo_points)
+                    amount = self._spell_effect_value(
+                        template, index, effect, caster_level, combo_points)
+                    amount = int(self._spell_mod_value(
+                        template, spells.SPELLMOD_THREAT, amount))
                     manager = (self._creature_combat_manager()
                                if hasattr(self, "_creature_combat_manager")
                                else None)
@@ -1572,8 +1654,8 @@ class SpellsMixin:
                             player_guid, amount)
             elif etype == spells.SPELL_EFFECT_MODIFY_THREAT_PERCENT:
                 if target_guid and not self._is_player_guid(target_guid):
-                    percent = template.effect_value(
-                        index, caster_level, combo_points)
+                    percent = self._spell_effect_value(
+                        template, index, effect, caster_level, combo_points)
                     manager = (self._creature_combat_manager()
                                if hasattr(self, "_creature_combat_manager")
                                else None)
@@ -1636,7 +1718,8 @@ class SpellsMixin:
                            spells.SPELL_EFFECT_ENCHANT_ITEM_TEMPORARY):
                 await self._apply_weapon_enchant(cast, template, effect)
             elif etype == spells.SPELL_EFFECT_ENERGIZE:
-                amount = template.effect_value(index, caster_level, combo_points)
+                amount = self._spell_effect_value(
+                    template, index, effect, caster_level, combo_points)
                 if amount <= 0:
                     continue
                 power_type = int(effect.get("misc_value") or 0)
@@ -1667,6 +1750,28 @@ class SpellsMixin:
                 elif hasattr(self, "_send_inventory_failure"):
                     await self._send_inventory_failure(
                         int(getattr(self, "INVENTORY_FULL", 50)))
+            elif etype == spells.SPELL_EFFECT_APPLY_GLYPH:
+                glyph_id = int(effect.get("misc_value") or 0)
+                glyph = spells.get_glyph_properties(
+                    self.config.database.world_path, glyph_id)
+                if glyph and glyph["spell_id"]:
+                    await self._cast_triggered(
+                        int(glyph["spell_id"]), int(self.player_guid))
+                    self.character.setdefault("glyphs", {})[
+                        int(glyph_id)] = int(glyph["spell_id"])
+            elif etype in (spells.SPELL_EFFECT_FORCE_CAST,
+                           spells.SPELL_EFFECT_FORCE_CAST_WITH_VALUE,
+                           spells.SPELL_EFFECT_FORCE_CAST_2):
+                triggered = int(effect.get("trigger_spell") or 0)
+                if triggered:
+                    target = int(target_guid or self.player_guid)
+                    peer = (self._peer_session_for_guid(target)
+                            if hasattr(self, "_peer_session_for_guid")
+                            else None)
+                    if peer is not None and peer is not self:
+                        await peer._cast_triggered(triggered, target)
+                    else:
+                        await self._cast_triggered(triggered, target)
             elif etype == spells.SPELL_EFFECT_LEARN_SPELL:
                 learned = int(effect.get("trigger_spell") or 0)
                 if learned and hasattr(self, "_learn_spell"):
@@ -1776,8 +1881,9 @@ class SpellsMixin:
         """Damage one target of a direct-damage effect would take."""
         if etype in (spells.SPELL_EFFECT_SCHOOL_DAMAGE,
                      spells.SPELL_EFFECT_HEALTH_LEECH):
-            return max(0, template.effect_value(index, caster_level,
-                                                combo_points))
+            return max(0, self._spell_effect_value(
+                template, index, effect, caster_level, combo_points,
+                damage=True))
         weapon = self._player_weapon_stats()
         roll = random.uniform(weapon["min"], weapon["max"])
         if etype == spells.SPELL_EFFECT_WEAPON_PERCENT_DAMAGE:
@@ -1790,10 +1896,13 @@ class SpellsMixin:
             normalized = (roll / delay) * 2.4
             normalized += (int(self.character.get("attack_power", 0) or 0)
                            / 14.0 * 2.4)
-            return max(1, int(normalized + template.effect_value(
-                index, caster_level, combo_points)))
+            return max(1, int(normalized + self._spell_effect_value(
+                template, index, effect, caster_level, combo_points,
+                damage=True)))
         amount = int(roll)
-        amount += template.effect_value(index, caster_level, combo_points)
+        amount += self._spell_effect_value(
+            template, index, effect, caster_level, combo_points,
+            damage=True)
         amount += max(1, int(caster_level * 0.5))
         amount += (int(self.character.get("attack_power", 0) or 0) / 14.0
                    * float(weapon.get("delay", 2.0) or 2.0))
@@ -2051,8 +2160,13 @@ class SpellsMixin:
             caster_level)
         if duration_ms <= 0:
             duration_ms = 8000
+        duration_ms = int(self._spell_mod_value(
+            template, spells.SPELLMOD_DURATION, duration_ms))
         interval = max(250, int(effect.get("amplitude") or 1000)) / 1000.0
-        amount = template.effect_value(index, caster_level)
+        amount = self._spell_effect_value(
+            template, index, effect, caster_level,
+            damage=int(effect.get("apply_aura") or 0)
+            == spells.SPELL_AURA_PERIODIC_DAMAGE)
         school = int(template.school) or 1
         aura = int(effect.get("apply_aura") or 0)
         slow_amount = 0
