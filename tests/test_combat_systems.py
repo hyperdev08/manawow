@@ -500,6 +500,11 @@ async def test_line_of_sight_geometry_and_optional_db_blockers():
 @_async_test
 async def test_melee_and_spell_facing_checks():
     session = FakeUnit()
+    # Facing is independent of equipment.  Seed the weapon cache with the
+    # bare-hand fallback so this test never depends on whether the local
+    # database is the combined CI layout or the normal split world/character
+    # pair (which has no character_items table in data/world.db).
+    session._weapon_stats_cache = {15: None, 16: None, 17: None}
     target = session.add_creature(20, -5.0)
     session.character["o"] = 0.0
     await session.handle_attack_swing(struct.pack("<Q", target))
