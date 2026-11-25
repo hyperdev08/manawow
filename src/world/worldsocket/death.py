@@ -22,6 +22,13 @@ SPIRIT_HEALER_INTERACT_RANGE = 30.0
 SPIRIT_HEALER_NPC_FLAG = 0x4000
 SPIRIT_HEAL_RESURRECT_PERCENT = 0.5
 
+# ``SPELL_AURA_GHOST`` spells CMaNGOS applies on spirit release.  Night elves
+# also get their wisp form; both are permanent and are removed on resurrect.
+GHOST_AURA_SPELLS = (8326,)
+NIGHT_ELF_GHOST_AURA = 20584
+NIGHT_ELF_RACE = 4
+GHOST_AURA_DURATION = 10 * 365 * 24 * 3600
+
 
 def _write_item_durability(path: str, rows) -> None:
     character_db.update_item_durability(path, rows)
@@ -48,6 +55,13 @@ class DeathMixin:
         if corpse is not None:
             corpse = dict(corpse)
             corpse.setdefault("owner_guid", int(corpse["character_guid"]))
+            # The corpse row stores only the position; the owner's current
+            # appearance lives on the character row.  Merge it so the ghost can
+            # be shown its own corpse after a relogin too.
+            for key in ("race", "gender", "skin", "face", "hair_style",
+                        "hair_color", "facial_style", "guild_id"):
+                if key not in corpse and key in self.character:
+                    corpse[key] = self.character[key]
         combat["corpse"] = corpse
         return corpse
 
@@ -75,6 +89,13 @@ class DeathMixin:
         return {"id": 0, "map": map_id, "zone": zone, "x": x, "y": y,
                 "z": z, "o": o, "name": "Starting graveyard"}
 
+    @staticmethod
+    def _corpse_item_value(item) -> int:
+        """Pack an equipped item as ``displayId | inventoryType << 24``."""
+        display_id = int(item.get("display_id", 0) or 0) & 0x00FFFFFF
+        inventory_type = int(item.get("inventory_type", 0) or 0) & 0xFF
+        return display_id | (inventory_type << 24)
+
     def _corpse_object_data(self, row) -> dict:
         """Build the client-facing corpse object from a character/corpse row."""
         owner = int(row.get("owner_guid")
@@ -88,14 +109,17 @@ class DeathMixin:
                 items = []
                 for slot in range(19):
                     item = inventory.get(slot)
-                    items.append(int(item.get("item_entry") or 0) if item else 0)
+                    items.append(self._corpse_item_value(item) if item else 0)
             else:
                 items = character_db.get_equipment_entries(
                     self.config.database.world_path, owner)
+        race = int(row.get("race", 0) or 0) & 0xFF
+        gender = int(row.get("gender", 0) or 0) & 0xFF
         skin = int(row.get("skin", 0) or 0) & 0xFF
         face = int(row.get("face", 0) or 0) & 0xFF
         hair = int(row.get("hair_style", 0) or 0) & 0xFF
         color = int(row.get("hair_color", 0) or 0) & 0xFF
+        facial = int(row.get("facial_style", 0) or 0) & 0xFF
         return {
             "owner_guid": owner,
             "map": int(row.get("map", 0) or 0),
@@ -105,8 +129,8 @@ class DeathMixin:
             "o": float(row.get("o", 0.0) or 0.0),
             "display_id": object_update.player_display_id(row),
             "items": list(items or []),
-            "bytes1": skin | (face << 8) | (hair << 16) | (color << 24),
-            "bytes2": int(row.get("facial_style", 0) or 0) & 0xFF,
+            "bytes1": (race << 8) | (gender << 16) | (skin << 24),
+            "bytes2": face | (hair << 8) | (color << 16) | (facial << 24),
             "guild": int(row.get("guild_id", 0) or 0),
         }
 
@@ -114,7 +138,7 @@ class DeathMixin:
         server = getattr(self, "server", None)
         sessions = getattr(server, "sessions", ()) if server is not None else ()
         for session in list(sessions):
-            if session is self or not getattr(session, "in_world", False):
+            if not getattr(session, "in_world", False):
                 continue
             character = getattr(session, "character", None)
             if not character or int(character.get("map", 0) or 0) != int(
@@ -147,7 +171,7 @@ class DeathMixin:
         guid = object_update.corpse_guid(owner_guid)
         payload = struct.pack("<QB", guid, 0)
         for session in list(sessions):
-            if session is self or not getattr(session, "in_world", False):
+            if not getattr(session, "in_world", False):
                 continue
             try:
                 await session.send_packet(
@@ -181,8 +205,10 @@ class DeathMixin:
         current = {}
         for row in rows:
             owner = int(row.get("character_guid") or 0)
-            if not owner or owner == int(self.player_guid or 0):
+            if not owner:
                 continue
+            # The owner must see their own corpse as well; otherwise a ghost can
+            # never get the client's "Recover corpse" interaction.
             current[owner] = row
         previous = getattr(self, "_visible_corpses", {})
         for owner, row in current.items():
@@ -255,16 +281,72 @@ class DeathMixin:
         self.character["player_flags"] = (
             F.PLAYER_FLAGS_GHOST if state == 2 else 0)
         self.character["health"] = 1 if state == 2 else 0
-        guid = int(self.player_guid or 0)
-        if guid:
-            corpse = await asyncio.to_thread(
-                character_db.get_character_corpse,
-                self.config.database.world_path, guid)
-            if corpse is not None:
-                corpse = dict(corpse)
-                corpse.setdefault("owner_guid", int(corpse["character_guid"]))
-            combat["corpse"] = corpse
+        combat["corpse"] = await self._corpse()
         combat["death_graveyard"] = await self._nearest_graveyard()
+        if state == 2:
+            # Recreate the ghost aura without packets; world entry follows with
+            # ``_send_all_auras`` once the client has entered the world.
+            await self._set_ghost_auras(True, send=False)
+
+    def _ghost_aura_ids(self) -> tuple[int, ...]:
+        ids = list(GHOST_AURA_SPELLS)
+        if int(self.character.get("race", 0) or 0) == NIGHT_ELF_RACE:
+            ids.append(NIGHT_ELF_GHOST_AURA)
+        return tuple(ids)
+
+    async def _set_ghost_auras(self, active: bool,
+                               send: bool = True) -> None:
+        """Add/remove the permanent ghost (and night-elf wisp) auras."""
+        if not self.character or not self.player_guid:
+            return
+        combat = self._get_combat_state()
+        auras = combat.setdefault("auras", [])
+        ghost_ids = set(self._ghost_aura_ids())
+        if not active:
+            removed = [aura for aura in auras
+                       if int(aura.get("spell_id") or 0) in ghost_ids]
+            if not removed:
+                return
+            auras[:] = [aura for aura in auras if aura not in removed]
+            if hasattr(self, "_normalise_aura_slots"):
+                self._normalise_aura_slots(auras)
+            if send and hasattr(self, "_send_aura_update"):
+                for aura in removed:
+                    await self._send_aura_update(
+                        "player", self.player_guid, aura, remove=True)
+            return
+
+        existing = {int(aura.get("spell_id") or 0) for aura in auras}
+        added = []
+        now = time.monotonic()
+        level = max(1, int(self.character.get("level", 1) or 1))
+        for spell_id in self._ghost_aura_ids():
+            if spell_id in existing:
+                continue
+            added.append({
+                "spell_id": int(spell_id),
+                "name": "Ghost",
+                "caster_guid": int(self.player_guid),
+                "caster_level": level,
+                "expires": now + GHOST_AURA_DURATION,
+                "max_duration": 0,
+                "components": [],
+                "stacks": 1,
+                "max_stacks": 1,
+                "dispel_type": 0,
+                "mechanic": 0,
+                "positive": True,
+                "slot": len(auras),
+            })
+        if not added:
+            return
+        auras.extend(added)
+        if hasattr(self, "_normalise_aura_slots"):
+            self._normalise_aura_slots(auras)
+        if send and hasattr(self, "_send_aura_update"):
+            for aura in added:
+                await self._send_aura_update(
+                    "player", self.player_guid, aura)
 
     async def _send_login_death_location(self) -> None:
         if not self.character or not self._get_combat_state().get("dead"):
@@ -334,6 +416,7 @@ class DeathMixin:
             Opcodes.SMSG_NEW_WORLD,
             login_packets.build_login_verify_world(self.character),
         )
+        await self._set_ghost_auras(True)
         self.log.info(
             f"'{self.character['name']}' released spirit at "
             f"map {self.character['map']} zone {self.character['zone']}")
@@ -395,6 +478,7 @@ class DeathMixin:
         self.character["power"] = (
             0 if char_class in (1, 6)
             else max(0, int(max_power * SPIRIT_HEAL_RESURRECT_PERCENT)))
+        await self._set_ghost_auras(False)
         guid = int(self.player_guid or 0)
         await run_db_write(
             character_db.update_character_position,

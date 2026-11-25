@@ -25,7 +25,9 @@ from src.network.packet_log import get_packet_log
 class WorldServer:
     def __init__(self, config: Config):
         self.config = config
-        self.log = setup_logger("worldserver", config.logging.log_dir, config.logging.level, config.logging.console)
+        self.log = setup_logger("worldserver", config.logging.log_dir,
+                                config.logging.level, config.logging.console,
+                                capture_asyncio=True)
         self._server: Optional[asyncio.AbstractServer] = None
         self.sessions = []
         # One shared aggro/threat/target/position state per engaged creature.

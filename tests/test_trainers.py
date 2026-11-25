@@ -97,6 +97,41 @@ def test_trainer_list_states_and_requirements(tmp_path):
     assert payload.endswith(b"Ready for training?\x00")
 
 
+def test_pet_trainer_only_accepts_hunters(tmp_path):
+    db = _world_db(tmp_path)
+    spawn = {
+        "npc_flags": trainer.NPC_FLAG_TRAINER,
+        "trainer_type": trainer.TRAINER_TYPE_PETS,
+    }
+    assert trainer.is_trainer_of(db, spawn, {"class": 3}, ())
+    assert not trainer.is_trainer_of(db, spawn, {"class": 1}, ())
+
+
+def test_profession_first_rank_sets_both_trainer_list_flags(tmp_path):
+    db = _world_db(tmp_path)
+    con = sqlite3.connect(db)
+    try:
+        con.execute(
+            "INSERT INTO npc_trainer(entry, spell, spellcost, reqlevel)"
+            " VALUES(198, 2372, 10, 0)")
+        con.commit()
+    finally:
+        con.close()
+    trainer.clear_caches()
+    spawn = creature.get_creature_spawn(db, 1)
+    payload, count = trainer.build_trainer_list(
+        db, 1, spawn, {"class": 4, "race": 1, "level": 5}, set(), {})
+    flags = {}
+    offset = 16
+    for _ in range(count):
+        spell_id = struct.unpack_from("<I", payload, offset)[0]
+        first, second = struct.unpack_from("<II", payload, offset + 9)
+        flags[spell_id] = (first, second)
+        offset += 38
+    assert flags[2372] == (1, 1)
+    assert flags[133] == (0, 0)
+
+
 def test_profession_wrapper_teaches_rank_and_skill(tmp_path):
     db = _world_db(tmp_path)
     # Append the profession row directly and read it back.

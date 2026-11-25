@@ -605,8 +605,12 @@ _NAME_RE = re.compile(r"^[A-Za-z]{2,12}$")
 # the 4 bag slots.  Sending only 19 truncates every record and the client
 # silently discards the whole SMSG_CHAR_ENUM (empty character list).
 _EQUIPMENT_SLOTS = 23
-# ``SMSG_CHAR_ENUM`` character flags.
+# Internal character flags and their ``SMSG_CHAR_ENUM`` wire values.  The
+# server stores the ghost marker as ``0x10``, but the 3.3.5 character-list
+# packet uses ``0x2000`` for the same state.
 CHARACTER_FLAG_GHOST = 0x00000010
+CHARACTER_FLAG_GHOST_CHAR_ENUM = 0x00002000
+CHARACTER_FLAG_GHOST_ENUM = CHARACTER_FLAG_GHOST_CHAR_ENUM
 
 # Player starting positions, copied row-for-row from the 3.3.5a world database
 # (``playercreateinfo``).  Keyed by (race, class) because death knights get the
@@ -1115,16 +1119,24 @@ def get_character_corpse(path: str, guid: int) -> Optional[Dict[str, object]]:
 
 
 def get_equipment_entries(path: str, guid: int) -> List[int]:
-    """Return the 19 equipped item entries in INVSLOT order (0 when empty)."""
+    """Return the 19 equipped items packed for ``CORPSE_FIELD_ITEM``.
+
+    The client expects ``displayId | inventoryType << 24`` in that field, not
+    the item entry.  Slots without an item (or with a missing template) stay 0.
+    """
     result = [0] * 19
     con = _connect(path)
     try:
-        for slot, entry in con.execute(
-                "SELECT slot, item_entry FROM character_items"
-                " WHERE character_guid = ? AND slot BETWEEN 0 AND 18",
+        for slot, display_id, inventory_type in con.execute(
+                "SELECT ci.slot, it.display_id, it.inventory_type"
+                " FROM character_items ci"
+                " LEFT JOIN item_templates it ON ci.item_entry = it.entry"
+                " WHERE ci.character_guid = ? AND ci.slot BETWEEN 0 AND 18",
                 (int(guid),)):
             if 0 <= int(slot) < 19:
-                result[int(slot)] = int(entry)
+                display = int(display_id or 0) & 0x00FFFFFF
+                inv_type = int(inventory_type or 0) & 0xFF
+                result[int(slot)] = display | (inv_type << 24)
     except sqlite3.Error:
         pass
     finally:
@@ -1314,7 +1326,7 @@ def build_char_enum_payload(characters: List[sqlite3.Row], equipment: Optional[D
                        if "death_state" in char.keys() else 0)
         char_flags = int(char["char_flags"])
         if death_state == 2:
-            char_flags |= CHARACTER_FLAG_GHOST
+            char_flags |= CHARACTER_FLAG_GHOST_CHAR_ENUM
         out += struct.pack("<I", char_flags)
         out += struct.pack("<I", int(char["customize_flags"]))
         out.append(1 if int(char["first_login"]) else 0)
@@ -1669,15 +1681,17 @@ def get_item_template(path: str, entry: int) -> Optional[sqlite3.Row]:
 def get_character_inventory(path: str, character_guid: int) -> Dict[int, sqlite3.Row]:
     """Return {slot: item_row} for all items owned by a character.
 
-    Each row also carries ``display_id`` from ``item_templates`` (NULL when the
-    template is missing) so callers can build visual packets such as
-    ``SMSG_MIRRORIMAGE_DATA`` without a second query per item.
+    Each row also carries ``display_id`` and ``inventory_type`` from
+    ``item_templates`` (NULL when the template is missing) so callers can build
+    visual packets such as ``SMSG_MIRRORIMAGE_DATA`` and corpse item fields
+    without a second query per item.
     """
     con = _connect(path)
     con.row_factory = sqlite3.Row
     try:
         rows = con.execute(
-            """SELECT ci.*, it.display_id AS display_id
+            """SELECT ci.*, it.display_id AS display_id,
+                      it.inventory_type AS inventory_type
                FROM character_items ci
                LEFT JOIN item_templates it ON ci.item_entry = it.entry
                WHERE ci.character_guid = ?""",

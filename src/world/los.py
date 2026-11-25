@@ -22,6 +22,7 @@ code.
 from __future__ import annotations
 
 import math
+import os
 import sqlite3
 from dataclasses import dataclass
 from typing import Iterable, Sequence
@@ -110,6 +111,11 @@ def load_blockers(path: str) -> list[SightBlocker]:
     cached = _cache.get(path)
     if cached is not None:
         return cached
+    # Only stat on the first load: the result is cached for the process, so the
+    # Windows metadata call cannot stall the event loop on every LOS query.
+    if not os.path.exists(path):
+        _cache[path] = []
+        return []
     try:
         con = sqlite3.connect(path)
         try:

@@ -504,6 +504,17 @@ def test_los_blockers_are_cached_without_per_query_filesystem_stats(tmp_path: Pa
         los.clear_cache()
 
 
+def test_los_missing_database_is_treated_as_open(tmp_path: Path):
+    los.clear_cache()
+    try:
+        missing = str(tmp_path / "missing.db")
+        assert los.load_blockers(missing) == []
+        # The empty result is cached, so the missing file is only statted once.
+        assert los.load_blockers(missing) == []
+    finally:
+        los.clear_cache()
+
+
 def test_monster_move_path_serializes_all_waypoints():
     payload = object_update.build_monster_move_path(
         0x1234, 1.0, 2.0, 3.0, 0.0,

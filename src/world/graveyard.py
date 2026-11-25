@@ -28,11 +28,16 @@ CREATE TABLE IF NOT EXISTS graveyard_zones(
   ghost_loc INTEGER NOT NULL,
   link_kind INTEGER NOT NULL DEFAULT 0,
   faction INTEGER NOT NULL DEFAULT 0,
-  PRIMARY KEY(id, ghost_loc, faction)
+  PRIMARY KEY(id, ghost_loc, link_kind, faction)
 );
 CREATE INDEX IF NOT EXISTS idx_graveyard_zone_loc
   ON graveyard_zones(ghost_loc);
 """
+
+# CMaNGOS ``GraveyardLinkKey`` kinds.  AREALINK rows compare ``ghost_loc``
+# against the player's zone; MAPLINK rows compare it against the map id.
+GRAVEYARD_AREALINK = 0
+GRAVEYARD_MAPLINK = 1
 
 # ``game_graveyard_zone.faction`` uses the team mask values, not race ids.
 TEAM_ALLIANCE = 469
@@ -42,10 +47,51 @@ ALLIANCE_RACES = frozenset((1, 3, 4, 7, 11))
 HORDE_RACES = frozenset((2, 5, 6, 8, 10))
 
 
+def ensure_graveyard_schema(con: sqlite3.Connection) -> None:
+    """Create the graveyard tables and upgrade the old zone-link primary key."""
+    con.executescript(CREATE_GRAVEYARD_SQL)
+    columns = con.execute("PRAGMA table_info(graveyard_zones)").fetchall()
+    if not columns:
+        return
+    if "link_kind" not in {row[1] for row in columns}:
+        con.execute(
+            "ALTER TABLE graveyard_zones ADD COLUMN link_kind INTEGER"
+            " NOT NULL DEFAULT 0")
+        columns = con.execute(
+            "PRAGMA table_info(graveyard_zones)").fetchall()
+    # PRAGMA table_info column 5 is the 1-based position in the primary key.
+    primary_key = [row[1] for row in sorted(columns, key=lambda row: row[5])
+                   if row[5]]
+    if "link_kind" in primary_key:
+        return
+    # Older databases keyed links by (id, ghost_loc, faction), which cannot
+    # store the same zone/map link for both link kinds.  SQLite cannot alter a
+    # primary key, so rebuild the table once.
+    con.executescript(
+        """
+        DROP TABLE IF EXISTS graveyard_zones_legacy;
+        ALTER TABLE graveyard_zones RENAME TO graveyard_zones_legacy;
+        CREATE TABLE graveyard_zones(
+          id INTEGER NOT NULL,
+          ghost_loc INTEGER NOT NULL,
+          link_kind INTEGER NOT NULL DEFAULT 0,
+          faction INTEGER NOT NULL DEFAULT 0,
+          PRIMARY KEY(id, ghost_loc, link_kind, faction)
+        );
+        INSERT OR IGNORE INTO graveyard_zones(
+            id, ghost_loc, link_kind, faction)
+          SELECT id, ghost_loc, link_kind, faction
+          FROM graveyard_zones_legacy;
+        DROP TABLE graveyard_zones_legacy;
+        CREATE INDEX IF NOT EXISTS idx_graveyard_zone_loc
+          ON graveyard_zones(ghost_loc);
+        """)
+
+
 def init_graveyard_db(path: str) -> None:
     con = sqlite3.connect(path)
     try:
-        con.executescript(CREATE_GRAVEYARD_SQL)
+        ensure_graveyard_schema(con)
         con.commit()
     finally:
         con.close()
@@ -76,7 +122,7 @@ def closest_graveyard(path: str, map_id: int, zone: int, x: float, y: float,
         # another map, and the zone/team link must win over same-map distance.
         rows = con.execute(
             "SELECT l.id, l.map, l.x, l.y, l.z, l.o, l.name,"
-            " z.ghost_loc, z.faction"
+            " z.ghost_loc, z.faction, z.link_kind"
             " FROM graveyard_locations l"
             " JOIN graveyard_zones z ON z.id = l.id",
         ).fetchall()
@@ -96,28 +142,44 @@ def closest_graveyard(path: str, map_id: int, zone: int, x: float, y: float,
     for row in rows:
         ghost_loc = int(row[7] or 0)
         faction = int(row[8] or 0)
+        link_kind = int(row[9] or 0)
+        # CMaNGOS ignores link kinds it does not know.
+        if link_kind not in (GRAVEYARD_AREALINK, GRAVEYARD_MAPLINK):
+            continue
         # A graveyard explicitly linked to the enemy team must never be used,
         # even when it is the closest one on the map/instance.
-        if faction and team and faction != team:
+        if faction and faction != team:
             continue
-        if ghost_loc == zone and faction == team:
+        is_zone_link = (link_kind == GRAVEYARD_AREALINK
+                        and zone and ghost_loc == zone)
+        is_map_link = (link_kind == GRAVEYARD_MAPLINK
+                       and ghost_loc == map_id)
+        if is_zone_link and faction == team:
             rank = 0
-        elif ghost_loc == zone and faction == 0:
+        elif is_zone_link and faction == 0:
             rank = 1
-        elif int(row[1]) == map_id and faction == team:
+        elif is_map_link and faction == team:
             rank = 2
-        elif int(row[1]) == map_id and faction == 0:
+        elif is_map_link and faction == 0:
             rank = 3
-        elif ghost_loc == zone:
+        # Upstream falls back to the team's default graveyard when no link
+        # matches.  Keep a same-map/cross-map geometric fallback for custom
+        # data sets that contain no usable links at all.
+        elif int(row[1]) == map_id and faction == team:
             rank = 4
-        else:
+        elif int(row[1]) == map_id and faction == 0:
             rank = 5
+        elif faction == team:
+            rank = 6
+        else:
+            rank = 7
         dist = distance(row)
         if (best is None or rank < best_rank
                 or (rank == best_rank and dist < best[0])):
             best = (dist, row)
             best_rank = rank
     row = best[1]
+    link_kind = int(row[9] or 0)
     return {
         "id": int(row[0]),
         "map": int(row[1]),
@@ -126,7 +188,8 @@ def closest_graveyard(path: str, map_id: int, zone: int, x: float, y: float,
         "z": float(row[4]),
         "o": float(row[5]),
         "name": str(row[6] or ""),
-        "zone": int(row[7] or 0),
+        # A MAPLINK stores the map id in ``ghost_loc``; it is not a zone.
+        "zone": int(row[7] or 0) if link_kind == GRAVEYARD_AREALINK else 0,
     }
 
 

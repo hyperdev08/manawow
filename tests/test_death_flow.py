@@ -153,6 +153,87 @@ def test_corpse_create_block_uses_the_corpse_guid_and_fields():
     assert values[F.CORPSE_FIELD_GUILD] == 9
 
 
+def test_corpse_object_packs_appearance_and_item_fields(tmp_path):
+    cfg, _ = _make_world(tmp_path)
+
+    async def flow():
+        socket = WorldSocket(asyncio.StreamReader(), FakeWriter(), cfg)
+        socket.in_world = True
+        char = {
+            "race": 4, "gender": 1, "skin": 5, "face": 6, "hair_style": 7,
+            "hair_color": 8, "facial_style": 9, "guild_id": 3,
+            "map": 0, "x": 0.0, "y": 0.0, "z": 0.0, "o": 0.0,
+            "inventory": {0: {"display_id": 1234, "inventory_type": 21}},
+        }
+        socket.character = char
+        corpse = socket._corpse_object_data(char)
+        # CMaNGOS corpse bytes are not the player appearance byte order.
+        assert corpse["bytes1"] == (4 << 8) | (1 << 16) | (5 << 24)
+        assert corpse["bytes2"] == 6 | (7 << 8) | (8 << 16) | (9 << 24)
+        assert corpse["items"][0] == 1234 | (21 << 24)
+
+    asyncio.run(flow())
+
+
+def test_ghost_sees_its_own_corpse(tmp_path):
+    cfg, guid = _make_world(tmp_path)
+    db = cfg.database.world_path
+    character_db.save_character_corpse(
+        db, guid, 0, 12, -8935.0, -188.0, 80.0, 1.0)
+
+    async def flow():
+        writer = FakeWriter()
+        socket = WorldSocket(asyncio.StreamReader(), writer, cfg)
+        socket.in_world = True
+        socket.player_guid = guid
+        socket.character = dict(character_db.get_character(db, 1, guid))
+        socket.character.update({"map": 0, "x": -8935.0, "y": -188.0,
+                                 "z": 80.0})
+        await socket.refresh_corpse_visibility(force=True)
+        assert guid in socket._visible_corpses
+        assert writer.writes
+
+        # The broadcast path must also include the owner, not only nearby
+        # players.
+        writer.writes.clear()
+        socket.server = type("Server", (), {"sessions": [socket]})()
+        corpse = socket._corpse_object_data(socket.character)
+        corpse.update({"character_guid": guid, "owner_guid": guid})
+        await socket._broadcast_corpse_create(corpse)
+        assert writer.writes
+
+    asyncio.run(flow())
+
+
+def test_release_and_resurrect_manage_ghost_auras(tmp_path):
+    cfg, guid = _make_world(tmp_path)
+    db = cfg.database.world_path
+
+    async def flow():
+        socket = WorldSocket(asyncio.StreamReader(), FakeWriter(), cfg)
+        socket.in_world = True
+        socket.player_guid = guid
+        socket.character = dict(character_db.get_character(db, 1, guid))
+        socket.character["race"] = 4          # night elf
+        socket._apply_combat_stats()
+        socket.character["health"] = 0
+        combat = socket._get_combat_state()
+        combat["dead"] = True
+
+        await socket._record_death()
+        await socket._release_spirit()
+        spell_ids = {int(aura["spell_id"]) for aura in combat["auras"]}
+        assert 8326 in spell_ids
+        assert 20584 in spell_ids
+
+        await socket._resurrect_player(at_corpse=True)
+        spell_ids = {int(aura["spell_id"]) for aura in combat["auras"]}
+        assert 8326 not in spell_ids
+        assert 20584 not in spell_ids
+
+    asyncio.run(flow())
+
+
 def test_corpse_query_finds_appearance_and_equipment(tmp_path):
     cfg, guid = _make_world(tmp_path)
     db = cfg.database.world_path
@@ -166,12 +247,17 @@ def test_corpse_query_finds_appearance_and_equipment(tmp_path):
         con.close()
     character_db.save_character_corpse(
         db, guid, 0, 12, -8935.0, -188.0, 80.0, 1.0)
+    template = character_db.get_item_template(db, 25)
+    assert template is not None
+    expected = (int(template["display_id"])
+                | (int(template["inventory_type"]) << 24))
     rows = character_db.get_corpses_near(db, 0, -8935.0, -188.0, 80.0, 100)
     assert len(rows) == 1
     row = rows[0]
     assert row["character_guid"] == guid
     assert row["race"] == 1
-    assert row["items"][0] == 25
+    # CORPSE_FIELD_ITEM carries displayId | inventoryType << 24, not the entry.
+    assert row["items"][0] == expected
 
 
 def test_login_restores_a_persisted_ghost(tmp_path):
@@ -193,6 +279,8 @@ def test_login_restores_a_persisted_ghost(tmp_path):
         assert combat["ghost"] is True
         assert int(socket.character["health"]) == 1
         assert combat["corpse"]["x"] == -100.0
+        assert any(int(aura["spell_id"]) == 8326
+                   for aura in combat["auras"])
 
     asyncio.run(flow())
 

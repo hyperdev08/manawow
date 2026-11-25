@@ -716,7 +716,7 @@ def build_graveyard_rows(safe_rows, zone_rows):
 def insert_graveyard_rows(con, safe_rows, zone_rows) -> dict[str, int]:
     from src.world import graveyard
 
-    con.executescript(graveyard.CREATE_GRAVEYARD_SQL)
+    graveyard.ensure_graveyard_schema(con)
     locations, links = build_graveyard_rows(safe_rows, zone_rows)
     con.execute("DELETE FROM graveyard_locations")
     con.execute("DELETE FROM graveyard_zones")

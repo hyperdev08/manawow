@@ -340,7 +340,7 @@ def is_trainer_of(path: str, spawn: Mapping, char: Mapping,
         return (int(char.get("class", 0) or 0)
                 == int(spawn["trainer_class"] or 0))
     if trainer_type == TRAINER_TYPE_PETS:
-        return int(char.get("class", 0) or 0) == 1      # hunter
+        return int(char.get("class", 0) or 0) == 3      # hunter
     if trainer_type == TRAINER_TYPE_MOUNTS:
         trainer_race = int(spawn["trainer_race"] or 0)
         return not trainer_race or int(char.get("race", 0) or 0) == trainer_race
@@ -453,13 +453,18 @@ def build_trainer_list(path: str, guid: int, spawn: Mapping,
     for trainer_spell, state, req_level, req_abilities in rows:
         sent_state = (TRAINER_SPELL_GREEN
                       if state == TRAINER_SPELL_GREEN_DISABLED else state)
+        # CMaNGOS writes the ``IsPrimaryProfessionFirstRank`` flag twice: the
+        # client uses both fields to decide whether the Learn button is enabled
+        # for an Apprentice/Journeyman profession rank.
+        profession_first_rank = (
+            1 if trainer_spell.primary_profession_first_rank else 0)
         out += struct.pack(
             "<IBIIIBIIIII",
             int(trainer_spell.spell),
             int(sent_state) & 0xFF,
             int(trainer_spell.cost) & 0xFFFFFFFF,
-            0,                       # talent points (always zero in 3.3.5)
-            1 if trainer_spell.primary_profession_first_rank else 0,
+            profession_first_rank,
+            profession_first_rank,
             max(0, min(255, int(req_level))) & 0xFF,
             int(trainer_spell.req_skill) & 0xFFFFFFFF,
             int(trainer_spell.req_skill_value) & 0xFFFFFFFF,

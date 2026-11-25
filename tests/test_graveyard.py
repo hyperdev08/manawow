@@ -72,6 +72,73 @@ def test_falls_back_to_same_map_then_other_map(tmp_path):
     assert grave is not None and grave["id"] == 1
 
 
+def test_zone_links_win_outright_over_map_links(tmp_path):
+    path = str(tmp_path / "graves.db")
+    graveyard.init_graveyard_db(path)
+    con = sqlite3.connect(path)
+    try:
+        con.executemany(
+            "INSERT INTO graveyard_locations(id, map, x, y, z, o, name)"
+            " VALUES(?,?,?,?,?,?,?)",
+            [
+                (10, 0, 0.0, 0.0, 10.0, 0.0, "Zone link"),
+                (11, 0, 100.0, 0.0, 10.0, 0.0, "Map link"),
+            ],
+        )
+        con.executemany(
+            "INSERT INTO graveyard_zones(id, ghost_loc, link_kind, faction)"
+            " VALUES(?,?,?,?)",
+            [
+                (10, 12, graveyard.GRAVEYARD_AREALINK, 0),
+                (11, 0, graveyard.GRAVEYARD_MAPLINK, 0),
+            ],
+        )
+        con.commit()
+    finally:
+        con.close()
+    # The zone link wins even though the map link is at the death position.
+    grave = graveyard.closest_graveyard(path, 0, 12, 100.0, 0.0, 10.0, race=1)
+    assert grave is not None and grave["id"] == 10
+    # With no zone link, only the MAPLINK matches the map.
+    grave = graveyard.closest_graveyard(path, 0, 77, 100.0, 0.0, 10.0, race=1)
+    assert grave is not None and grave["id"] == 11
+
+
+def test_graveyard_schema_includes_link_kind_in_the_primary_key(tmp_path):
+    path = str(tmp_path / "graves.db")
+    con = sqlite3.connect(path)
+    try:
+        con.executescript(
+            """
+            CREATE TABLE graveyard_zones(
+              id INTEGER NOT NULL,
+              ghost_loc INTEGER NOT NULL,
+              link_kind INTEGER NOT NULL DEFAULT 0,
+              faction INTEGER NOT NULL DEFAULT 0,
+              PRIMARY KEY(id, ghost_loc, faction)
+            );
+            INSERT INTO graveyard_zones VALUES(1, 12, 0, 0);
+            """)
+        con.commit()
+    finally:
+        con.close()
+    graveyard.init_graveyard_db(path)
+    con = sqlite3.connect(path)
+    try:
+        con.execute(
+            "INSERT INTO graveyard_zones(id, ghost_loc, link_kind, faction)"
+            " VALUES(1, 12, 1, 0)")
+        con.commit()
+        assert con.execute(
+            "SELECT COUNT(*) FROM graveyard_zones").fetchone()[0] == 2
+        pk = [row[1] for row in sorted(
+            con.execute("PRAGMA table_info(graveyard_zones)"),
+            key=lambda row: row[5]) if row[5]]
+        assert "link_kind" in pk
+    finally:
+        con.close()
+
+
 def test_char_enum_marks_ghost_players():
     import struct
 
@@ -88,7 +155,8 @@ def test_char_enum_marks_ghost_players():
     # + xyz(12) + guild(4) ===> char flags
     offset = 1 + 8 + len("Ghost\x00") + 9 + 4 + 4 + 12 + 4
     flags = struct.unpack_from("<I", payload, offset)[0]
-    assert flags & character_db.CHARACTER_FLAG_GHOST
+    assert flags & character_db.CHARACTER_FLAG_GHOST_CHAR_ENUM
+    assert flags & 0x2000
 
 
 def test_corpse_and_death_state_round_trip(tmp_path):

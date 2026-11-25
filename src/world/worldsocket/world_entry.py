@@ -343,6 +343,10 @@ class WorldEntryMixin:
             self._power_field(F.UNIT_FIELD_POWER1): int(self.character["power"]),
             self._power_field(F.UNIT_FIELD_MAXPOWER1): int(self.character["max_power"]),
         })
+        if ghost and hasattr(self, "_set_ghost_auras"):
+            # ``combat["auras"]`` was reset above; the ghost aura must be
+            # recreated for the rebuilt client world.
+            await self._set_ghost_auras(True)
         if not ghost and self._is_death_knight():
             await self._send_resync_runes()
         await self.send_packet(
