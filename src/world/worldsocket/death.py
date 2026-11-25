@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import math
+import sqlite3
 import struct
 import time
 
@@ -323,6 +324,28 @@ class DeathMixin:
         for spell_id in self._ghost_aura_ids():
             if spell_id in existing:
                 continue
+            # The client needs the effect mask to draw the aura.  Ghost and
+            # wisp are APPLY_AURA spells whose effect values are irrelevant to
+            # the server simulation, so keep the indices but zero the amount.
+            components = []
+            try:
+                template = spells.get_spell_template(
+                    self.config.database.world_path, int(spell_id))
+            except (sqlite3.Error, OSError):
+                template = None
+            if template is not None:
+                for index, effect in enumerate(template.effects):
+                    if int(effect.get("effect") or 0) != \
+                            spells.SPELL_EFFECT_APPLY_AURA:
+                        continue
+                    components.append({
+                        "type": int(effect.get("apply_aura") or 0),
+                        "amount": 0,
+                        "misc": int(effect.get("misc_value") or 0),
+                        "index": int(index),
+                    })
+            if not components:
+                components = [{"type": 0, "amount": 0, "index": 0}]
             added.append({
                 "spell_id": int(spell_id),
                 "name": "Ghost",
@@ -330,7 +353,7 @@ class DeathMixin:
                 "caster_level": level,
                 "expires": now + GHOST_AURA_DURATION,
                 "max_duration": 0,
-                "components": [],
+                "components": components,
                 "stacks": 1,
                 "max_stacks": 1,
                 "dispel_type": 0,
