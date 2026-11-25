@@ -30,8 +30,11 @@ from .constants import (
     SPELL_FAILED_NO_COMBO_POINTS,
     SPELL_FAILED_NO_POWER,
     SPELL_FAILED_OUT_OF_RANGE,
+    SPELL_FAILED_REAGENTS,
+    SPELL_FAILED_REQUIRES_SPELL_FOCUS,
     SPELL_FAILED_SPELL_IN_PROGRESS,
     SPELL_FAILED_SPELL_UNAVAILABLE,
+    SPELL_FAILED_TOTEM_CATEGORY,
 )
 
 # ``SpellCastTargetFlags`` (3.3.5a SpellDefines.h).  ``SpellCastTargets::Read``
@@ -144,6 +147,24 @@ class SpellsMixin:
         template = spells.get_spell_template(self.config.database.world_path, spell_id)
         if template is None:
             await self._cast_failed(cast_id, spell_id, SPELL_FAILED_SPELL_UNAVAILABLE)
+            return
+        if not await self._has_spell_focus(template):
+            await self._cast_failed(cast_id, spell_id,
+                                    SPELL_FAILED_REQUIRES_SPELL_FOCUS)
+            return
+        if not self._has_spell_tools(template):
+            await self._cast_failed(cast_id, spell_id,
+                                    SPELL_FAILED_TOTEM_CATEGORY)
+            return
+        if not self._has_spell_reagents(template):
+            await self._cast_failed(cast_id, spell_id, SPELL_FAILED_REAGENTS)
+            return
+        if not self._can_store_create_items(template):
+            # ``Spell::CheckCast`` sends an equip error and reports
+            # ``SPELL_FAILED_DONT_REPORT``; the client has no cast to fail.
+            if hasattr(self, "_send_inventory_failure"):
+                await self._send_inventory_failure(
+                    int(getattr(self, "INVENTORY_FULL", 50)))
             return
         # Auto Shot / Shoot / Throw toggle the ranged auto-attack instead of
         # running a normal spell effect loop.
@@ -352,6 +373,9 @@ class SpellsMixin:
         # ``Spell::finish`` pays the cost (``TakePower``) and only then calls
         # ``SendSpellGo``, so the client's predicted power in the GO packet is the
         # value *after* the spend and there is exactly one power write per cast.
+        if not await self._consume_spell_reagents(template):
+            await self._cast_failed(cast_id, spell_id, SPELL_FAILED_REAGENTS)
+            return
         if not await self._take_power(template):
             await self._cast_failed(cast_id, spell_id, SPELL_FAILED_NO_POWER)
             return
@@ -657,6 +681,135 @@ class SpellsMixin:
                 & spells.SPELL_ATTR_EX2_DONT_BLOCK_MANA_REGEN):
             return
         self._get_combat_state()["last_power_use"] = time.monotonic()
+
+    def _reagent_slots(self, item_entry: int) -> list[tuple[int, dict]]:
+        """Backpack/bag slots holding ``item_entry``.
+
+        ``0..22`` are equipment and bag-container slots, so reagents can only
+        come from the backpack (``256..271``) and any bag contents stored
+        above that range.
+        """
+        inventory = (self.character or {}).get("inventory") or {}
+        result = []
+        for slot, item in inventory.items():
+            if int(slot) < 256:
+                continue
+            if int(item.get("item_entry") or 0) == int(item_entry):
+                result.append((int(slot), item))
+        return sorted(result, key=lambda pair: pair[0])
+
+    def _spell_item_requirements(self, template) -> list[tuple[int, int]]:
+        """Reagents plus literal totem items (``Spell::TakeReagents``)."""
+        requirements = [
+            (int(entry), max(1, int(count)))
+            for entry, count in getattr(template, "reagents", ())
+        ]
+        requirements += [(int(entry), 1)
+                         for entry in getattr(template, "totem_items", ())
+                         if int(entry)]
+        return requirements
+
+    def _has_spell_reagents(self, template) -> bool:
+        for item_entry, count in self._spell_item_requirements(template):
+            total = sum(max(1, int(item.get("stack_count", 1) or 1))
+                        for _slot, item in self._reagent_slots(item_entry))
+            if total < int(count):
+                return False
+        return True
+
+    async def _consume_spell_reagents(self, template) -> bool:
+        """Consume the spell's reagents, atomically checking every stack first."""
+        requirements = self._spell_item_requirements(template)
+        if not requirements:
+            return True
+        if not self._has_spell_reagents(template):
+            return False
+        for item_entry, count in requirements:
+            remaining = int(count)
+            while remaining > 0:
+                slots = self._reagent_slots(item_entry)
+                if not slots:
+                    return False
+                slot, item = slots[0]
+                current = max(1, int(item.get("stack_count", 1) or 1))
+                take = min(remaining, current)
+                await self._remove_item_from_slot(
+                    slot, 0 if take >= current else take,
+                    notify_quests=False)
+                remaining -= take
+        return True
+
+    def _has_spell_tools(self, template) -> bool:
+        """``TotemCategory`` requirement: hammer, pick, knife, ... in bags."""
+        required = [int(category)
+                    for category in getattr(template, "totem_category", ())
+                    if int(category)]
+        if not required:
+            return True
+        path = self.config.database.world_path
+        owned = set()
+        for item in ((self.character or {}).get("inventory") or {}).values():
+            entry = int(item.get("item_entry") or 0)
+            if not entry:
+                continue
+            category, _max_stack = spells.item_tool_fields(path, entry)
+            if category:
+                owned.add(category)
+        for category in required:
+            if not any(
+                    spells.totem_category_compatible(owned_category, category,
+                                                     path)
+                    for owned_category in owned):
+                return False
+        return True
+
+    async def _has_spell_focus(self, template) -> bool:
+        """``RequiresSpellFocus``: an anvil/forge/fire nearby."""
+        focus_id = int(getattr(template, "requires_spell_focus", 0) or 0)
+        if not focus_id:
+            return True
+        if not hasattr(self, "_gameobjects_near"):
+            return False
+        point = self._gameobject_scan_point()
+        if point is None:
+            return False
+        try:
+            spawns = await self._gameobjects_near(point)
+        except Exception as exc:            # map data unavailable
+            self.log.warning(f"Spell focus scan failed: {exc}")
+            return False
+        limit = gameobject.GAMEOBJECT_USE_DISTANCE ** 2
+        focus_type = gameobject.GAMEOBJECT_TYPE_SPELL_FOCUS
+        for spawn in spawns:
+            if int(spawn.get("type") or 0) != focus_type:
+                continue
+            if int(spawn.get("data0") or 0) != focus_id:
+                continue
+            dx = float(spawn.get("x", 0.0)) - float(point[1])
+            dy = float(spawn.get("y", 0.0)) - float(point[2])
+            dz = float(spawn.get("z", 0.0)) - float(point[3])
+            if dx * dx + dy * dy + dz * dz <= limit:
+                return True
+        return False
+
+    def _can_store_create_items(self, template) -> bool:
+        """Cast-time bag-space check for ``CREATE_ITEM[_2]`` effects."""
+        path = self.config.database.world_path
+        for effect in template.effects:
+            if int(effect.get("effect") or 0) not in (
+                    spells.SPELL_EFFECT_CREATE_ITEM,
+                    spells.SPELL_EFFECT_CREATE_ITEM_2):
+                continue
+            item_entry = int(effect.get("item_type") or 0)
+            if not item_entry:
+                continue
+            _category, max_stack = spells.item_tool_fields(path, item_entry)
+            count = min(max(1, int(effect.get("base_points") or 0) + 1),
+                        max_stack)
+            if not character_db.can_add_item_to_inventory(
+                    path, int(self.player_guid), item_entry, count):
+                return False
+        return True
 
     def _spell_power_cost(self, template) -> int:
         """Cost in the same units ``UNIT_FIELD_POWER1`` is stored in.
@@ -1476,6 +1629,7 @@ class SpellsMixin:
         if target_guid and int(target_guid) == self._combo_target():
             combo_points = self._combo_points()
         ground_started = False
+        crafted = False
         aura_patterns: set = set()
         rolls: dict = {}
         weapon_proc_slot = None
@@ -1738,25 +1892,31 @@ class SpellsMixin:
                             min(self._max_power(), current + amount))
                 await self._send_spell_energize_log(
                     victim, player_guid, template.id, power_type, amount)
-            elif etype == spells.SPELL_EFFECT_CREATE_ITEM:
+            elif etype in (spells.SPELL_EFFECT_CREATE_ITEM,
+                           spells.SPELL_EFFECT_CREATE_ITEM_2):
                 item_entry = int(effect.get("item_type") or 0)
                 if not item_entry:
                     continue
-                # Reagent-consuming crafts need the inventory consumption path
-                # before they can safely create their product.
-                if getattr(template, "reagents", ()):
-                    continue
-                count = max(1, int(effect.get("base_points") or 0) + 1)
+                _category, max_stack = spells.item_tool_fields(
+                    self.config.database.world_path, item_entry)
+                count = min(max(1, int(effect.get("base_points") or 0) + 1),
+                            max_stack)
                 changes = await run_db_write(
                     character_db.add_item_to_inventory,
                     self.config.database.world_path, int(self.player_guid),
                     item_entry, count)
                 if changes:
+                    crafted = True
                     if hasattr(self, "_deliver_item_changes"):
                         await self._deliver_item_changes(item_entry, changes)
                 elif hasattr(self, "_send_inventory_failure"):
                     await self._send_inventory_failure(
                         int(getattr(self, "INVENTORY_FULL", 50)))
+            elif etype == spells.SPELL_EFFECT_TRADE_SKILL:
+                continue                    # recipe marker; item effect follows
+            elif etype == spells.SPELL_EFFECT_SKILL:
+                if hasattr(self, "_apply_trainer_skill"):
+                    await self._apply_trainer_skill(template)
             elif etype == spells.SPELL_EFFECT_APPLY_GLYPH:
                 glyph_id = int(effect.get("misc_value") or 0)
                 glyph = spells.get_glyph_properties(
@@ -1872,6 +2032,8 @@ class SpellsMixin:
                         await self._apply_aura_from_effect(
                             template, effect, index, player_guid, aura_target,
                             caster_level, combo_points, target_kind=target_kind)
+        if crafted and hasattr(self, "_advance_craft_skill"):
+            await self._advance_craft_skill(template)
         # Poison/item procs are checked once per weapon ability, not once per
         # effect (a finisher with damage + combo points should only roll once).
         if (weapon_proc_slot and target_guid
@@ -2503,6 +2665,10 @@ class SpellsMixin:
         # The five-second regen rule starts here too (patch 1.4.0), not at cast
         # start, and a spell that cannot be paid for any more simply does not go
         # off (the client still has to be told, hence the GO we skip).
+        if not await self._consume_spell_reagents(template):
+            await self._cast_failed(pending["cast_id"], template.id,
+                                    SPELL_FAILED_REAGENTS)
+            return
         if not await self._take_power(template):
             await self._cast_failed(pending["cast_id"], template.id,
                                     SPELL_FAILED_NO_POWER)

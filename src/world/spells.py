@@ -77,6 +77,7 @@ SPELL_EFFECT_WEAPON_PERCENT_DAMAGE = 31
 SPELL_EFFECT_TRIGGER_MISSILE = 32
 SPELL_EFFECT_APPLY_AREA_AURA_PARTY = 35
 SPELL_EFFECT_DISPEL = 38
+SPELL_EFFECT_TRADE_SKILL = 47
 SPELL_EFFECT_TELEPORT_UNITS = 5
 SPELL_EFFECT_RESURRECT_OLD = 18
 SPELL_EFFECT_ENCHANT_ITEM = 53
@@ -108,9 +109,11 @@ SPELL_EFFECT_SUMMON_OBJECT_SLOT1 = 104
 SPELL_EFFECT_SUMMON_OBJECT_SLOT2 = 105
 SPELL_EFFECT_SUMMON_OBJECT_SLOT3 = 106
 SPELL_EFFECT_SUMMON_OBJECT_SLOT4 = 107
+SPELL_EFFECT_SKILL = 118
 SPELL_EFFECT_TRIGGER_SPELL_WITH_VALUE = 142
 SPELL_EFFECT_APPLY_AREA_AURA_OWNER = 143
 SPELL_EFFECT_TRIGGER_MISSILE_SPELL_WITH_VALUE = 148
+SPELL_EFFECT_CREATE_ITEM_2 = 157
 SPELL_EFFECT_TRIGGER_SPELL_2 = 151
 SPELL_EFFECT_ATTACK_ME = 114
 SPELL_EFFECT_RESURRECT = 113
@@ -566,6 +569,16 @@ class SpellTemplate:
         self.caster_aura_spell = int(_row_get(row, "caster_aura_spell", 0))
         self.target_aura_spell = int(_row_get(row, "target_aura_spell", 0))
         self.requires_spell_focus = int(_row_get(row, "requires_spell_focus", 0))
+        # Tool requirements: ``TotemCategory`` (crafting hammer, mining pick,
+        # skinning knife, ...) and literal totem items consumed by shaman spells.
+        self.totem_category = (
+            int(_row_get(row, "totem_category1", 0)),
+            int(_row_get(row, "totem_category2", 0)),
+        )
+        self.totem_items = (
+            int(_row_get(row, "totem1", 0)),
+            int(_row_get(row, "totem2", 0)),
+        )
         self.facing_caster_flags = int(_row_get(row, "facing_caster_flags", 0))
         self.mana_per_second = int(_row_get(row, "mana_per_second", 0))
         self.mana_per_second_per_level = int(
@@ -588,9 +601,8 @@ class SpellTemplate:
         # ``RuneCostID`` points into ``SpellRuneCost.dbc``.  It is only set for
         # death knight abilities (and a few NPC spells that reuse the field).
         self.rune_cost_id = int(_row_get(row, "rune_cost_id", 0))
-        # Reagent requirements, used by crafting/item-creation spells.  The
-        # consumable path is not wired into casting yet, so item creation is
-        # deliberately limited to spells without reagents.
+        # Reagent requirements, checked at cast start and consumed when the cast
+        # finishes (``Spell::CheckCast`` / ``Spell::TakeReagents``).
         self.reagents = []
         for i in range(1, 9):
             reagent = int(_row_get(row, f"reagent{i}", 0))
@@ -1351,6 +1363,83 @@ def get_glyph_properties(path: str, glyph_id: int) -> Optional[dict]:
     }
 
 
+@lru_cache(maxsize=4096)
+def _skill_line_ability_cached(path: str, spell_id: int):
+    con = sqlite3.connect(path)
+    con.row_factory = sqlite3.Row
+    try:
+        rows = con.execute(
+            "SELECT spell_id, skill_line, race_mask, class_mask, min_rank,"
+            " trivial_high, trivial_low FROM skill_line_ability"
+            " WHERE spell_id = ?", (int(spell_id),)
+        ).fetchall()
+    except sqlite3.OperationalError:
+        rows = []
+    finally:
+        con.close()
+    return tuple(rows)
+
+
+def get_skill_line_ability(path: str, spell_id: int) -> List[dict]:
+    """Profession SkillLineAbility rows for a recipe spell."""
+    return [dict(row) for row in _skill_line_ability_cached(path, int(spell_id))]
+
+
+@lru_cache(maxsize=1024)
+def _totem_categories_cached(path: str):
+    con = sqlite3.connect(path)
+    try:
+        rows = con.execute(
+            "SELECT id, category_type, category_mask FROM totem_categories"
+        ).fetchall()
+    except sqlite3.OperationalError:
+        rows = []
+    finally:
+        con.close()
+    return {int(row[0]): (int(row[1]), int(row[2])) for row in rows}
+
+
+@lru_cache(maxsize=4096)
+def _item_tool_fields_cached(path: str, entry: int) -> tuple:
+    con = sqlite3.connect(path)
+    try:
+        row = con.execute(
+            "SELECT totem_category, stackable FROM item_templates"
+            " WHERE entry = ?", (int(entry),)
+        ).fetchone()
+    except sqlite3.OperationalError:
+        row = None
+    finally:
+        con.close()
+    if row is None:
+        return (0, 1)
+    return (int(row[0] or 0), max(1, int(row[1] or 1)))
+
+
+def item_tool_fields(path: str, entry: int) -> tuple:
+    """``(totem_category, max_stack)`` for an item template."""
+    return _item_tool_fields_cached(path, int(entry))
+
+
+def totem_category_compatible(item_category: int, required_category: int,
+                              path: str) -> bool:
+    """``IsTotemCategoryCompatiableWith`` for crafted-tool requirements."""
+    if not required_category:
+        return True
+    if not item_category:
+        return False
+    categories = _totem_categories_cached(path)
+    item = categories.get(int(item_category))
+    required = categories.get(int(required_category))
+    if item is None or required is None:
+        return int(item_category) == int(required_category)
+    item_type, item_mask = item
+    required_type, required_mask = required
+    if item_type != required_type:
+        return False
+    return (item_mask & required_mask) == required_mask
+
+
 def get_creature_spells(path: str, entry: int) -> List[int]:
     """Fetch the spell IDs a creature can cast.
 
@@ -1522,6 +1611,8 @@ def clear_caches() -> None:
                    _creature_spell_targeting_cached,
                    _spell_target_position_cached,
                    _glyph_properties_cached,
+                   _skill_line_ability_cached,
+                   _totem_categories_cached, _item_tool_fields_cached,
                    get_creature_base_mana, get_rune_cost):
         cached.cache_clear()
 

@@ -34,6 +34,8 @@ SUPPORTED_EFFECTS = frozenset((
     spells.SPELL_EFFECT_WEAPON_DAMAGE_NOSCHOOL,
     spells.SPELL_EFFECT_QUEST_COMPLETE,
     spells.SPELL_EFFECT_CREATE_ITEM,
+    spells.SPELL_EFFECT_CREATE_ITEM_2,
+    spells.SPELL_EFFECT_TRADE_SKILL,
     spells.SPELL_EFFECT_PERSISTENT_AREA_AURA,
     spells.SPELL_EFFECT_SUMMON,
     spells.SPELL_EFFECT_ENERGIZE,
@@ -42,6 +44,7 @@ SUPPORTED_EFFECTS = frozenset((
     spells.SPELL_EFFECT_APPLY_AREA_AURA_PARTY,
     spells.SPELL_EFFECT_OPEN_LOCK,
     spells.SPELL_EFFECT_LEARN_SPELL,
+    spells.SPELL_EFFECT_SKILL,
     spells.SPELL_EFFECT_SKILL_STEP,
     spells.SPELL_EFFECT_DISPEL,
     spells.SPELL_EFFECT_ENCHANT_ITEM,
@@ -117,10 +120,9 @@ def audit(path: str) -> dict:
     try:
         rows = con.execute(
             "SELECT id, name, effect1, effect2, effect3,"
+            " effect_item_type1, effect_item_type2, effect_item_type3,"
             " effect_apply_aura_name1, effect_apply_aura_name2,"
-            " effect_apply_aura_name3,"
-            " reagent1, reagent2, reagent3, reagent4,"
-            " reagent5, reagent6, reagent7, reagent8"
+            " effect_apply_aura_name3"
             " FROM spell_templates").fetchall()
     finally:
         con.close()
@@ -147,12 +149,14 @@ def audit(path: str) -> dict:
                 spell_unsupported = True
                 reasons[f"effect {effect} {_effect_name(effect)}".strip()] += 1
                 continue
-            if (effect == spells.SPELL_EFFECT_CREATE_ITEM
-                    and any(int(row[f"reagent{i}"] or 0)
-                            for i in range(1, 9))):
-                spell_unsupported = True
-                reasons["CreateItem with reagents"] += 1
-                continue
+            if effect in (spells.SPELL_EFFECT_CREATE_ITEM,
+                          spells.SPELL_EFFECT_CREATE_ITEM_2):
+                item_type = int(row[f"effect_item_type{index}"] or 0)
+                if not item_type:
+                    # Random-loot research spells need spell_loot_template.
+                    spell_unsupported = True
+                    reasons[f"effect {effect} without item"] += 1
+                    continue
             if effect in (spells.SPELL_EFFECT_APPLY_AURA,
                           spells.SPELL_EFFECT_PERSISTENT_AREA_AURA):
                 aura = int(row[f"effect_apply_aura_name{index}"] or 0)

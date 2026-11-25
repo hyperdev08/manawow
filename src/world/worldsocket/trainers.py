@@ -1,6 +1,7 @@
 """NPC spell trainers: list, prerequisites and buying spells."""
 from __future__ import annotations
 
+import random
 import struct
 
 from src.common.db_io import run_db_write
@@ -85,6 +86,15 @@ class TrainersMixin:
         """Apply ``SPELL_EFFECT_SKILL_STEP`` from a profession/riding wrapper."""
         skill_id, step = trainer.skill_step_from_template(template)
         if not skill_id or not step:
+            # ``SPELL_EFFECT_SKILL`` (118) is used by the profession/riding
+            # acquisition spells instead of SKILL_STEP.  ``EffectBasePoints``
+            # carries the rank (riding: 0 = apprentice ... 3 = artisan).
+            for effect in template.effects:
+                if int(effect.get("effect") or 0) == 118:
+                    skill_id = int(effect.get("misc_value") or 0)
+                    step = min(6, max(1, int(effect.get("base_points") or 0) + 1))
+                    break
+        if not skill_id or not step:
             return
         skills = self._player_skills()
         current = skills.get(int(skill_id)) or {}
@@ -113,6 +123,60 @@ class TrainersMixin:
         )
         self.log.info(
             f"Learned skill {skill_id} rank {step} ({value}/{maximum})")
+
+    async def _advance_craft_skill(self, template) -> None:
+        """Award a profession skill point after a successful craft."""
+        if not self.character or not self.player_guid:
+            return
+        rows = spells.get_skill_line_ability(
+            self.config.database.world_path, int(template.id))
+        if not rows:
+            return
+        char_class = max(1, int(self.character.get("class", 1) or 1))
+        char_race = max(1, int(self.character.get("race", 1) or 1))
+        for row in rows:
+            class_mask = int(row.get("class_mask") or 0)
+            race_mask = int(row.get("race_mask") or 0)
+            if class_mask and not (class_mask & (1 << (char_class - 1))):
+                continue
+            if race_mask and not (race_mask & (1 << (char_race - 1))):
+                continue
+            skill_id = int(row.get("skill_line") or 0)
+            skills = self._player_skills()
+            current = skills.get(skill_id)
+            if current is None:
+                continue
+            value = int(current.get("value", 0) or 0)
+            maximum = int(current.get("max_value", 0) or 0)
+            if maximum and value >= maximum:
+                return
+            low = int(row.get("trivial_low") or 0)
+            high = int(row.get("trivial_high") or 0)
+            middle = (high + low) // 2
+            # ``SkillGainChance``: orange 100%, yellow 75%, green 25%, grey 0.
+            if value >= high:
+                chance = 0.0
+            elif value >= middle:
+                chance = 25.0
+            elif value >= low:
+                chance = 75.0
+            else:
+                chance = 100.0
+            if chance <= 0.0 or random.uniform(0.0, 100.0) >= chance:
+                return
+            value += 1
+            current["value"] = value
+            await self._send_player_fields(
+                object_update.skill_field_values(self.character, skill_id))
+            await run_db_write(
+                character_db.set_character_skill,
+                self.config.database.world_path, int(self.player_guid),
+                skill_id, int(current.get("slot", -1) or -1), value,
+                maximum, int(current.get("step", 0) or 0),
+            )
+            self.log.info(
+                f"Craft skill {skill_id} advanced to {value}/{maximum}")
+            return
 
     async def _apply_trainer_proficiency(self, template) -> None:
         """Apply ``SPELL_EFFECT_PROFICIENCY`` (weapon/armour masks)."""

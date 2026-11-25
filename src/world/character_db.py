@@ -1909,6 +1909,47 @@ def create_character_items(path: str, character_guid: int, items: List[Tuple[int
         con.close()
 
 
+def can_add_item_to_inventory(path: str, character_guid: int, entry: int,
+                              count: int = 1) -> bool:
+    """Whether :func:`add_item_to_inventory` could store ``count`` items.
+
+    Mirrors the capacity rules of that function without writing anything, so a
+    craft can be rejected before its reagents are consumed.
+    """
+    con = _connect(path)
+    try:
+        template = con.execute(
+            "SELECT stackable FROM item_templates WHERE entry = ?",
+            (entry,),
+        ).fetchone()
+        if template is None:
+            return False
+        stackable = max(1, int(template[0] or 1))
+        remaining = max(1, int(count))
+        rows = con.execute(
+            "SELECT slot, stack_count, item_entry FROM character_items "
+            "WHERE character_guid = ?",
+            (character_guid,),
+        ).fetchall()
+        used = {int(row[0]) for row in rows}
+        if stackable > 1:
+            for slot, stack_count, row_entry in rows:
+                slot = int(slot)
+                if (int(row_entry) != int(entry)
+                        or not (256 <= slot <= 271)):
+                    continue
+                free = stackable - int(stack_count or 1)
+                if free <= 0:
+                    continue
+                remaining -= min(remaining, free)
+                if remaining <= 0:
+                    return True
+        free_slots = sum(1 for slot in range(256, 272) if slot not in used)
+        return (remaining + stackable - 1) // stackable <= free_slots
+    finally:
+        con.close()
+
+
 def add_item_to_inventory(path: str, character_guid: int, entry: int,
                           count: int = 1) -> Optional[List[Dict]]:
     """Store ``count`` of ``entry`` in the character's backpack.

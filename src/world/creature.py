@@ -495,6 +495,24 @@ CREATE TABLE IF NOT EXISTS spell_templates(
   attributes_serverside INTEGER NOT NULL DEFAULT 0
 );
 
+CREATE TABLE IF NOT EXISTS skill_line_ability(
+  spell_id INTEGER NOT NULL,
+  skill_line INTEGER NOT NULL,
+  race_mask INTEGER NOT NULL DEFAULT 0,
+  class_mask INTEGER NOT NULL DEFAULT 0,
+  min_rank INTEGER NOT NULL DEFAULT 0,
+  trivial_high INTEGER NOT NULL DEFAULT 0,
+  trivial_low INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_skill_line_ability_spell
+  ON skill_line_ability(spell_id);
+
+CREATE TABLE IF NOT EXISTS totem_categories(
+  id INTEGER PRIMARY KEY,
+  category_type INTEGER NOT NULL DEFAULT 0,
+  category_mask INTEGER NOT NULL DEFAULT 0
+);
+
 CREATE TABLE IF NOT EXISTS glyph_properties(
   id INTEGER PRIMARY KEY,
   spell_id INTEGER NOT NULL DEFAULT 0,
@@ -852,6 +870,10 @@ _SPELL_ENCHANT_SQL = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "spell_item_enchantment.sql")
 _GLYPH_PROPERTIES_SQL = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "glyph_properties.sql")
+_SKILL_LINE_ABILITY_SQL = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "skill_line_ability.sql")
+_TOTEM_CATEGORIES_SQL = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "totem_categories.sql")
 
 
 def _seed_spell_item_enchantment(con: sqlite3.Connection) -> None:
@@ -880,6 +902,31 @@ def _seed_glyph_properties(con: sqlite3.Connection) -> None:
     if not os.path.exists(_GLYPH_PROPERTIES_SQL):
         return
     with open(_GLYPH_PROPERTIES_SQL, encoding="utf-8") as handle:
+        con.executescript(handle.read())
+    con.commit()
+
+
+def _seed_skill_line_ability(con: sqlite3.Connection) -> None:
+    """Load bundled profession rows from SkillLineAbility.dbc."""
+    count = con.execute(
+        "SELECT COUNT(*) FROM skill_line_ability").fetchone()[0]
+    if count:
+        return
+    if not os.path.exists(_SKILL_LINE_ABILITY_SQL):
+        return
+    with open(_SKILL_LINE_ABILITY_SQL, encoding="utf-8") as handle:
+        con.executescript(handle.read())
+    con.commit()
+
+
+def _seed_totem_categories(con: sqlite3.Connection) -> None:
+    """Load bundled TotemCategory.dbc rows (crafting tool categories)."""
+    count = con.execute("SELECT COUNT(*) FROM totem_categories").fetchone()[0]
+    if count:
+        return
+    if not os.path.exists(_TOTEM_CATEGORIES_SQL):
+        return
+    with open(_TOTEM_CATEGORIES_SQL, encoding="utf-8") as handle:
         con.executescript(handle.read())
     con.commit()
 
@@ -942,6 +989,8 @@ def init_creature_db(path: str) -> None:
         _seed_playercreateinfo(con)
         _seed_spell_item_enchantment(con)
         _seed_glyph_properties(con)
+        _seed_skill_line_ability(con)
+        _seed_totem_categories(con)
         if con.execute("SELECT COUNT(*) FROM creature_spawns").fetchone()[0]:
             con.commit()
             return

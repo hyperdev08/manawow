@@ -3,11 +3,13 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
+import struct
 import types
 
 from src.common.config import AuthConfig, Config, DBConfig, LogConfig, WorldConfig
 from src.protocol.opcodes import Opcodes
 from src.world import character_db, creature, gameobject, spells
+from src.world import update_fields as F
 from src.world.groups import Group, GroupMember
 from src.world.realmsocket import WorldSocket
 
@@ -130,6 +132,48 @@ def _socket(tmp_path):
             " effect_radius_index1, duration_index)"
             " VALUES(411, 'Raid Aura Test', 65, 99, 10, 1, 12, 1)")
         con.execute(
+            "INSERT OR REPLACE INTO item_templates"
+            "(entry, name1, stackable, display_id, quality)"
+            " VALUES(6000, 'Craft Reagent', 20, 100, 1)")
+        con.execute(
+            "INSERT OR REPLACE INTO item_templates"
+            "(entry, name1, stackable, display_id, quality)"
+            " VALUES(6001, 'Crafted Product', 20, 101, 1)")
+        con.execute(
+            "INSERT OR REPLACE INTO spell_templates"
+            "(id, name, effect1, effect_item_type1, reagent1,"
+            " reagent_count1, attributes)"
+            " VALUES(412, 'Craft Test', 24, 6001, 6000, 2, 32)")
+        con.execute(
+            "INSERT OR REPLACE INTO skill_line_ability"
+            "(spell_id, skill_line, race_mask, class_mask, min_rank,"
+            " trivial_high, trivial_low)"
+            " VALUES(412, 165, 0, 0, 0, 60, 30)")
+        con.execute(
+            "INSERT OR REPLACE INTO spell_templates"
+            "(id, name, effect1, effect_misc_value1, effect_base_points1)"
+            " VALUES(413, 'Journeyman Riding Test', 118, 762, 1)")
+        con.execute(
+            "INSERT OR REPLACE INTO spell_templates"
+            "(id, name, effect1, effect_item_type1)"
+            " VALUES(414, 'Create Item 2 Test', 157, 6001)")
+        con.execute(
+            "INSERT OR REPLACE INTO spell_templates"
+            "(id, name, effect1, effect_item_type1, requires_spell_focus)"
+            " VALUES(415, 'Focus Craft Test', 24, 6001, 1)")
+        con.execute(
+            "INSERT OR REPLACE INTO spell_templates"
+            "(id, name, effect1, effect_item_type1, totem_category1)"
+            " VALUES(416, 'Tool Craft Test', 24, 6001, 162)")
+        con.execute(
+            "INSERT OR REPLACE INTO item_templates"
+            "(entry, name1, stackable, display_id, quality, totem_category)"
+            " VALUES(6002, 'Test Hammer', 1, 102, 1, 162)")
+        con.execute(
+            "INSERT OR REPLACE INTO item_templates"
+            "(entry, name1, stackable, display_id, quality, totem_category)"
+            " VALUES(6003, 'Test Pick', 1, 103, 1, 165)")
+        con.execute(
             "INSERT OR REPLACE INTO gameobject_templates"
             "(entry, type, display_id, name, size, faction, flags)"
             " VALUES(5000, 6, 100, 'Trap', 1.0, 0, 0)")
@@ -213,6 +257,180 @@ def test_skill_step_and_proficiency_effects_persist(tmp_path):
             con.close()
         assert skill == (1,)
         assert proficiency == (32,)
+
+    asyncio.run(flow())
+
+
+def test_skill_effect_sets_rank_and_create_item_2(tmp_path):
+    async def flow():
+        socket, db, _sent, delivered = _socket(tmp_path)
+        socket.character["skills"] = {}
+        await socket._apply_spell_effects(
+            None, spells.get_spell_template(db, 413), 0)
+        riding = socket.character["skills"][762]
+        assert riding["step"] == 2
+        assert riding["max_value"] == 150
+
+        await socket._apply_spell_effects(
+            None, spells.get_spell_template(db, 414), 0)
+        assert delivered and delivered[-1][0] == 6001
+        con = sqlite3.connect(db)
+        try:
+            row = con.execute(
+                "SELECT stack_count FROM character_items"
+                " WHERE character_guid = 1 AND item_entry = 6001").fetchone()
+        finally:
+            con.close()
+        assert row == (1,)
+
+    asyncio.run(flow())
+
+
+def _load_inventory(socket, db):
+    inventory = character_db.get_character_inventory(db, 1)
+    socket.character["inventory"] = {
+        int(slot): {**dict(item),
+                    "guid": F.ITEM_HIGH_GUID | int(item["id"])}
+        for slot, item in inventory.items()
+    }
+
+
+def _last_failure(sent):
+    failures = [payload for opcode, payload in sent
+                if opcode == int(Opcodes.SMSG_CAST_FAILED)]
+    return failures[-1][5] if failures else None
+
+
+def test_casting_requires_spell_focus_and_tools(tmp_path):
+    async def flow():
+        socket, db, sent, _delivered = _socket(tmp_path)
+        socket.known_spell_ids = {415, 416}
+        spawns = []
+
+        async def gameobjects_near(_point):
+            return list(spawns)
+
+        socket._gameobjects_near = gameobjects_near
+
+        await socket.handle_cast_spell(struct.pack("<BiBI", 1, 415, 0, 0))
+        assert _last_failure(sent) == 102
+
+        spawns.append({"type": 8, "data0": 1, "x": 1.0, "y": 0.0, "z": 0.0})
+        sent.clear()
+        await socket.handle_cast_spell(struct.pack("<BiBI", 2, 415, 0, 0))
+        assert _last_failure(sent) is None
+
+        # A hammer (162) is required; a mining pick (165) is not compatible.
+        con = sqlite3.connect(db)
+        try:
+            con.execute(
+                "DELETE FROM character_items WHERE character_guid = 1")
+            con.commit()
+        finally:
+            con.close()
+        assert character_db.add_item_to_inventory(db, 1, 6003, 1)
+        _load_inventory(socket, db)
+        sent.clear()
+        await socket.handle_cast_spell(struct.pack("<BiBI", 3, 416, 0, 0))
+        assert _last_failure(sent) == 130
+
+        con = sqlite3.connect(db)
+        try:
+            pick_slot = con.execute(
+                "SELECT slot FROM character_items"
+                " WHERE character_guid = 1 AND item_entry = 6003").fetchone()[0]
+        finally:
+            con.close()
+        character_db.delete_character_item(db, 1, int(pick_slot))
+        assert character_db.add_item_to_inventory(db, 1, 6002, 1)
+        _load_inventory(socket, db)
+        sent.clear()
+        await socket.handle_cast_spell(struct.pack("<BiBI", 4, 416, 0, 0))
+        assert _last_failure(sent) is None
+
+    asyncio.run(flow())
+
+
+def test_full_bag_fails_create_item_without_consuming_reagents(tmp_path):
+    async def flow():
+        socket, db, sent, _delivered = _socket(tmp_path)
+        # The reagent stack fills one slot; single-item stacks fill the rest, so
+        # the reagent requirement is met but the product cannot be stored.
+        con = sqlite3.connect(db)
+        try:
+            con.execute(
+                "INSERT INTO character_items(character_guid, item_entry, slot,"
+                " stack_count) VALUES(1, 6000, 256, 2)")
+            for slot in range(257, 272):
+                con.execute(
+                    "INSERT INTO character_items(character_guid, item_entry,"
+                    " slot, stack_count) VALUES(1, 6003, ?, 1)", (slot,))
+            con.commit()
+        finally:
+            con.close()
+        _load_inventory(socket, db)
+        assert not character_db.can_add_item_to_inventory(db, 1, 6001, 1)
+        socket.known_spell_ids = {412}
+        socket.character["skills"] = {
+            165: {"slot": 1, "value": 10, "max_value": 75, "step": 1}
+        }
+        await socket.handle_cast_spell(struct.pack("<BiBI", 1, 412, 0, 0))
+        assert _last_failure(sent) is None
+        con = sqlite3.connect(db)
+        try:
+            reagents = con.execute(
+                "SELECT SUM(stack_count) FROM character_items"
+                " WHERE character_guid = 1 AND item_entry = 6000").fetchone()
+            products = con.execute(
+                "SELECT COUNT(*) FROM character_items"
+                " WHERE character_guid = 1 AND item_entry = 6001").fetchone()
+        finally:
+            con.close()
+        assert reagents == (2,)          # untouched on failure
+        assert products == (0,)
+        assert socket.character["skills"][165]["value"] == 10
+
+    asyncio.run(flow())
+
+
+def test_crafting_consumes_reagents_creates_item_and_skills_up(tmp_path):
+    async def flow():
+        socket, db, sent, _delivered = _socket(tmp_path)
+        changes = character_db.add_item_to_inventory(db, 1, 6000, 3)
+        assert changes
+        inventory = character_db.get_character_inventory(db, 1)
+        socket.character["inventory"] = {
+            int(slot): {**dict(item),
+                        "guid": F.ITEM_HIGH_GUID | int(item["id"])}
+            for slot, item in inventory.items()
+        }
+        socket.character["skills"] = {
+            165: {"slot": 1, "value": 10, "max_value": 75, "step": 1}
+        }
+        socket.known_spell_ids = {412}
+        await socket.handle_cast_spell(struct.pack("<BiBI", 1, 412, 0, 0))
+        assert sent
+        con = sqlite3.connect(db)
+        try:
+            reagent = con.execute(
+                "SELECT stack_count FROM character_items"
+                " WHERE character_guid = 1 AND item_entry = 6000").fetchone()
+            product = con.execute(
+                "SELECT stack_count FROM character_items"
+                " WHERE character_guid = 1 AND item_entry = 6001").fetchone()
+        finally:
+            con.close()
+        assert reagent == (1,)
+        assert product == (1,)
+        assert socket.character["skills"][165]["value"] == 11
+
+        # Missing reagents must fail before creating anything.
+        socket.character["inventory"].clear()
+        sent.clear()
+        await socket.handle_cast_spell(struct.pack("<BiBI", 2, 412, 0, 0))
+        failures = [payload for opcode, payload in sent
+                    if opcode == int(Opcodes.SMSG_CAST_FAILED)]
+        assert failures and failures[-1][5] == 100
 
     asyncio.run(flow())
 
