@@ -21,6 +21,9 @@ Examples::
     # Everything the mirror has for a map (large!)
     python tools/fetch_client_data.py --map 0 --all-map
 
+    # Only the small client DBCs (flight paths); every run fetches them too
+    python tools/fetch_client_data.py --dbc-only
+
 Only static WMO geometry (``.wmo.vmo``) is downloaded for selected tiles.  M2
 models use their placement bounds for line of sight, so their per-model files
 are optional and skipped by default.
@@ -46,6 +49,7 @@ from src.world.client_data import (  # noqa: E402
     vmap_tile_name,
     vmap_tree_name,
 )
+from src.world.taxi import DBC_FILES  # noqa: E402
 from src.world.vmap import load_vmap_tile, load_vmap_tree_globals  # noqa: E402
 
 DEFAULT_SOURCE = (
@@ -75,6 +79,8 @@ def _validate(path: str, rel: str) -> bool:
         return head[:4] == b"PAMM"
     if rel.endswith((".vmtile", ".vmtree", ".vmo")):
         return head.startswith(b"VMAP_")
+    if rel.endswith(".dbc"):
+        return head[:4] == b"WDBC"
     return True
 
 
@@ -201,6 +207,13 @@ def fetch_tile_set(source: str, data_dir: str, map_id: int,
                      quiet=True)
 
 
+def fetch_dbc_files(source: str, data_dir: str, force: bool = False) -> None:
+    """The client DBCs the server reads at runtime (flight paths)."""
+    log("Client DBCs")
+    for name in DBC_FILES:
+        download(source, f"dbc/{name}", data_dir, force=force, quiet=True)
+
+
 def fetch_entire_map(source: str, data_dir: str, map_id: int,
                      force: bool = False) -> None:
     log(f"Listing source tree for map {map_id} ...")
@@ -258,6 +271,8 @@ def main(argv=None) -> int:
                         help="download every file the mirror has for the map")
     parser.add_argument("--with-m2", action="store_true",
                         help="also download M2 .vmo files (not needed for LOS)")
+    parser.add_argument("--dbc-only", action="store_true",
+                        help="only download the client DBCs (flight paths)")
     parser.add_argument("--force", action="store_true",
                         help="re-download files that already exist")
     args = parser.parse_args(argv)
@@ -274,7 +289,8 @@ def main(argv=None) -> int:
             parser.error(f"invalid --tile {value!r}; expected X,Y")
         explicit_tiles.append((tile_x, tile_y))
 
-    maps = args.map or [STARTER_MAP]
+    fetch_dbc_files(args.source, args.data_dir, force=args.force)
+    maps = [] if args.dbc_only else (args.map or [STARTER_MAP])
     for map_id in maps:
         if args.all_map:
             fetch_entire_map(args.source, args.data_dir, map_id,

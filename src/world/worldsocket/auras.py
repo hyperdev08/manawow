@@ -980,8 +980,10 @@ class AurasMixin:
             flags |= UNIT_FLAG_SILENCED
         if mods["pacified"]:
             flags |= UNIT_FLAG_PACIFIED
-        if int(state.get("flags", 0)) & 0x00000400:      # UNIT_FLAG_LOOTING
-            flags |= 0x00000400
+        # Kept from the current flags: UNIT_FLAG_LOOTING and the taxi-flight
+        # flags (REMOVE_CLIENT_CONTROL | TAXI_FLIGHT | MOUNT), which auras do
+        # not own.
+        flags |= int(state.get("flags", 0)) & 0x08000504
         if flags != state.get("flags"):
             state["flags"] = flags
             await self._send_player_fields({F.UNIT_FIELD_FLAGS: flags})
