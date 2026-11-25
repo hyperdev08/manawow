@@ -7,6 +7,7 @@ import sqlite3
 import struct
 import time
 
+from src.common.db_io import run_db_write
 from src.protocol.opcodes import Opcodes
 from src.world import creature
 from src.world import geometry
@@ -27,17 +28,19 @@ class TaxiMixin:
         return taxi.get_taxi_data(geometry.configured_data_dir(self.config) or "")
 
     def _taxi_db_path(self) -> str:
-        # characters.db once world and character data are split.
-        database = self.config.database
-        return getattr(database, "character_path", "") or database.world_path
+        # The world path; databases.connect_character routes it to
+        # characters.db when world and character data are split.
+        return self.config.database.world_path
 
     def _taxi_alliance(self) -> bool:
         return taxi.is_alliance(int(self.character.get("race", 1)))
 
-    def _taxi_known(self) -> set:
+    async def _taxi_known(self) -> set:
         known = getattr(self, "_taxi_known_nodes", None)
         if known is None:
-            known = taxi.load_known_nodes(
+            # Seeds the race's starting nodes on first load, so it is a write.
+            known = await run_db_write(
+                taxi.load_known_nodes,
                 self._taxi_db_path(), int(self.player_guid),
                 int(self.character.get("race", 1)),
                 int(self.character.get("level", 1)))
@@ -71,11 +74,12 @@ class TaxiMixin:
 
     async def _learn_taxi_node(self, guid: int, node: int) -> bool:
         """``WorldSession::SendLearnNewTaxiNode``: True when ``node`` was new."""
-        known = self._taxi_known()
+        known = await self._taxi_known()
         if not node or node in known:
             return False
         known.add(node)
-        taxi.save_known_node(self._taxi_db_path(), int(self.player_guid), node)
+        await run_db_write(taxi.save_known_node, self._taxi_db_path(),
+                           int(self.player_guid), node)
         await self.send_packet(Opcodes.SMSG_NEW_TAXI_PATH, b"")
         await self.send_packet(Opcodes.SMSG_TAXINODE_STATUS,
                                taxi.build_taxinode_status(guid, True))
@@ -92,7 +96,7 @@ class TaxiMixin:
         await self._learn_taxi_node(guid, node)
         await self.send_packet(
             Opcodes.SMSG_SHOWTAXINODES,
-            taxi.build_show_taxi_nodes(guid, node, self._taxi_known()))
+            taxi.build_show_taxi_nodes(guid, node, (await self._taxi_known())))
 
     # ------------------------------------------------------------------
     # Handlers
@@ -107,7 +111,7 @@ class TaxiMixin:
             return
         await self.send_packet(
             Opcodes.SMSG_TAXINODE_STATUS,
-            taxi.build_taxinode_status(guid, node in self._taxi_known()))
+            taxi.build_taxinode_status(guid, node in (await self._taxi_known())))
 
     async def handle_taxi_query_available_nodes(self, data: bytes):
         """``CMSG_TAXIQUERYAVAILABLENODES``: right-click on a flight master."""
@@ -126,7 +130,7 @@ class TaxiMixin:
             spawn = self._flight_master(guid)
             if spawn is not None and self._taxi_data() is not None:
                 node = self._flight_master_node(guid, spawn)
-                if node and node not in self._taxi_known():
+                if node and node not in (await self._taxi_known()):
                     await self._send_taxi_menu(guid)
                     return
         await super().handle_gossip_hello(data)
@@ -180,7 +184,7 @@ class TaxiMixin:
         if nodes[0] == nodes[-1]:
             await self._taxi_reply(taxi.ERR_TAXISAMENODE)
             return
-        known = self._taxi_known()
+        known = await self._taxi_known()
         if any(node not in known for node in nodes):
             await self._taxi_reply(taxi.ERR_TAXINOTVISITED)
             return

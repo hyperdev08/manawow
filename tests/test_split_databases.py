@@ -206,3 +206,45 @@ def test_configure_with_same_path_is_combined(tmp_path):
     character_db.configure(path, path)
     assert not databases.is_split()
     assert databases.character_path(path) == path
+
+
+def test_taxi_nodes_live_in_the_character_store(tmp_path):
+    from src.world import taxi
+
+    world = str(tmp_path / "world.db")
+    characters = str(tmp_path / "characters.db")
+
+    # Bogalis-style legacy data: discovered flight nodes in the old world.db.
+    creature.init_creature_db(world)
+    character_db.init_character_db(world)
+    quests.init_quest_db(world)
+    con = sqlite3.connect(world)
+    con.execute(
+        "INSERT INTO characters(guid, account_id, name, race, class, level)"
+        " VALUES(41, 1, 'Bogalis', 1, 2, 5)")
+    con.executemany(
+        "INSERT INTO character_taxi_nodes(guid, node) VALUES(41, ?)",
+        [(2,), (5,)])
+    con.commit()
+    con.close()
+
+    character_db.configure(world, characters)
+    character_db.init_split_databases(world, characters)
+
+    # The server passes the world path; it must be routed to characters.db.
+    taxi.save_known_node(world, 41, 6)
+    assert {2, 5, 6} <= taxi.load_known_nodes(world, 41, race=1, level=5)
+    store = sqlite3.connect(characters)
+    try:
+        assert {row[0] for row in store.execute(
+            "SELECT node FROM character_taxi_nodes WHERE guid = 41")} >= {2, 5, 6}
+    finally:
+        store.close()
+
+    assert character_db.delete_character(world, 1, 41)
+    store = sqlite3.connect(characters)
+    try:
+        assert store.execute(
+            "SELECT COUNT(*) FROM character_taxi_nodes").fetchone()[0] == 0
+    finally:
+        store.close()

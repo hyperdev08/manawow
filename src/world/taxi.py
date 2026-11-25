@@ -30,6 +30,7 @@ import struct
 from dataclasses import dataclass, field
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
+from src.world import databases
 from src.world.object_update import (
     MONSTER_MOVE_NORMAL,
     MONSTER_MOVE_STOP,
@@ -365,12 +366,19 @@ CREATE TABLE IF NOT EXISTS character_taxi_nodes(
 
 
 def ensure_schema(con: sqlite3.Connection) -> None:
+    # character_db creates the table with the rest of the character store;
+    # this keeps standalone test/tool databases working too.
     con.execute(_SCHEMA)
 
 
 def load_known_nodes(path: str, guid: int, race: int, level: int) -> set:
-    """The character's discovered nodes; seeded with its race's defaults."""
-    con = sqlite3.connect(path)
+    """The character's discovered nodes; seeded with its race's defaults.
+
+    ``path`` is the world path the server passes around; the connection is
+    routed to characters.db when the databases are split.  The race defaults
+    are written on first load, so call it through ``run_db_write``.
+    """
+    con = databases.connect_character(path)
     try:
         ensure_schema(con)
         rows = con.execute(
@@ -390,7 +398,7 @@ def load_known_nodes(path: str, guid: int, race: int, level: int) -> set:
 
 
 def save_known_node(path: str, guid: int, node: int) -> None:
-    con = sqlite3.connect(path)
+    con = databases.connect_character(path)
     try:
         ensure_schema(con)
         con.execute(
