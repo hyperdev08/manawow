@@ -304,14 +304,16 @@ class TaxiMixin:
         self._taxi_flight = None
         x, y, z = flight["track"].destination
         self.character["x"], self.character["y"], self.character["z"] = x, y, z
+        # Save before the landing packet goes out, so anything the client does
+        # after seeing it lands already finds the character at the node.
+        result = self.persist_position(force=True)
+        if inspect.isawaitable(result):
+            await result
         await self._set_flight_fields(0, False)
         stop = taxi.build_move_stop(int(self.player_guid), (x, y, z),
                                     move_id=self._next_move_id())
         await self.send_packet(Opcodes.SMSG_MONSTER_MOVE, stop)
         await self.send_packet_to_peers(Opcodes.SMSG_MONSTER_MOVE, stop)
-        result = self.persist_position(force=True)
-        if inspect.isawaitable(result):
-            await result
         await self.refresh_creature_visibility(force=True)
         self.log.info(f"'{self.character['name']}' landed at node {flight['route'].nodes[-1]}")
 
