@@ -44,6 +44,80 @@ class GameObjectsMixin:
         state = self._go_runtime().state(int(spawn["guid"]))
         return gameobject.initial_state(spawn) if state is None else state
 
+    # ------------------------------------------------------------------
+    # Spell-summoned game objects (traps, chests, ritual objects)
+    # ------------------------------------------------------------------
+    def _summoned_gameobjects(self) -> dict:
+        if not hasattr(self, "_summoned_objects"):
+            self._summoned_objects = {}
+        return self._summoned_objects
+
+    def _next_gameobject_low(self) -> int:
+        objects = self._summoned_gameobjects()
+        counter = int(getattr(self, "_gameobject_serial", 0) or 0)
+        if not 0xE00000 <= counter <= 0xFFFFFF:
+            counter = 0xE00000
+        for _ in range(0xFFFFFF - 0xE00000 + 1):
+            if counter not in objects:
+                self._gameobject_serial = counter + 1
+                return counter
+            counter = 0xE00000 if counter >= 0xFFFFFF else counter + 1
+        raise RuntimeError("no free gameobject guid for a summon")
+
+    async def _summon_gameobject(self, entry: int, x: float, y: float,
+                                 z: float, o: float,
+                                 duration_ms: int = -1) -> int | None:
+        template = gameobject.get_gameobject_template(
+            self.config.database.world_path, int(entry))
+        if template is None:
+            self.log.debug(f"Summon gameobject entry {entry} is not imported")
+            return None
+        low = self._next_gameobject_low()
+        spawn = dict(template)
+        spawn.update({
+            "guid": low,
+            "entry": int(entry),
+            "map": int(self.character.get("map", 0) or 0),
+            "phase_mask": 1,
+            "x": float(x), "y": float(y), "z": float(z), "o": float(o),
+            "rotation0": 0.0, "rotation1": 0.0,
+            "rotation2": 0.0, "rotation3": 0.0,
+            "spawn_time_min": 0, "spawn_time_max": 0,
+            "anim_progress": gameobject.GO_ANIMPROGRESS_DEFAULT,
+            "state": -1,
+            "expires": (None if duration_ms is None or duration_ms <= 0
+                        else time.monotonic() + duration_ms / 1000.0),
+        })
+        self._summoned_gameobjects()[low] = spawn
+        packet = gameobject.build_gameobject_update([spawn])
+        if packet is not None:
+            opcode, payload = packet
+            await self.send_packet(opcode, payload)
+            await self.send_packet_to_peers(opcode, payload)
+        self.log.info(
+            f"'{self.character.get('name')}' summons gameobject "
+            f"{entry} ({template.get('name', '')}) at guid {low}")
+        return low
+
+    async def _dismiss_gameobject(self, low: int) -> None:
+        spawn = self._summoned_gameobjects().pop(int(low), None)
+        if spawn is None:
+            return
+        guid = gameobject.gameobject_guid(int(low), int(spawn["entry"]))
+        payload = login_packets.build_destroy_object(guid)
+        await self.send_packet(Opcodes.SMSG_DESTROY_OBJECT, payload)
+        await self.send_packet_to_peers(Opcodes.SMSG_DESTROY_OBJECT, payload)
+
+    async def _dismiss_all_gameobjects(self) -> None:
+        for low in list(self._summoned_gameobjects()):
+            await self._dismiss_gameobject(int(low))
+
+    async def _summoned_objects_tick(self, now: float) -> None:
+        for low, spawn in list(self._summoned_gameobjects().items()):
+            expires = spawn.get("expires")
+            if expires is not None and now >= float(expires):
+                await self._dismiss_gameobject(int(low))
+
     def _go_dynamic(self, spawn) -> int:
         """Per-player ``GAMEOBJECT_DYNAMIC`` (TrinityCore ``BuildValuesUpdate``).
 

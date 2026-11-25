@@ -677,8 +677,10 @@ class CreaturesMixin:
                 )
                 # Creature auto-attacks are normal-school melee, the only
                 # damage source that fills a warrior's rage bar.
-                await self._damage_player(damage, str(spawn["name"]),
-                                          physical=True)
+                await self._damage_player(
+                    damage, str(spawn["name"]), physical=True,
+                    attacker_guid=self._creature_object_guid(
+                        int(low_guid), int(spawn["entry"])))
                 if hasattr(self, "_break_cc_on_damage"):
                     await self._break_cc_on_damage(
                         "player", self.player_guid, 0)

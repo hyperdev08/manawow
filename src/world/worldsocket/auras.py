@@ -18,6 +18,7 @@ caster when ``AFLAG_CASTER`` is *not* set, and optional ``max duration`` /
 """
 from __future__ import annotations
 
+import random
 import struct
 import time
 
@@ -115,7 +116,20 @@ SUPPORTED_AURA_TYPES = frozenset((
     spells.SPELL_AURA_HASTE_SPELLS,
     spells.SPELL_AURA_MECHANIC_DURATION_MOD,
     spells.SPELL_AURA_MOD_MECHANIC_DAMAGE_TAKEN_PERCENT,
+    spells.SPELL_AURA_PROC_TRIGGER_SPELL,
+    spells.SPELL_AURA_MOD_RATING,
+    spells.SPELL_AURA_MELEE_SLOW,
 ))
+
+# ``SPELL_AURA_MOD_RATING`` uses the 3.3.5 CombatRating id as its misc value.
+_RATING_AURA_FIELDS = {
+    1: "defense", 2: "dodge", 3: "parry", 4: "block",
+    5: "hit", 6: "hit", 7: "hit",
+    8: "crit", 9: "crit", 10: "crit",
+    14: "resilience", 15: "resilience", 16: "resilience",
+    17: "haste", 18: "haste", 19: "haste",
+    23: "expertise", 24: "armor_penetration",
+}
 
 # State-only auras: their amount is irrelevant for the simulation.
 STATE_AURA_TYPES = frozenset((
@@ -237,6 +251,9 @@ class AurasMixin:
         else:
             amount = int(template.effect_value(index, caster_level,
                                                combo_points))
+            if (aura_type == spells.SPELL_AURA_PROC_TRIGGER_SPELL
+                    and amount <= 0):
+                amount = 100
             if aura_type not in (spells.SPELL_AURA_MOD_DECREASE_SPEED,
                                  spells.SPELL_AURA_MOD_INCREASE_SPEED,
                                  spells.SPELL_AURA_MOD_DAMAGE_DONE,
@@ -584,6 +601,11 @@ class AurasMixin:
             "melee_haste": 0.0,
             "ranged_haste": 0.0,
             "spell_haste": 0.0,
+            "ratings": {
+                "defense": 0, "dodge": 0, "parry": 0, "block": 0,
+                "hit": 0, "crit": 0, "haste": 0, "resilience": 0,
+                "expertise": 0, "armor_penetration": 0,
+            },
             "damage_done_flat": {},
             "damage_done_pct": {},
             "damage_taken_flat": {},
@@ -692,6 +714,12 @@ class AurasMixin:
                             mods["resistances_pct"][school] += amount
                 elif aura_type == spells.SPELL_AURA_MOD_ATTACK_POWER:
                     mods["attack_power"] += amount
+                elif aura_type == spells.SPELL_AURA_MOD_RATING:
+                    field = _RATING_AURA_FIELDS.get(misc)
+                    if field:
+                        mods["ratings"][field] += amount
+                elif aura_type == spells.SPELL_AURA_MELEE_SLOW:
+                    mods["melee_haste"] -= amount
                 elif aura_type == spells.SPELL_AURA_MOD_ATTACK_POWER_PCT:
                     mods["attack_power_pct"] += amount
                 elif aura_type == spells.SPELL_AURA_MOD_RANGED_ATTACK_POWER:
@@ -788,6 +816,28 @@ class AurasMixin:
 
     def _player_aura_mods(self) -> dict:
         return self._aura_mods(self._get_combat_state().get("auras", ()))
+
+    async def _proc_trigger_auras(self, attacker_guid: int) -> None:
+        """Roll reactive ``SPELL_AURA_PROC_TRIGGER_SPELL`` auras.
+
+        The hook is called while the player is taking damage; the triggered
+        spell is aimed back at the attacker (or at the player when no attacker
+        guid is known).
+        """
+        if not hasattr(self, "_cast_triggered"):
+            return
+        target = int(attacker_guid or self.player_guid or 0)
+        for aura in list(self._get_combat_state().get("auras", ())):
+            for component in aura.get("components", ()):
+                if int(component.get("type") or 0) != \
+                        spells.SPELL_AURA_PROC_TRIGGER_SPELL:
+                    continue
+                chance = int(component.get("amount") or 0)
+                if chance <= 0 or random.uniform(0.0, 100.0) >= chance:
+                    continue
+                triggered = int(component.get("trigger_spell") or 0)
+                if triggered:
+                    await self._cast_triggered(triggered, target)
 
     def _creature_aura_mods(self, low_guid: int) -> dict:
         entries = self._get_combat_state().get(

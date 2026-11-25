@@ -620,6 +620,22 @@ class QuestsMixin:
         if changed:
             await self._send_visible_questgiver_statuses()
 
+    async def _spell_complete_quest(self, quest_id: int) -> None:
+        """``SPELL_EFFECT_QUEST_COMPLETE``: mark an active quest complete."""
+        quest = Q.get_quest_template(
+            self.config.database.world_path, int(quest_id))
+        if quest is None:
+            return
+        state = self._quest_log_map().get(int(quest_id))
+        if state is None or int(state["status"]) == Q.QUEST_STATUS_COMPLETE:
+            return
+        state["status"] = Q.QUEST_STATUS_COMPLETE
+        await self._save_quest(int(quest_id), state)
+        await self._send_quest_slot(int(quest_id), state)
+        await self.send_packet(
+            Opcodes.SMSG_QUESTUPDATE_COMPLETE,
+            Q.build_questupdate_complete(int(quest_id)))
+
     async def _quest_check_complete(self, quest_id: int, quest, state: dict) -> None:
         """Re-evaluate completion after a counter/item/explore change."""
         complete = Q.objectives_complete(quest, state, self._quest_item_counts())

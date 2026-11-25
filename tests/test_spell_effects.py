@@ -6,7 +6,7 @@ import sqlite3
 
 from src.common.config import AuthConfig, Config, DBConfig, LogConfig, WorldConfig
 from src.protocol.opcodes import Opcodes
-from src.world import character_db, creature, spells
+from src.world import character_db, creature, gameobject, spells
 from src.world.realmsocket import WorldSocket
 
 
@@ -33,6 +33,7 @@ class FakeWriter:
 def _socket(tmp_path):
     db = str(tmp_path / "world.db")
     creature.init_creature_db(db)
+    gameobject.init_gameobject_db(db)
     character_db.init_world_db(db)
     character_db.init_character_store(db)
     con = sqlite3.connect(db)
@@ -61,6 +62,49 @@ def _socket(tmp_path):
             "(id, name, effect1, equipped_item_class,"
             " equipped_item_subclass_mask)"
             " VALUES(301, 'Test Proficiency', 60, 2, 32)")
+        con.execute(
+            "CREATE TABLE IF NOT EXISTS spell_target_position("
+            "id INTEGER PRIMARY KEY, target_map INTEGER,"
+            "target_position_x REAL, target_position_y REAL,"
+            "target_position_z REAL, target_orientation REAL)")
+        con.execute(
+            "INSERT OR REPLACE INTO spell_templates"
+            "(id, name, effect1) VALUES(400, 'Teleport Same Map', 5)")
+        con.execute(
+            "INSERT OR REPLACE INTO spell_templates"
+            "(id, name, effect1) VALUES(401, 'Teleport Cross Map', 5)")
+        con.execute(
+            "INSERT OR REPLACE INTO spell_templates"
+            "(id, name, effect1, effect_trigger_spell1)"
+            " VALUES(402, 'Trigger Missile Test', 32, 200)")
+        con.execute(
+            "INSERT OR REPLACE INTO spell_templates"
+            "(id, name, effect1, effect_misc_value1, duration_index)"
+            " VALUES(403, 'Summon Object Test', 104, 5000, 0)")
+        con.execute(
+            "INSERT OR REPLACE INTO spell_templates"
+            "(id, name, effect1, effect_apply_aura_name1,"
+            " effect_base_points1, effect_misc_value1, duration_index)"
+            " VALUES(404, 'Rating Aura', 6, 189, 20, 5, 1)")
+        con.execute(
+            "INSERT OR REPLACE INTO spell_templates"
+            "(id, name, effect1, effect_apply_aura_name1,"
+            " effect_base_points1, effect_trigger_spell1, duration_index)"
+            " VALUES(405, 'Proc Aura', 6, 42, 100, 200, 1)")
+        con.execute(
+            "INSERT OR REPLACE INTO spell_duration"
+            "(id, duration, duration_per_level, max_duration)"
+            " VALUES(1, 10000, 0, 10000)")
+        con.execute(
+            "INSERT OR REPLACE INTO gameobject_templates"
+            "(entry, type, display_id, name, size, faction, flags)"
+            " VALUES(5000, 6, 100, 'Trap', 1.0, 0, 0)")
+        con.execute(
+            "INSERT OR REPLACE INTO spell_target_position"
+            " VALUES(400, 0, 10.0, 20.0, 30.0, 1.0)")
+        con.execute(
+            "INSERT OR REPLACE INTO spell_target_position"
+            " VALUES(401, 1, 40.0, 50.0, 60.0, 2.0)")
         con.commit()
     finally:
         con.close()
@@ -135,6 +179,75 @@ def test_skill_step_and_proficiency_effects_persist(tmp_path):
             con.close()
         assert skill == (1,)
         assert proficiency == (32,)
+
+    asyncio.run(flow())
+
+
+def test_teleport_trigger_missile_and_summon_object_effects(tmp_path):
+    async def flow():
+        socket, db, sent, _delivered = _socket(tmp_path)
+        # Same-map teleport uses the near-teleport handshake.
+        await socket._apply_spell_effects(
+            None, spells.get_spell_template(db, 400), 0)
+        assert (socket.character["x"], socket.character["y"],
+                socket.character["z"]) == (10.0, 20.0, 30.0)
+        assert any(opcode == int(Opcodes.MSG_MOVE_TELEPORT_ACK)
+                   for opcode, _payload in sent)
+
+        # A different target map starts a worldport.
+        sent.clear()
+        await socket._apply_spell_effects(
+            None, spells.get_spell_template(db, 401), 0)
+        assert socket.character["map"] == 1
+        assert socket._repop_pending is True
+        assert sent[-1][0] == int(Opcodes.SMSG_NEW_WORLD)
+
+        # Trigger missiles run the referenced spell through the trigger path.
+        triggered = []
+
+        async def fake_trigger(spell_id, target_guid):
+            triggered.append((int(spell_id), int(target_guid)))
+
+        socket._cast_triggered = fake_trigger
+        await socket._apply_spell_effects(
+            None, spells.get_spell_template(db, 402), 0)
+        assert triggered == [(200, socket.player_guid)]
+
+        # Summon objects get a runtime gameobject create/destroy pair.
+        sent.clear()
+        await socket._apply_spell_effects(
+            None, spells.get_spell_template(db, 403), 0)
+        assert socket._summoned_gameobjects()
+        low = next(iter(socket._summoned_gameobjects()))
+        assert any(opcode in (int(Opcodes.SMSG_UPDATE_OBJECT),
+                              int(Opcodes.SMSG_COMPRESSED_UPDATE_OBJECT))
+                   for opcode, _payload in sent)
+        sent.clear()
+        await socket._dismiss_all_gameobjects()
+        assert not socket._summoned_gameobjects()
+        assert any(opcode == int(Opcodes.SMSG_DESTROY_OBJECT)
+                   for opcode, _payload in sent)
+
+    asyncio.run(flow())
+
+
+def test_rating_and_proc_trigger_auras(tmp_path):
+    async def flow():
+        socket, db, _sent, _delivered = _socket(tmp_path)
+        await socket._apply_spell_effects(
+            None, spells.get_spell_template(db, 404), socket.player_guid)
+        assert socket._player_aura_mods()["ratings"]["hit"] == 21
+
+        await socket._apply_spell_effects(
+            None, spells.get_spell_template(db, 405), socket.player_guid)
+        triggered = []
+
+        async def fake_trigger(spell_id, target_guid):
+            triggered.append((int(spell_id), int(target_guid)))
+
+        socket._cast_triggered = fake_trigger
+        await socket._proc_trigger_auras(0xDEADBEEF)
+        assert triggered == [(200, 0xDEADBEEF)]
 
     asyncio.run(flow())
 

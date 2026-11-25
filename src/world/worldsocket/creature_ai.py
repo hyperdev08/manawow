@@ -618,7 +618,8 @@ class CreatureAIMixin:
                     await self._send_attacker_state_update(
                         caster_guid, int(self.player_guid), amount)
                     await self._damage_player(
-                        amount, f"{spawn['name']}'s {template.name}")
+                        amount, f"{spawn['name']}'s {template.name}",
+                        attacker_guid=caster_guid)
                 elif etype == spells.SPELL_EFFECT_APPLY_AURA:
                     aura = int(effect["apply_aura"])
                     if self._effect_is_harmful(template, effect):
@@ -687,7 +688,8 @@ class CreatureAIMixin:
                     caster_guid, target_guid, amount)
                 if self._is_player_guid(target_guid):
                     await self._damage_player(
-                        amount, f"{spawn['name']}'s {template.name}")
+                        amount, f"{spawn['name']}'s {template.name}",
+                        attacker_guid=caster_guid)
                 else:
                     await self._deal_damage_to_creature(
                         target_guid, amount, caster_guid)
@@ -713,7 +715,8 @@ class CreatureAIMixin:
             elif etype == spells.SPELL_EFFECT_INSTAKILL:
                 if target_guid and self._is_player_guid(target_guid):
                     await self._damage_player(
-                        1 << 24, f"{spawn['name']}'s {template.name}")
+                        1 << 24, f"{spawn['name']}'s {template.name}",
+                        attacker_guid=caster_guid)
             elif etype == spells.SPELL_EFFECT_APPLY_AURA:
                 aura = int(effect["apply_aura"])
                 if target_guid and self._effect_is_harmful(template, effect):

@@ -68,11 +68,13 @@ SPELL_EFFECT_APPLY_AURA = 6
 SPELL_EFFECT_HEALTH_LEECH = 9
 SPELL_EFFECT_HEAL = 10
 SPELL_EFFECT_WEAPON_DAMAGE_NOSCHOOL = 17
+SPELL_EFFECT_QUEST_COMPLETE = 16
 SPELL_EFFECT_CREATE_ITEM = 24
 SPELL_EFFECT_PERSISTENT_AREA_AURA = 27
 SPELL_EFFECT_SUMMON = 28
 SPELL_EFFECT_ENERGIZE = 30
 SPELL_EFFECT_WEAPON_PERCENT_DAMAGE = 31
+SPELL_EFFECT_TRIGGER_MISSILE = 32
 SPELL_EFFECT_DISPEL = 38
 SPELL_EFFECT_TELEPORT_UNITS = 5
 SPELL_EFFECT_RESURRECT_OLD = 18
@@ -87,13 +89,22 @@ SPELL_EFFECT_THREAT = 63
 SPELL_EFFECT_TRIGGER_SPELL = 64
 SPELL_EFFECT_INTERRUPT_CAST = 68
 SPELL_EFFECT_SUMMON_OBJECT_WILD = 76
+SPELL_EFFECT_SEND_EVENT = 61
 # Opening, Herb Gathering, Mining, Pick Lock: unlock and use a game object.
 SPELL_EFFECT_OPEN_LOCK = 33
 SPELL_EFFECT_ATTACK = 78
 SPELL_EFFECT_ADD_COMBO_POINTS = 80
 SPELL_EFFECT_LEAP = 29
 SPELL_EFFECT_KNOCK_BACK = 98
+SPELL_EFFECT_TELEPORT_UNITS_FACE_CASTER = 43
+SPELL_EFFECT_TELEPORT_UNITS_SET_FACING = 95
 SPELL_EFFECT_SUMMON_OBJECT_SLOT1 = 104
+SPELL_EFFECT_SUMMON_OBJECT_SLOT2 = 105
+SPELL_EFFECT_SUMMON_OBJECT_SLOT3 = 106
+SPELL_EFFECT_SUMMON_OBJECT_SLOT4 = 107
+SPELL_EFFECT_TRIGGER_SPELL_WITH_VALUE = 142
+SPELL_EFFECT_TRIGGER_MISSILE_SPELL_WITH_VALUE = 148
+SPELL_EFFECT_TRIGGER_SPELL_2 = 151
 SPELL_EFFECT_ATTACK_ME = 114
 SPELL_EFFECT_RESURRECT = 113
 SPELL_EFFECT_MODIFY_THREAT_PERCENT = 125
@@ -125,7 +136,12 @@ SPELL_AURA_MOD_SILENCE = 27
 SPELL_AURA_REFLECT_SPELLS = 28
 SPELL_AURA_MOD_STAT = 29
 SPELL_AURA_MOD_INCREASE_SPEED = 31
+SPELL_AURA_MOD_INCREASE_MOUNTED_SPEED = 32
 SPELL_AURA_MOD_DECREASE_SPEED = 33
+SPELL_AURA_PROC_TRIGGER_SPELL = 42
+SPELL_AURA_MOUNTED = 78
+SPELL_AURA_MOD_RATING = 189
+SPELL_AURA_MELEE_SLOW = 193
 SPELL_AURA_MOD_INCREASE_HEALTH = 34
 SPELL_AURA_MOD_INCREASE_ENERGY = 35
 SPELL_AURA_EFFECT_IMMUNITY = 37
@@ -1238,6 +1254,37 @@ def _creature_spells_cached(path: str, entry: int) -> Tuple[int, ...]:
     return tuple(spells)
 
 
+@lru_cache(maxsize=2048)
+def _spell_target_position_cached(path: str, spell_id: int):
+    con = sqlite3.connect(path)
+    con.row_factory = sqlite3.Row
+    try:
+        row = con.execute(
+            "SELECT target_map, target_position_x, target_position_y,"
+            " target_position_z, target_orientation"
+            " FROM spell_target_position WHERE id = ?", (int(spell_id),)
+        ).fetchone()
+    except sqlite3.OperationalError:
+        row = None
+    finally:
+        con.close()
+    return row
+
+
+def get_spell_target_position(path: str, spell_id: int) -> Optional[dict]:
+    """Destination of a teleport spell (``spell_target_position``)."""
+    row = _spell_target_position_cached(path, int(spell_id))
+    if row is None:
+        return None
+    return {
+        "map": int(row["target_map"]),
+        "x": float(row["target_position_x"]),
+        "y": float(row["target_position_y"]),
+        "z": float(row["target_position_z"]),
+        "o": float(row["target_orientation"]),
+    }
+
+
 def get_creature_spells(path: str, entry: int) -> List[int]:
     """Fetch the spell IDs a creature can cast.
 
@@ -1407,6 +1454,7 @@ def clear_caches() -> None:
                    _creature_cooldowns_cached,
                    _creature_spell_list_entry_cached,
                    _creature_spell_targeting_cached,
+                   _spell_target_position_cached,
                    get_creature_base_mana, get_rune_cost):
         cached.cache_clear()
 

@@ -60,7 +60,11 @@ A real 3.3.5a client can now log in, pick a character and **enter the world**:
 - `SMSG_LOGIN_VERIFY_WORLD` is the first world packet, followed by `SMSG_INITIAL_SPELLS` and `SMSG_ACTION_BUTTONS`
 - `CMSG_CAST_SPELL` / `CMSG_CANCEL_CAST` use imported `spell_templates`: cast time, range, power cost, GCD (`StartRecoveryTime`), school, damage/heal rolls and effect/aura enums
 - `SPELL_EFFECT_CREATE_ITEM` (for reagent-free conjures), `LEARN_SPELL`, `SKILL_STEP` and `PROFICIENCY` are handled through the same item, trainer-skill and proficiency paths used by loot and trainers; reagent-consuming crafts wait for the reagent-consumption phase
-- `python tools/spell_coverage.py` audits every imported spell against the implemented effect/aura families and prints unsupported families with example spells; the current dataset has 50,889 templates and 23,301 fully covered spells
+- Teleport effects 5/43/95 use `spell_target_position` and the same-map near-teleport or cross-map `SMSG_NEW_WORLD` path; trigger-spell/missile effects run their referenced spell with the existing triggered-cast pipeline
+- Summon-object effects 76/104-107 create runtime gameobjects (traps, chests, ritual objects) for the owner and peers, expire with their spell duration and are removed on dismiss/logout
+- Quest-complete effects mark the active quest complete in the quest log; send-event effects dispatch through a server hook (`_spell_send_event`) so scripts can attach later
+- Reactive `SPELL_AURA_PROC_TRIGGER_SPELL`, `SPELL_AURA_MOD_RATING` and `SPELL_AURA_MELEE_SLOW` are applied; rating auras feed the hit/crit/haste/dodge/parry/block/defense tables, and reactive procs use the attacker as the trigger target
+- `python tools/spell_coverage.py` audits every imported spell against the implemented effect/aura families and prints unsupported families with example spells; the current dataset has 50,889 templates and 27,164 fully covered spells
 - Melee auto-attack, weapon damage/delay, creature aggro + chase + leash AI (a creature evades when its victim is more than 60 yards from the spawn, `Creature::CanCreatureAttack`; its own position does not count, so low-health humanoids can flee without resetting), creature melee, death, respawn, XP and level-up
 - `SMSG_SPELL_START` / `SMSG_SPELL_GO` / `SMSG_CAST_FAILED` with miss/crit flags
 - `SMSG_SPELLHEALLOG`, `SMSG_SPELLENERGIZELOG`, `SMSG_LOG_XPGAIN` and `SMSG_LEVELUP_INFO`

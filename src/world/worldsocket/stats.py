@@ -433,19 +433,29 @@ class StatsMixin:
         # flat 15 points per percent (the level-60-ish ratio) because the full
         # ``GtCombatRatings`` curve is not imported; the result is still a
         # consistent, gear-driven table rather than fixed 5%/10%.
-        hit_rating = int(item_totals.get("hit_rating", 0) or 0)
-        crit_rating = int(item_totals.get("crit_rating", 0) or 0)
-        haste_rating = int(item_totals.get("haste_rating", 0) or 0)
+        aura_ratings = ((aura_mods.get("ratings") or {})
+                        if aura_mods else {})
+        hit_rating = int(item_totals.get("hit_rating", 0) or 0) + int(
+            aura_ratings.get("hit", 0) or 0)
+        crit_rating = int(item_totals.get("crit_rating", 0) or 0) + int(
+            aura_ratings.get("crit", 0) or 0)
+        haste_rating = int(item_totals.get("haste_rating", 0) or 0) + int(
+            aura_ratings.get("haste", 0) or 0)
         self.character["hit_rating"] = hit_rating
         self.character["crit_rating"] = crit_rating
         self.character["haste_rating"] = haste_rating
-        self.character["resilience"] = int(item_totals.get("resilience", 0) or 0)
+        self.character["resilience"] = int(
+            item_totals.get("resilience", 0) or 0) + int(
+                aura_ratings.get("resilience", 0) or 0)
         self.character["armor_penetration"] = int(
-            item_totals.get("armor_penetration", 0) or 0)
+            item_totals.get("armor_penetration", 0) or 0) + int(
+                aura_ratings.get("armor_penetration", 0) or 0)
         self.character["expertise"] = int(
-            item_totals.get("expertise", 0) or 0)
+            item_totals.get("expertise", 0) or 0) + int(
+                aura_ratings.get("expertise", 0) or 0)
         self.character["defense_rating"] = int(
-            item_totals.get("defense_rating", 0) or 0)
+            item_totals.get("defense_rating", 0) or 0) + int(
+                aura_ratings.get("defense", 0) or 0)
         self.character["has_shield"] = bool(item_totals.get("shield", 0))
         self.character["block_value"] = int(
             item_totals.get("block_value", 0) or 0)
@@ -479,14 +489,20 @@ class StatsMixin:
         self.character["spell_crit_chance"] = min(
             75.0, 5.0 + crit_rating / 15.0 + aura_spell_crit)
         self.character["dodge_chance"] = min(
-            75.0, 5.0 + int(item_totals.get("dodge_rating", 0) or 0) / 15.0
+            75.0, 5.0 + (
+                int(item_totals.get("dodge_rating", 0) or 0)
+                + int(aura_ratings.get("dodge", 0) or 0)) / 15.0
             + agility * 0.002 + (float(aura_mods.get("dodge", 0.0))
                                  if aura_mods else 0.0))
         self.character["parry_chance"] = min(
-            75.0, 5.0 + int(item_totals.get("parry_rating", 0) or 0) / 15.0
+            75.0, 5.0 + (
+                int(item_totals.get("parry_rating", 0) or 0)
+                + int(aura_ratings.get("parry", 0) or 0)) / 15.0
             + (float(aura_mods.get("parry", 0.0)) if aura_mods else 0.0))
         self.character["block_chance"] = (
-            min(75.0, 5.0 + int(item_totals.get("block_rating", 0) or 0) / 15.0
+            min(75.0, 5.0 + (
+                int(item_totals.get("block_rating", 0) or 0)
+                + int(aura_ratings.get("block", 0) or 0)) / 15.0
                 + (float(aura_mods.get("block", 0.0)) if aura_mods else 0.0))
             if self.character["has_shield"] else 0.0)
         self.character["melee_haste"] = haste_rating / 15.0 + (
@@ -823,7 +839,8 @@ class StatsMixin:
             int(healer_guid or 0), int(target_guid or 0), float(effective))
 
     async def _damage_player(self, damage: int, source: str,
-                             physical: bool = False) -> None:
+                             physical: bool = False,
+                             attacker_guid: int = 0) -> None:
         """Apply damage to the player and handle death.
 
         ``physical`` marks normal-school melee damage.  ``Unit::DealDamage``
@@ -857,6 +874,9 @@ class StatsMixin:
                 float(channel.get("expires", 0.0)) - 0.5)
         if physical:
             self._gain_rage(amount, dealing=False)
+        if (new_health > 0 and attacker_guid
+                and hasattr(self, "_proc_trigger_auras")):
+            await self._proc_trigger_auras(int(attacker_guid))
         if new_health <= 0:
             await self._on_player_killed(source)
 

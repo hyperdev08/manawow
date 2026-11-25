@@ -258,6 +258,8 @@ class SummonsMixin:
         """Remove every summon this session owns (logout/disconnect)."""
         for low_guid in list(self._summon_spawns()):
             await self._dismiss_summon(low_guid)
+        if hasattr(self, "_dismiss_all_gameobjects"):
+            await self._dismiss_all_gameobjects()
 
     # ------------------------------------------------------------------
     # Damage
@@ -290,6 +292,8 @@ class SummonsMixin:
     # ------------------------------------------------------------------
     async def _summon_tick_all(self, now: float) -> None:
         """Advance every summon: expiry, following and attacking."""
+        if hasattr(self, "_summoned_objects_tick"):
+            await self._summoned_objects_tick(now)
         summons = self._summon_spawns()
         if not summons:
             return

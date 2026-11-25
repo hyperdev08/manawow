@@ -13,6 +13,7 @@ from src.world import character_db
 from src.world import creature
 from src.world import databases
 from src.world import gameobject
+from src.world import login_packets
 from src.world import object_update
 from src.world import spells
 
@@ -1114,7 +1115,7 @@ class SpellsMixin:
             if peer is not None and remaining > 0:
                 await peer._damage_player(
                     remaining, f"{self.character.get('name', 'player')}'s "
-                    f"{template.name}")
+                    f"{template.name}", attacker_guid=self.player_guid)
             overkill = 0
         else:
             overkill = max(0, remaining - (
@@ -1349,6 +1350,43 @@ class SpellsMixin:
         payload += struct.pack("<B", 1)
         await self.send_packet(Opcodes.SMSG_SPELLSTEALLOG, bytes(payload))
 
+    async def _spell_teleport(self, template) -> None:
+        """Apply a ``spell_target_position`` teleport to the caster."""
+        destination = spells.get_spell_target_position(
+            self.config.database.world_path, int(template.id))
+        if destination is None:
+            self.log.debug(
+                f"Teleport spell {template.id} has no spell_target_position")
+            return
+        map_id = int(destination["map"])
+        x, y, z = (float(destination["x"]), float(destination["y"]),
+                   float(destination["z"]))
+        o = float(destination["o"])
+        old_map = int(self.character.get("map", 0) or 0)
+        zone = (int(self.character.get("zone", 0) or 0)
+                if map_id == old_map else 0)
+        self.character["map"] = map_id
+        self.character["zone"] = zone
+        if map_id == old_map and hasattr(self, "_teleport_nearby"):
+            await self._teleport_nearby(x, y, z, o)
+            return
+        self.character["x"], self.character["y"] = x, y
+        self.character["z"], self.character["o"] = z, o
+        await run_db_write(
+            character_db.update_character_position,
+            self.config.database.world_path, int(self.player_guid),
+            x, y, z, o, map_id=map_id, zone=zone)
+        self._repop_pending = True
+        self.movement_info = None
+        await self.send_packet(
+            Opcodes.SMSG_NEW_WORLD,
+            login_packets.build_login_verify_world(self.character))
+
+    async def _spell_send_event(self, event_id: int, template) -> None:
+        """Dispatch hook for ``SPELL_EFFECT_SEND_EVENT`` (scripts come later)."""
+        self.log.info(
+            f"Spell {template.id} ({template.name}) sends event {event_id}")
+
     async def _apply_spell_effects(self, cast, template, target_guid: int) -> None:
         """Roll and apply every effect of a completed cast."""
         self._last_cast_spell_id = int(template.id)
@@ -1369,6 +1407,11 @@ class SpellsMixin:
         for index, effect in enumerate(template.effects):
             etype = int(effect["effect"])
             if not etype:
+                continue
+            if etype in (spells.SPELL_EFFECT_TELEPORT_UNITS,
+                         spells.SPELL_EFFECT_TELEPORT_UNITS_FACE_CASTER,
+                         spells.SPELL_EFFECT_TELEPORT_UNITS_SET_FACING):
+                await self._spell_teleport(template)
                 continue
             if etype == spells.SPELL_EFFECT_OPEN_LOCK:
                 if target_guid and gameobject.is_gameobject_guid(target_guid):
@@ -1634,10 +1677,43 @@ class SpellsMixin:
             elif etype == spells.SPELL_EFFECT_PROFICIENCY:
                 if hasattr(self, "_apply_trainer_proficiency"):
                     await self._apply_trainer_proficiency(template)
-            elif etype == spells.SPELL_EFFECT_TRIGGER_SPELL:
+            elif etype == spells.SPELL_EFFECT_QUEST_COMPLETE:
+                quest_id = int(effect.get("misc_value") or 0)
+                if quest_id and hasattr(self, "_spell_complete_quest"):
+                    await self._spell_complete_quest(quest_id)
+            elif etype == spells.SPELL_EFFECT_SEND_EVENT:
+                event_id = int(effect.get("misc_value") or 0)
+                if event_id:
+                    await self._spell_send_event(event_id, template)
+            elif etype in (spells.SPELL_EFFECT_TRIGGER_SPELL,
+                           spells.SPELL_EFFECT_TRIGGER_SPELL_WITH_VALUE,
+                           spells.SPELL_EFFECT_TRIGGER_SPELL_2):
                 triggered = int(effect["trigger_spell"])
                 if triggered:
                     await self._cast_triggered(triggered, target_guid)
+            elif etype in (spells.SPELL_EFFECT_TRIGGER_MISSILE,
+                           spells.SPELL_EFFECT_TRIGGER_MISSILE_SPELL_WITH_VALUE):
+                triggered = int(effect["trigger_spell"])
+                if triggered:
+                    await self._cast_triggered(
+                        triggered, target_guid or self.player_guid)
+            elif etype in (spells.SPELL_EFFECT_SUMMON_OBJECT_WILD,
+                           spells.SPELL_EFFECT_SUMMON_OBJECT_SLOT1,
+                           spells.SPELL_EFFECT_SUMMON_OBJECT_SLOT2,
+                           spells.SPELL_EFFECT_SUMMON_OBJECT_SLOT3,
+                           spells.SPELL_EFFECT_SUMMON_OBJECT_SLOT4):
+                entry = int(effect.get("misc_value") or 0)
+                if entry and hasattr(self, "_summon_gameobject"):
+                    duration = spells.summon_duration_ms(
+                        self.config.database.world_path,
+                        template.duration_index, caster_level)
+                    x, y, z = (cast.x, cast.y, cast.z) if (
+                        cast is not None and getattr(cast, "has_dest", False)
+                    ) else self._player_position()
+                    await self._summon_gameobject(
+                        entry, x, y, z,
+                        float(self.character.get("o", 0.0) or 0.0),
+                        duration)
             elif etype in (spells.SPELL_EFFECT_SUMMON,
                            spells.SPELL_EFFECT_SUMMON_PET):
                 entry = int(effect.get("misc_value") or 0)
@@ -1652,14 +1728,6 @@ class SpellsMixin:
                         is_pet=etype == spells.SPELL_EFFECT_SUMMON_PET,
                         stationary=template.is_totem(),
                     )
-            elif etype in (spells.SPELL_EFFECT_SUMMON_OBJECT_WILD,
-                           spells.SPELL_EFFECT_SUMMON_OBJECT_SLOT1):
-                # Gameobjects (traps, ritual circles, chests) are not part of
-                # this server's object model.
-                self.log.debug(
-                    f"Spell {template.id} summons gameobject "
-                    f"{int(effect.get('misc_value') or 0)}; ignored"
-                )
             elif etype == spells.SPELL_EFFECT_ADD_COMBO_POINTS:
                 # ``Spell::EffectAddComboPoints``: the effect's own rolled value
                 # is the number of points added (Sinister Strike adds 1).
