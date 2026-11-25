@@ -32,6 +32,7 @@ from src.world.worldsocket.groups import GroupsMixin
 from src.world.worldsocket.inventory import InventoryMixin
 from src.world.worldsocket.loot import LootMixin
 from src.world.worldsocket.peers import PeersMixin
+from src.world.worldsocket.pets import PetsMixin
 from src.world.worldsocket.player_movement import PlayerMovementMixin
 from src.world.worldsocket.quests import QuestsMixin
 from src.world.worldsocket.runes import RunesMixin
@@ -67,6 +68,7 @@ class WorldSocket(
     CreatureMovementMixin,
     GroupsMixin,
     SummonsMixin,
+    PetsMixin,
     LootMixin,
     InventoryMixin,
     QuestsMixin,

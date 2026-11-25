@@ -410,6 +410,22 @@ class SocketBase:
                 await self.handle_trainer_list(data)
             elif opcode == Opcodes.CMSG_TRAINER_BUY_SPELL:
                 await self.handle_trainer_buy_spell(data)
+            elif opcode == Opcodes.CMSG_PET_ACTION:
+                await self.handle_pet_action(data)
+            elif opcode == Opcodes.CMSG_PET_SET_ACTION:
+                await self.handle_pet_set_action(data)
+            elif opcode == Opcodes.CMSG_PET_SPELL_AUTOCAST:
+                await self.handle_pet_spell_autocast(data)
+            elif opcode == Opcodes.CMSG_PET_ABANDON:
+                await self.handle_pet_abandon(data)
+            elif opcode == Opcodes.CMSG_PET_STOP_ATTACK:
+                await self.handle_pet_stop_attack(data)
+            elif opcode == Opcodes.CMSG_PET_RENAME:
+                await self.handle_pet_rename(data)
+            elif opcode == Opcodes.CMSG_PET_NAME_QUERY:
+                await self.handle_pet_name_query(data)
+            elif opcode == Opcodes.CMSG_REQUEST_PET_INFO:
+                await self.handle_request_pet_info(data)
             elif opcode == Opcodes.CMSG_REPOP_REQUEST:
                 await self.handle_repop_request(data)
             elif opcode == Opcodes.CMSG_RECLAIM_CORPSE:

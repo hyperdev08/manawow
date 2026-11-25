@@ -842,12 +842,22 @@ def build_creature_values(creature: Mapping) -> Dict[int, int]:
     summoned_by = 0
     if "summoned_by" in creature.keys():
         summoned_by = int(creature["summoned_by"] or 0)
+    pet_flags = 0
     if summoned_by:
         values[F.UNIT_FIELD_SUMMONEDBY] = summoned_by & 0xFFFFFFFF
         values[F.UNIT_FIELD_SUMMONEDBY + 1] = (summoned_by >> 32) & 0xFFFFFFFF
         values[F.UNIT_FIELD_CREATEDBY] = summoned_by & 0xFFFFFFFF
         values[F.UNIT_FIELD_CREATEDBY + 1] = (summoned_by >> 32) & 0xFFFFFFFF
         values[F.UNIT_FIELD_FLAGS] = UNIT_FLAG_PLAYER_CONTROLLED
+        if "pet_number" in creature.keys():
+            pet_number = int(creature["pet_number"] or 0)
+            if pet_number:
+                values[F.UNIT_FIELD_PETNUMBER] = pet_number
+                values[F.UNIT_FIELD_PET_NAME_TIMESTAMP] = int(
+                    creature["pet_name_timestamp"]
+                    if "pet_name_timestamp" in creature.keys() else 0)
+        pet_flags = int(creature["pet_flags"]
+                        if "pet_flags" in creature.keys() else 0)
     else:
         values[F.UNIT_FIELD_FLAGS] = int(creature["unit_flags"])
     values[F.UNIT_FIELD_FLAGS_2] = int(creature["unit_flags2"])
@@ -860,7 +870,8 @@ def build_creature_values(creature: Mapping) -> Dict[int, int]:
     values[F.UNIT_DYNAMIC_FLAGS] = 1 if dead else 0  # UNIT_DYNFLAG_LOOTABLE
     values[F.UNIT_NPC_FLAGS] = int(creature["npc_flags"])
     values[F.UNIT_NPC_EMOTESTATE] = 0
-    values[F.UNIT_FIELD_BYTES_2] = 0
+    # UNIT_FIELD_BYTES_2 byte 2 carries UNIT_PET_FLAG_* for controlled pets.
+    values[F.UNIT_FIELD_BYTES_2] = (pet_flags & 0xFF) << 16
     return values
 
 

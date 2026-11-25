@@ -1317,12 +1317,14 @@ async def rune_and_creature_ai_checks(temp_dir: str, world_db: str) -> None:
                   "summon stores its owner in UNIT_FIELD_SUMMONEDBY")
         assert_eq(values[F.UNIT_FIELD_FLAGS], 0x00000008,
                   "summon is player-controlled")
-        assert sent and sent[-1][0] in (
+        create_packets = [packet for packet in sent if packet[0] in (
             int(Opcodes.SMSG_UPDATE_OBJECT),
-            int(Opcodes.SMSG_COMPRESSED_UPDATE_OBJECT)), \
-            "summon sends a create object"
-        assert peer_sent and peer_sent[-1][0] == sent[-1][0], \
+            int(Opcodes.SMSG_COMPRESSED_UPDATE_OBJECT))]
+        assert create_packets, "summon sends a create object"
+        assert peer_sent and peer_sent[-1][0] == create_packets[-1][0], \
             "summon create block is relayed to peers"
+        assert sent and sent[-1][0] == int(Opcodes.SMSG_PET_SPELLS), \
+            "summon sends the pet action bar"
 
         # Assist: the pet attacks the owner's current target.
         pet._combat_state.update({

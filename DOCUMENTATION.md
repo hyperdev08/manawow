@@ -145,7 +145,9 @@ A real 3.3.5a client can now log in, pick a character and **enter the world**:
 - Summon duration comes from `SpellDuration.dbc`: index 21 (`-1`, until dismissed) covers warlock pets, index 0 is treated as permanent, and the table has fallbacks for the common timed guardians until `--spell-duration-dbc` is imported
 - `Summon Imp` is part of the level-1 warlock starter kit, matching the real class; Call Pet (883) has no stored-pet state and is refused instead of summoning nothing
 - Summoned gameobjects (`SPELL_EFFECT_SUMMON_OBJECT_WILD` 76 / `SUMMON_OBJECT_SLOT1` 104, e.g. traps) are recognised but ignored because the server has no gameobject model
-- No pet action bar (`SMSG_PET_SPELLS`), pet commands or stables yet: the pet fights automatically and cannot be told to stay/attack a specific target
+- `SMSG_PET_SPELLS` builds the 3.3.5 pet action bar with attack/follow/stay, command/reaction buttons and the pet's learned spells; `CMSG_PET_ACTION` implements attack, follow, stay, passive/defensive/aggressive and dismiss, and `CMSG_PET_SET_ACTION` supports moving or clearing bar buttons
+- Pet spell autocast state is toggled through `CMSG_PET_SPELL_AUTOCAST` (and the action-bar spell states), persisted for the lifetime of the summon and resent in `SMSG_PET_SPELLS`; pet spell casting itself still uses the melee AI
+- `CMSG_PET_RENAME`/`CMSG_PET_NAME_QUERY` support renaming the active summon (including the `UNIT_FIELD_BYTES_2` rename flag); stables and hunter-pet persistence are still not implemented
 
 ### Creature spell-list AI
 - Creatures use database spell lists during combat

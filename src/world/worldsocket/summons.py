@@ -145,7 +145,7 @@ class SummonsMixin:
             "aggro_radius": 0.0,
             "chase_distance": 0.0,
             "loot_id": 0,
-            "spell_list_id": 0,
+            "spell_list_id": int(template["spell_list_id"] or 0),
             "ai_name": "",
             "speed_walk": float(template["speed_walk"] or 2.5),
             "speed_run": float(template["speed_run"] or 8.0),
@@ -190,6 +190,13 @@ class SummonsMixin:
         low_guid = self._next_summon_guid()
         x, y, z, o = self._summon_spawn_position()
         spawn = self._build_summon_spawn(template, low_guid, x, y, z, o)
+        if is_pet:
+            # The client uses these fields for the pet portrait, name query and
+            # the rename/dismiss menu.  Summons are session-local, so the low
+            # guid doubles as a stable pet number while the summon is alive.
+            spawn["pet_number"] = low_guid
+            spawn["pet_flags"] = 0x03       # can rename + can abandon
+            spawn["pet_name_timestamp"] = int(time.time())
         self._summon_spawns()[low_guid] = spawn
         self._creature_spawn_cache[low_guid] = spawn
         self._visible_creatures[low_guid] = creature.creature_guid(
@@ -202,12 +209,16 @@ class SummonsMixin:
             "moving_until": 0.0,
             "target": 0,
             "stationary": bool(stationary),
+            "is_pet": bool(is_pet),
+            "duration_ms": int(duration_ms or 0),
         })
         packet = object_update.build_creature_update([spawn])
         if packet is not None:
             opcode, payload = packet
             await self.send_packet(opcode, payload)
             await self.send_packet_to_peers(opcode, payload)
+        if is_pet and not stationary and hasattr(self, "_pet_initialize"):
+            await self._pet_initialize(low_guid, spawn, state)
         self.log.info(
             f"'{self.character['name']}' summons {template['name']} "
             f"(entry {entry}, guid {low_guid}, "
@@ -303,8 +314,12 @@ class SummonsMixin:
             return                       # the client is still animating a move
         owner = self._player_position()
         here = (float(spawn["x"]), float(spawn["y"]), float(spawn["z"]))
-        target_guid, target_spawn = self._summon_pick_target()
+        target_guid, target_spawn = self._summon_pick_target(state)
         if target_spawn is None:
+            # STAY holds the pet at its current spot; FOLLOW (the default)
+            # walks it back to the owner.
+            if int(state.get("command_state", 1)) == 0:
+                return
             await self._summon_follow(low_guid, spawn, state, here, owner, now)
             return
         low_target = creature.creature_low_guid(target_guid)
@@ -333,14 +348,27 @@ class SummonsMixin:
             int(target_guid), damage, pet_guid)
         if died:
             state["target"] = 0
+            if int(state.get("forced_target") or 0) == int(target_guid):
+                state["forced_target"] = 0
 
-    def _summon_pick_target(self):
+    def _summon_pick_target(self, state: dict):
         """Choose what the summon attacks, or ``(0, None)``.
 
-        Pets assist the owner: they only engage while the owner is in combat,
-        and they prefer the owner's explicit attack target, then the selected
-        unit, then any creature currently fighting the owner.
+        An explicit ATTACK command is honoured first.  Otherwise pets assist
+        the owner only in defensive/aggressive mode: they prefer the owner's
+        explicit attack target, then the selected unit, then any creature
+        currently fighting the owner.  Passive pets never pick a target.
         """
+        forced = int(state.get("forced_target") or 0)
+        if forced:
+            low = creature.creature_low_guid(forced)
+            spawn = (None if low in self._summon_spawns()
+                     else self._get_creature_spawn(low))
+            if spawn is not None and int(spawn["dead_since"] or 0) <= 0:
+                return forced, spawn
+            state["forced_target"] = 0
+        if int(state.get("react_state", 1)) == 0:      # REACT_PASSIVE
+            return 0, None
         combat = self._get_combat_state()
         engaged = bool(combat.get("auto_attacking") or combat.get("aggro")
                        or combat.get("in_combat"))
