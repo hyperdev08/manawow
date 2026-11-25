@@ -26,6 +26,7 @@ from src.world.worldsocket.constants import __all__ as _CONSTANT_NAMES
 from src.world.worldsocket.creature_ai import CreatureAIMixin
 from src.world.worldsocket.creature_movement import CreatureMovementMixin
 from src.world.worldsocket.creatures import CreaturesMixin
+from src.world.worldsocket.death import DeathMixin
 from src.world.worldsocket.gameobjects import GameObjectsMixin
 from src.world.worldsocket.groups import GroupsMixin
 from src.world.worldsocket.inventory import InventoryMixin
@@ -37,6 +38,7 @@ from src.world.worldsocket.runes import RunesMixin
 from src.world.worldsocket.spells import SpellsMixin
 from src.world.worldsocket.stats import StatsMixin
 from src.world.worldsocket.summons import SummonsMixin
+from src.world.worldsocket.trainers import TrainersMixin
 from src.world.worldsocket.vendors import VendorsMixin
 from src.world.worldsocket.world_entry import WorldEntryMixin
 
@@ -53,6 +55,7 @@ class WorldSocket(
     ChatMixin,
     StatsMixin,
     AurasMixin,
+    DeathMixin,
     RunesMixin,
     SpellsMixin,
     CombatMixin,
@@ -66,5 +69,6 @@ class WorldSocket(
     InventoryMixin,
     QuestsMixin,
     VendorsMixin,
+    TrainersMixin,
 ):
     """One connected 3.3.5a client; see the mixins for each subsystem."""

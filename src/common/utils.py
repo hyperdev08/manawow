@@ -7,6 +7,8 @@ import sys
 
 def ensure_dirs(*paths: str) -> None:
     for p in paths:
+        if not p:
+            continue
         os.makedirs(p, exist_ok=True)
 
 

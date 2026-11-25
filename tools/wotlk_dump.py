@@ -12,6 +12,7 @@ its NPC tables on a machine that only has Python and SQLite.
 """
 from __future__ import annotations
 
+import gzip
 import re
 from typing import Dict, Iterator, List, Optional, Sequence
 
@@ -159,6 +160,12 @@ def convert(raw: str):
 
 
 def read_dump(path: str) -> str:
+    """Read a plain SQL dump or the gzip-compressed CMaNGOS release asset."""
+    with open(path, "rb") as probe:
+        compressed = probe.read(2) == b"\x1f\x8b"
+    if compressed:
+        with gzip.open(path, "rt", encoding="utf-8", errors="replace") as handle:
+            return handle.read()
     with open(path, "r", encoding="utf-8", errors="replace") as handle:
         return handle.read()
 

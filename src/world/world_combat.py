@@ -38,6 +38,29 @@ class WorldCombatManager:
         self._states: dict[int, dict] = {}
         self._idle: dict[int, dict] = {}
         self._idle_driver: dict[int, tuple[int, float]] = {}
+        # Creature health is authoritative in memory.  Reading the row back
+        # after every hit loses damage when two hits land in one combat tick
+        # (the queued DB write has not run yet).
+        self._health: dict[int, int] = {}
+
+    # -- creature health ------------------------------------------------
+    def get_health(self, low_guid: int, spawn) -> Optional[int]:
+        low_guid = int(low_guid)
+        if low_guid in self._health:
+            return self._health[low_guid]
+        if spawn is None:
+            return None
+        current = int(spawn["current_health"] or 0)
+        if current > 0:
+            return current
+        base = int(spawn["base_health"] or 0) if "base_health" in spawn.keys() else 0
+        return base if base > 0 else 100
+
+    def set_health(self, low_guid: int, health: int) -> None:
+        self._health[int(low_guid)] = max(0, int(health))
+
+    def forget_health(self, low_guid: int) -> None:
+        self._health.pop(int(low_guid), None)
 
     # -- session helpers ------------------------------------------------
     def _sessions(self):

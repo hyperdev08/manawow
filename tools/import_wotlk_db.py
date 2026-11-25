@@ -6,18 +6,27 @@ in front of the client: creature templates, spawn points, gossip menus, gossip
 options and NPC text.  This tool reads the canonical CMaNGOS ``WoTLKDB`` dump
 (``Full_DB/WoTLKDB_*.sql`` from ``cmangos/wotlk-db``) and fills those tables.
 
+Without ``--dump`` the tool downloads the pinned ``cmangos/wotlk-db`` release
+commit, verifies its SHA-256 and caches it under ``data/cache`` so every
+checkout builds the same ``data/world.db``.  Pass ``--dump PATH`` to import an
+already-downloaded ``.sql`` or ``.sql.gz`` file offline.
+
 Usage::
 
-    python tools/import_wotlk_db.py --dump C:\\path\\WoTLKDB.sql [--db data/world.db]
-    python tools/import_wotlk_db.py --dump WoTLKDB.sql --vendors-only
-    python tools/import_wotlk_db.py --dump WoTLKDB.sql --gameobjects-only
-    python tools/import_wotlk_db.py --dump WoTLKDB.sql --events-only
-    python tools/import_wotlk_db.py --dump WoTLKDB.sql --loot-only
-    python tools/import_wotlk_db.py --dump WoTLKDB.sql --pools-only
-    python tools/import_wotlk_db.py --dump WoTLKDB.sql --spawn-entries-only
+    python tools/import_wotlk_db.py [--db data/world.db]
+    python tools/import_wotlk_db.py --dump C:\\path\\WoTLKDB.sql.gz
+    python tools/import_wotlk_db.py --vendors-only
+    python tools/import_wotlk_db.py --gameobjects-only
+    python tools/import_wotlk_db.py --events-only
+    python tools/import_wotlk_db.py --loot-only
+    python tools/import_wotlk_db.py --pools-only
+    python tools/import_wotlk_db.py --spawn-entries-only
+    python tools/import_wotlk_db.py --graveyards-only
 
-``--quests-only`` refreshes just the quest tables (``quest_template`` and the
-creature/area-trigger quest relations) of an existing database.
+The world bank is separate from ``data/characters.db``; character rows are
+never written to it.  ``--quests-only`` refreshes just the quest tables
+(``quest_template`` and the creature/area-trigger quest relations) of an
+existing database.
 
 The import is idempotent: by default the creature/gossip/npc-text tables are
 cleared first, so running it again always produces the same data and never
@@ -28,10 +37,13 @@ contend with a live writer.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import os
 import re
 import sys
 import time
+import urllib.error
+import urllib.request
 
 root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, root)
@@ -39,10 +51,98 @@ sys.path.insert(0, os.path.join(root, "tools"))
 
 import wotlk_dump
 
+# The world bank is reproducible: everyone downloads the same CMaNGOS release
+# commit and the SHA-256 below is verified before anything is imported.  Bump
+# all four values together when intentionally upgrading the data set.
+CMANGOS_REPO = "cmangos/wotlk-db"
+CMANGOS_COMMIT = "5612dec4fd60cf029c424b27627f1c60be03e153"
+CMANGOS_DUMP_FILE = "Full_DB/WoTLKDB_1_9_14092.sql.gz"
+CMANGOS_DUMP_SIZE = 30_009_076
+CMANGOS_DUMP_SHA256 = (
+    "8a380e6807ccf4b301d1412bdcfbe459b9eb2190f2c5d2ddda902365d41299ac"
+)
+
 try:  # importing the package is only needed for the optional start-position report
     from src.world.character_db import _START_POSITIONS
 except Exception:  # pragma: no cover - tool still works without the server package
     _START_POSITIONS = {}
+
+
+def default_dump_cache_dir() -> str:
+    """Where downloaded CMaNGOS dumps are kept (gitignored)."""
+    return os.path.join(root, "data", "cache")
+
+
+def _sha256(path: str) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def download_dump(cache_dir: str | None = None, force: bool = False) -> str:
+    """Download and verify the pinned CMaNGOS WotLK world dump.
+
+    Returns the path to the cached ``.sql.gz`` file.  The checksum is checked
+    every time, so a partial or tampered download can never be imported.
+    """
+    cache_dir = cache_dir or default_dump_cache_dir()
+    os.makedirs(cache_dir, exist_ok=True)
+    name = f"WoTLKDB-{CMANGOS_COMMIT[:12]}.sql.gz"
+    target = os.path.join(cache_dir, name)
+
+    if os.path.isfile(target) and not force:
+        if (os.path.getsize(target) == CMANGOS_DUMP_SIZE
+                and _sha256(target) == CMANGOS_DUMP_SHA256):
+            print(f"using cached CMaNGOS dump {target}")
+            return target
+        print(f"discarding cached dump with a bad checksum: {target}")
+        os.unlink(target)
+
+    url = ("https://raw.githubusercontent.com/"
+           f"{CMANGOS_REPO}/{CMANGOS_COMMIT}/{CMANGOS_DUMP_FILE}")
+    print(f"downloading {url}")
+    partial = target + ".part"
+    try:
+        request = urllib.request.Request(
+            url, headers={"User-Agent": "ManaWoW-import/1.0"})
+        with urllib.request.urlopen(request, timeout=120) as response, \
+                open(partial, "wb") as handle:
+            downloaded = 0
+            next_report = 4 * 1024 * 1024
+            while True:
+                block = response.read(256 * 1024)
+                if not block:
+                    break
+                handle.write(block)
+                downloaded += len(block)
+                if downloaded >= next_report:
+                    print(f"  {downloaded / 1_048_576:.1f} MiB")
+                    next_report += 4 * 1024 * 1024
+        size = os.path.getsize(partial)
+        if size != CMANGOS_DUMP_SIZE:
+            raise RuntimeError(
+                f"downloaded dump has {size} bytes, expected"
+                f" {CMANGOS_DUMP_SIZE}")
+        digest = _sha256(partial)
+        if digest != CMANGOS_DUMP_SHA256:
+            raise RuntimeError(
+                "downloaded dump failed its SHA-256 check:\n"
+                f"  expected {CMANGOS_DUMP_SHA256}\n"
+                f"  actual   {digest}")
+        os.replace(partial, target)
+    except (urllib.error.URLError, TimeoutError, RuntimeError) as exc:
+        try:
+            os.unlink(partial)
+        except OSError:
+            pass
+        raise SystemExit(
+            f"could not download the CMaNGOS dump: {exc}\n"
+            "Download it manually and pass --dump PATH to import offline."
+        ) from exc
+    print(f"verified {CMANGOS_DUMP_SHA256[:16]}... ({CMANGOS_DUMP_SIZE:,} bytes)")
+    return target
 
 
 # Menu-option text that CMaNGOS stores as a client global-string token instead
@@ -147,6 +247,9 @@ TEMPLATE_COLUMNS = (
     "speed_walk", "speed_run", "min_damage", "max_damage",
     "attack_power", "ranged_attack_power", "armor",
     "melee_attack_speed", "ranged_attack_speed", "crit_chance",
+    # Trainer selection (CMaNGOS creature_template Trainer* columns).
+    "trainer_type", "trainer_spell", "trainer_class", "trainer_race",
+    "trainer_template_id",
 )
 
 SPAWN_COLUMNS = ("guid", "entry", "map", "zone", "x", "y", "z", "o",
@@ -414,6 +517,16 @@ PLAYERCREATEINFO_ACTION_MAP = (
     ("action", "action"), ("type", "type"),
 )
 
+TRAINER_MAP = (
+    ("entry", "entry"), ("spell", "spell"), ("spellcost", "spellcost"),
+    ("reqskill", "reqskill"), ("reqskillvalue", "reqskillvalue"),
+    ("reqlevel", "reqlevel"), ("reqability1", "ReqAbility1"),
+    ("reqability2", "ReqAbility2"), ("reqability3", "ReqAbility3"),
+    ("condition_id", "condition_id"),
+)
+TRAINER_TEMPLATE_MAP = TRAINER_MAP
+TRAINER_GREETING_MAP = (("entry", "Entry"), ("text", "Text"))
+
 
 def read_rune_cost_dbc(path: str) -> list[tuple[int, int, int, int, int]]:
     """Read ``SpellRuneCost.dbc`` (WDBC) into ``(id, blood, unholy, frost, rp)``.
@@ -560,7 +673,65 @@ def _insert_spell_durations(con, rows) -> int:
         "id, duration, duration_per_level, max_duration) VALUES(?,?,?,?)",
         rows,
     )
+    # The SPIRIT_HEALER activation casts Resurrection Sickness (15007), whose
+    # SpellDuration.dbc row 427 is not part of the SQL dump.  Seed the known
+    # ten-minute duration even when no DBC was supplied.
+    con.execute(
+        "INSERT OR IGNORE INTO spell_duration(id, duration, duration_per_level,"
+        " max_duration) VALUES(427, 600000, 0, 600000)")
     return len(rows)
+
+
+def build_graveyard_rows(safe_rows, zone_rows):
+    """Return ``(locations, links)`` tuples for the two graveyard tables."""
+    locations = []
+    for raw in safe_rows:
+        gid = _sqlite_int(raw.get("id"))
+        if not gid:
+            continue
+        locations.append((
+            gid,
+            _sqlite_int(raw.get("map")),
+            _sqlite_float(raw.get("x")),
+            _sqlite_float(raw.get("y")),
+            _sqlite_float(raw.get("z")),
+            _sqlite_float(raw.get("o")),
+            _text_or_empty(raw.get("name")),
+        ))
+    links = []
+    for raw in zone_rows:
+        gid = _sqlite_int(raw.get("id"))
+        ghost_loc = _sqlite_int(raw.get("ghost_loc"))
+        if not gid or not ghost_loc:
+            continue
+        links.append((
+            gid,
+            ghost_loc,
+            _sqlite_int(raw.get("link_kind")),
+            _sqlite_int(raw.get("faction")),
+        ))
+    return locations, links
+
+
+def insert_graveyard_rows(con, safe_rows, zone_rows) -> dict[str, int]:
+    from src.world import graveyard
+
+    graveyard.ensure_graveyard_schema(con)
+    locations, links = build_graveyard_rows(safe_rows, zone_rows)
+    con.execute("DELETE FROM graveyard_locations")
+    con.execute("DELETE FROM graveyard_zones")
+    con.executemany(
+        "INSERT OR REPLACE INTO graveyard_locations("
+        "id, map, x, y, z, o, name) VALUES(?,?,?,?,?,?,?)",
+        locations,
+    )
+    con.executemany(
+        "INSERT OR REPLACE INTO graveyard_zones("
+        "id, ghost_loc, link_kind, faction) VALUES(?,?,?,?)",
+        links,
+    )
+    return {"graveyard_locations": len(locations),
+            "graveyard_zones": len(links)}
 
 
 def _insert_mapped(con, table, pairs, raw_rows, float_columns=frozenset(),
@@ -731,6 +902,11 @@ def _template_row(template: dict) -> tuple:
         int(template.get("MeleeBaseAttackTime") or 2000),
         int(template.get("RangedBaseAttackTime") or 3000),
         0.0,
+        int(template.get("TrainerType") or 0),
+        int(template.get("TrainerSpell") or 0),
+        int(template.get("TrainerClass") or 0),
+        int(template.get("TrainerRace") or 0),
+        int(template.get("TrainerTemplateId") or 0),
     )
 
 
@@ -796,7 +972,7 @@ def import_vendors(dump_path: str, db_path: str) -> dict[str, int]:
     """
     import sqlite3
 
-    from src.world.character_db import init_character_db
+    from src.world.character_db import init_world_db
     from src.world.creature import init_creature_db
 
     started = time.time()
@@ -808,7 +984,7 @@ def import_vendors(dump_path: str, db_path: str) -> dict[str, int]:
     del text
 
     init_creature_db(db_path)
-    init_character_db(db_path)
+    init_world_db(db_path)
     rows = build_vendor_rows(raw_vendor, raw_vendor_template, raw_templates)
     con = sqlite3.connect(db_path)
     try:
@@ -835,6 +1011,65 @@ def import_vendors(dump_path: str, db_path: str) -> dict[str, int]:
           f"and {added_items:,} missing item templates "
           f"in {time.time() - started:.1f}s")
     return {"vendor_items": vendor_items, "vendors": vendors, "items_added": added_items}
+
+
+def import_trainers(dump_path: str, db_path: str) -> dict[str, int]:
+    """Refresh the three CMaNGOS trainer tables and template trainer columns.
+
+    This is the focused variant for an already imported world database; the
+    full :func:`import_world` does the same work from data it has already read.
+    """
+    text = wotlk_dump.read_dump(dump_path)
+    _, raw_trainers = wotlk_dump.rows(text, "npc_trainer")
+    _, raw_templates = wotlk_dump.rows(text, "npc_trainer_template")
+    _, raw_greetings = wotlk_dump.rows(text, "trainer_greeting")
+    _, raw_creatures = wotlk_dump.rows(text, "creature_template")
+
+    from src.world.creature import init_creature_db
+
+    init_creature_db(db_path)
+    import sqlite3
+
+    con = sqlite3.connect(db_path)
+    try:
+        con.execute("PRAGMA synchronous=OFF")
+        con.execute("DELETE FROM npc_trainer")
+        con.execute("DELETE FROM npc_trainer_template")
+        con.execute("DELETE FROM trainer_greeting")
+        counts = {
+            "npc_trainer": _insert_mapped(
+                con, "npc_trainer", TRAINER_MAP, raw_trainers),
+            "npc_trainer_template": _insert_mapped(
+                con, "npc_trainer_template", TRAINER_TEMPLATE_MAP,
+                raw_templates),
+            "trainer_greeting": _insert_mapped(
+                con, "trainer_greeting", TRAINER_GREETING_MAP, raw_greetings,
+                text_columns=frozenset(("text",))),
+        }
+        updates = [
+            (
+                int(row.get("TrainerType") or 0),
+                int(row.get("TrainerSpell") or 0),
+                int(row.get("TrainerClass") or 0),
+                int(row.get("TrainerRace") or 0),
+                int(row.get("TrainerTemplateId") or 0),
+                int(row.get("Entry") or 0),
+            )
+            for row in raw_creatures
+            if int(row.get("Entry") or 0)
+        ]
+        con.executemany(
+            "UPDATE creature_templates SET trainer_type = ?,"
+            " trainer_spell = ?, trainer_class = ?, trainer_race = ?,"
+            " trainer_template_id = ? WHERE entry = ?",
+            updates,
+        )
+        counts["creature_trainers"] = len(updates)
+        con.commit()
+        con.execute("PRAGMA optimize")
+    finally:
+        con.close()
+    return counts
 
 
 def import_world(dump_path: str, db_path: str, clear: bool = True,
@@ -880,6 +1115,11 @@ def import_world(dump_path: str, db_path: str, clear: bool = True,
     quest_tables = read_quest_tables(text)
     _, raw_npc_vendor = wotlk_dump.rows(text, "npc_vendor")
     _, raw_npc_vendor_template = wotlk_dump.rows(text, "npc_vendor_template")
+    _, raw_npc_trainer = wotlk_dump.rows(text, "npc_trainer")
+    _, raw_npc_trainer_template = wotlk_dump.rows(text, "npc_trainer_template")
+    _, raw_trainer_greeting = wotlk_dump.rows(text, "trainer_greeting")
+    _, raw_safe_locs = wotlk_dump.rows(text, "world_safe_locs")
+    _, raw_graveyard_zones = wotlk_dump.rows(text, "game_graveyard_zone")
     gameobject_tables = read_gameobject_tables(text)
     _, raw_game_event_creature = wotlk_dump.rows(text, "game_event_creature")
     creature_pool_tables = {t: wotlk_dump.rows(text, t)[1] for t in (
@@ -981,11 +1221,11 @@ def import_world(dump_path: str, db_path: str, clear: bool = True,
     from src.world.creature import init_creature_db
 
     init_creature_db(db_path)
-    # ``item_templates`` lives in the character schema; loot rows and equipped
-    # gear are useless without it, so make sure it exists before filling it.
-    from src.world.character_db import init_character_db
+    # ``item_templates`` lives in the world bank; loot rows and equipped gear
+    # are useless without it, so make sure it exists before filling it.
+    from src.world.character_db import init_world_db
 
-    init_character_db(db_path)
+    init_world_db(db_path)
 
     con = sqlite3.connect(db_path)
     try:
@@ -997,6 +1237,9 @@ def import_world(dump_path: str, db_path: str, clear: bool = True,
             con.execute("DELETE FROM gossip_options")
             con.execute("DELETE FROM gossip_menus")
             con.execute("DELETE FROM npc_text")
+            con.execute("DELETE FROM npc_trainer")
+            con.execute("DELETE FROM npc_trainer_template")
+            con.execute("DELETE FROM trainer_greeting")
             con.execute("DELETE FROM creature_templates")
 
         template_sql = (
@@ -1131,7 +1374,17 @@ def import_world(dump_path: str, db_path: str, clear: bool = True,
                 build_vendor_rows(raw_npc_vendor, raw_npc_vendor_template,
                                   raw_templates),
             ),
+            "npc_trainer": _insert_mapped(
+                con, "npc_trainer", TRAINER_MAP, raw_npc_trainer),
+            "npc_trainer_template": _insert_mapped(
+                con, "npc_trainer_template", TRAINER_TEMPLATE_MAP,
+                raw_npc_trainer_template),
+            "trainer_greeting": _insert_mapped(
+                con, "trainer_greeting", TRAINER_GREETING_MAP,
+                raw_trainer_greeting, text_columns=frozenset(("text",))),
         }
+        counts.update(insert_graveyard_rows(
+            con, raw_safe_locs, raw_graveyard_zones))
 
         # CMaNGOS spell_template only ships SchoolMask, while the server stores
         # the single school index used by the client packets.  Derive it from
@@ -1202,6 +1455,8 @@ def import_world(dump_path: str, db_path: str, clear: bool = True,
         "gameobject_templates": counts["gameobject_templates"],
         "gameobject_spawns": counts["gameobject_spawns"],
         "creature_events": counts["creature_events"],
+        "graveyard_locations": counts["graveyard_locations"],
+        "graveyard_zones": counts["graveyard_zones"],
     }
     print(
         f"imported {stats['templates']:,} templates, {stats['spawns']:,} spawns, "
@@ -1217,6 +1472,7 @@ def import_world(dump_path: str, db_path: str, clear: bool = True,
         f"{stats['quests']:,} quests, {stats['vendor_items']:,} vendor items, "
         f"{stats['gameobject_templates']:,} game object templates, "
         f"{stats['gameobject_spawns']:,} game object spawns, "
+        f"{stats['graveyard_locations']:,} graveyard locations, "
         f"{stats['creature_events']:,} world-event creatures "
         f"in {time.time() - started:.1f}s"
     )
@@ -1793,7 +2049,8 @@ def insert_quest_tables(con, tables: dict) -> dict[str, int]:
     """
     from src.world import quests
 
-    con.executescript(quests.CREATE_QUEST_SQL)
+    # World bank only: character quest logs live in data/characters.db.
+    con.executescript(quests.CREATE_WORLD_QUEST_SQL)
     con.execute("DELETE FROM quest_templates")
     for _dump_table, table, _key in QUEST_RELATION_TABLES:
         con.execute(f"DELETE FROM {table}")
@@ -1837,14 +2094,14 @@ def import_quests(dump_path: str, db_path: str) -> dict[str, int]:
     """``--quests-only``: refresh just the quest tables of an existing DB."""
     import sqlite3
 
-    from src.world.character_db import init_character_db
+    from src.world.character_db import init_world_db
 
     started = time.time()
     text = wotlk_dump.read_dump(dump_path)
     tables = read_quest_tables(text)
     _, raw_items = wotlk_dump.rows(text, "item_template")
     del text
-    init_character_db(db_path)            # adds item_templates.start_quest
+    init_world_db(db_path)                # adds item_templates.start_quest
     con = sqlite3.connect(db_path)
     try:
         counts = insert_quest_tables(con, tables)
@@ -1898,10 +2155,45 @@ def report_start_zones(db_path: str, radius: float = 150.0) -> None:
         con.close()
 
 
+def import_graveyards(dump_path: str, db_path: str) -> dict[str, int]:
+    """``--graveyards-only``: refresh ``world_safe_locs``/ghost links."""
+    import sqlite3
+
+    from src.world import graveyard
+
+    started = time.time()
+    text = wotlk_dump.read_dump(dump_path)
+    _, safe_rows = wotlk_dump.rows(text, "world_safe_locs")
+    _, zone_rows = wotlk_dump.rows(text, "game_graveyard_zone")
+    del text
+    graveyard.init_graveyard_db(db_path)
+    con = sqlite3.connect(db_path)
+    try:
+        counts = insert_graveyard_rows(con, safe_rows, zone_rows)
+        con.commit()
+    finally:
+        con.close()
+    print(
+        f"imported {counts['graveyard_locations']:,} graveyard locations and "
+        f"{counts['graveyard_zones']:,} zone links in {time.time() - started:.1f}s"
+    )
+    return counts
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--dump", required=True, help="CMaNGOS/TrinityCore world .sql dump")
+    parser.add_argument("--dump", help="CMaNGOS/TrinityCore world .sql (or .sql.gz) "
+                                      "dump; defaults to the pinned download")
+    parser.add_argument("--cache-dir",
+                        help="where to cache the downloaded CMaNGOS dump "
+                             "(default: data/cache)")
+    parser.add_argument("--refresh-dump", action="store_true",
+                        help="re-download the pinned CMaNGOS dump even when "
+                             "the cached copy is valid")
     parser.add_argument("--db", help="target SQLite world database (default: config/config.yaml)")
+    parser.add_argument("--combined", action="store_true",
+                        help="keep the character tables inside the world database "
+                             "(used by CI and the unit-test suite)")
     parser.add_argument("--rune-cost-dbc", help="path to the client's SpellRuneCost.dbc")
     parser.add_argument("--spell-duration-dbc",
                         help="path to the client's SpellDuration.dbc")
@@ -1925,42 +2217,73 @@ def main() -> None:
     parser.add_argument("--events-only", action="store_true",
                         help="only refresh which creature/object spawns belong "
                              "to world events")
+    parser.add_argument("--graveyards-only", action="store_true",
+                        help="only refresh world_safe_locs and graveyard links")
     args = parser.parse_args()
 
-    db_path = args.db
-    if not db_path:
-        # Reuse the server configuration so the tool works from any directory.
-        from src.common.config import Config
-        config_path = os.path.join(root, "config", "config.yaml")
-        if not os.path.exists(config_path):
-            config_path = os.path.join(root, "config", "config.example.yaml")
-        db_path = Config.load(config_path).database.world_path
+    from src.common.config import Config
+
+    config_path = os.path.join(root, "config", "config.yaml")
+    if not os.path.exists(config_path):
+        config_path = os.path.join(root, "config", "config.example.yaml")
+    config = Config.load(config_path)
+    config.resolve_database_paths(root)
+    character_path = getattr(config.database, "character_path", "")
+
+    db_path = args.db or config.database.world_path
+    if args.combined:
+        character_path = ""
+    elif args.db:
+        # A custom world path gets a sibling characters.db, not the one from
+        # config/config.yaml.
+        character_path = os.path.join(
+            os.path.dirname(os.path.abspath(db_path)) or ".", "characters.db")
+    dump_path = args.dump or download_dump(args.cache_dir, args.refresh_dump)
 
     if args.quests_only:
-        import_quests(args.dump, db_path)
+        import_quests(dump_path, db_path)
         return
     if args.vendors_only:
-        import_vendors(args.dump, db_path)
+        import_vendors(dump_path, db_path)
         return
     if args.gameobjects_only:
-        import_gameobjects(args.dump, db_path)
+        import_gameobjects(dump_path, db_path)
         return
     if args.events_only:
-        import_events(args.dump, db_path)
+        import_events(dump_path, db_path)
+        return
+    if args.graveyards_only:
+        import_graveyards(dump_path, db_path)
         return
     if args.loot_only:
-        import_loot(args.dump, db_path)
+        import_loot(dump_path, db_path)
         return
     if args.pools_only:
-        import_pools(args.dump, db_path)
+        import_pools(dump_path, db_path)
         return
     if args.spawn_entries_only:
-        import_spawn_entries(args.dump, db_path)
+        import_spawn_entries(dump_path, db_path)
         return
 
-    import_world(args.dump, db_path, clear=not args.keep_existing,
+    import_world(dump_path, db_path, clear=not args.keep_existing,
                  rune_cost_dbc=args.rune_cost_dbc,
                  spell_duration_dbc=args.spell_duration_dbc)
+
+    # The world bank is complete.  Make sure the separate character store
+    # exists too, so a first-time checkout can start the server immediately.
+    from src.world import databases
+    from src.world.character_db import (configure as configure_character_db,
+                                        init_split_databases)
+    configure_character_db(db_path, character_path)
+    if databases.is_split():
+        init_split_databases(db_path, character_path)
+        from src.world.quests import init_world_quest_db
+        init_world_quest_db(db_path)
+        print(f"character database ready: {character_path}")
+    else:
+        from src.world.character_db import init_character_db
+        init_character_db(db_path)
+
     print(f"\nvisible spawns at each starting position ({os.path.abspath(db_path)}):")
     report_start_zones(db_path)
 

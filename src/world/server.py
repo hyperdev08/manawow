@@ -11,8 +11,11 @@ from src.common import sqlite_tuning
 from src.world.realmsocket import WorldSocket
 from src.world import character_db
 from src.world import creature
+from src.world import databases
 from src.world import gameobject
 from src.world import geometry
+from src.world import graveyard
+from src.world import los
 from src.world import quests
 from src.world.groups import GroupManager
 from src.world.world_combat import WorldCombatManager
@@ -22,7 +25,9 @@ from src.network.packet_log import get_packet_log
 class WorldServer:
     def __init__(self, config: Config):
         self.config = config
-        self.log = setup_logger("worldserver", config.logging.log_dir, config.logging.level, config.logging.console)
+        self.log = setup_logger("worldserver", config.logging.log_dir,
+                                config.logging.level, config.logging.console,
+                                capture_asyncio=True)
         self._server: Optional[asyncio.AbstractServer] = None
         self.sessions = []
         # One shared aggro/threat/target/position state per engaged creature.
@@ -34,18 +39,44 @@ class WorldServer:
         # Which pooled creatures exist (rare spawns); loaded on first use.
         self.creature_pools = None
         self.packet_log = get_packet_log()
-        self.packet_log.Initialize(config.logging.log_dir)
+        self.packet_log.Initialize(
+            config.logging.log_dir,
+            enabled=getattr(config.logging, "packet_log", True))
+        # Characters live in their own database when one is configured; every
+        # character_db/quests call still receives the world path and is routed
+        # by src.world.databases.
+        world_path = config.database.world_path
+        character_path = getattr(config.database, "character_path", "")
+        character_db.configure(
+            world_path, character_path,
+            int(getattr(config.worldserver, "start_money", 0) or 0))
         # WAL + synchronous=NORMAL: rollback-journal commits blocked the event
         # loop for seconds on Windows (see src/common/sqlite_tuning.py).
-        sqlite_tuning.install(config.database.world_path)
+        sqlite_tuning.install(world_path, character_path or None)
         # Creature/spell tables (including the bundled 3.3.5a starter spells)
         # come first so the character backfill can read them.
-        creature.init_creature_db(config.database.world_path)
-        # Ensure the character schema exists and is up to date (adds the
-        # orientation column to databases created before world entry existed).
-        character_db.init_character_db(config.database.world_path)
-        quests.init_quest_db(config.database.world_path)
-        gameobject.init_gameobject_db(config.database.world_path)
+        creature.init_creature_db(world_path)
+        graveyard.init_graveyard_db(world_path)
+        if databases.is_split():
+            character_db.init_split_databases(world_path, character_path)
+            quests.init_world_quest_db(world_path)
+        else:
+            # Combined database: keep the test/tool layout working.
+            character_db.init_character_db(world_path)
+            quests.init_quest_db(world_path)
+        gameobject.init_gameobject_db(world_path)
+        # Open the shared read connections before players connect: the first
+        # connect on a cold Windows disk can take seconds (Defender scans the
+        # Python process and database), and it must not happen on the loop
+        # while a session is waiting for a query result.
+        sqlite_tuning.warm_read(world_path)
+        sqlite_tuning.warm_read(databases.character_path(world_path))
+        # Groups live in the character store; load them once the schema has
+        # been created so offline members come back with the group.
+        self.groups.load(databases.character_path(world_path))
+        self.log.info(
+            f"World database: {world_path}; character database: "
+            f"{databases.character_path(world_path)}")
         world_geometry = geometry.get_geometry(config,
                                                config.database.world_path)
         if world_geometry is None:
@@ -73,7 +104,7 @@ class WorldServer:
             try:
                 player_guid = int(getattr(session, "player_guid", 0) or 0)
                 self.creature_combat.detach_session(player_guid)
-                await self.groups.on_session_end(player_guid)
+                await self.groups.on_session_end(player_guid, session)
             except Exception:
                 pass
             try:
@@ -84,6 +115,27 @@ class WorldServer:
             self.log.info(f"World client disconnected: {peer}")
 
     async def start(self):
+        # Load the static LOS blocker set off the event loop.  A per-query
+        # mtime/exists check used to block the loop on Windows during combat.
+        world_path = self.config.database.world_path
+        await asyncio.to_thread(los.load_blockers, world_path)
+        # Spawn-pool trees take a few hundred milliseconds to build.  Warm them
+        # before accepting players so the first login does not compete with
+        # that Python work for the GIL while the client is loading.
+        try:
+            gameobject_pools, creature_pools = await asyncio.gather(
+                asyncio.to_thread(gameobject.GameObjectPools.load, world_path),
+                asyncio.to_thread(gameobject.load_creature_pools, world_path),
+            )
+            self.gameobjects.pools = gameobject_pools
+            self.creature_pools = creature_pools
+        except Exception as exc:
+            # A damaged/missing pool table is not fatal; the lazy per-login
+            # load will retry and the rest of the world still starts.
+            self.log.warning(f"Could not preload spawn pools: {exc}")
+        # Remove persisted groups whose reconnect window elapsed while the
+        # server was offline (or before the first player logs in).
+        await self.groups.expire_offline_groups()
         try:
             self._server = await asyncio.start_server(
                 self.handle_client, self.config.worldserver.host, self.config.worldserver.port

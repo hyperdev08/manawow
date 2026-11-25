@@ -7,8 +7,11 @@ import sqlite3
 import struct
 import time
 
+from src.common.db_io import run_db_write
 from src.protocol.opcodes import Opcodes
+from src.world import character_db
 from src.world import creature
+from src.world import databases
 from src.world import gameobject
 from src.world import object_update
 from src.world import spells
@@ -224,7 +227,7 @@ class SpellsMixin:
                                             SPELL_FAILED_OUT_OF_RANGE)
                     return
             if hasattr(self, "_has_line_of_sight") and \
-                    not self._has_line_of_sight(
+                    not await self._has_line_of_sight(
                         self._unit_eye_position(self.player_guid), dest):
                 await self._cast_failed(cast_id, spell_id,
                                         SPELL_FAILED_LINE_OF_SIGHT)
@@ -252,7 +255,7 @@ class SpellsMixin:
             else:
                 target_eye = None
             if target_eye is not None and hasattr(self, "_has_line_of_sight") \
-                    and not self._has_line_of_sight(
+                    and not await self._has_line_of_sight(
                         self._unit_eye_position(self.player_guid), target_eye):
                 await self._cast_failed(cast_id, spell_id,
                                         SPELL_FAILED_LINE_OF_SIGHT)
@@ -377,7 +380,7 @@ class SpellsMixin:
         import sqlite3
         if not self.player_guid:
             return False
-        con = sqlite3.connect(self.config.database.world_path)
+        con = databases.connect_character(self.config.database.world_path)
         try:
             if item_guid:
                 row = con.execute(
@@ -965,7 +968,7 @@ class SpellsMixin:
         slot = 15
         item_slot = None
         if item_guid:
-            con = sqlite3.connect(path)
+            con = databases.connect_character(path)
             try:
                 row = con.execute(
                     "SELECT slot FROM character_items"
@@ -1029,16 +1032,10 @@ class SpellsMixin:
             "expires": now + duration_ms / 1000.0,
             "max_duration": duration_ms / 1000.0,
         }
-        con = sqlite3.connect(path)
-        try:
-            con.execute(
-                "UPDATE character_items SET enchantment_2 = ?"
-                " WHERE character_guid = ? AND slot = ? AND slot IN (15,16)",
-                (enchant_id, int(self.player_guid or 0), slot),
-            )
-            con.commit()
-        finally:
-            con.close()
+        await run_db_write(
+            character_db.update_character_item_enchant, path,
+            int(self.player_guid or 0), int(slot), enchant_id,
+        )
         inventory = getattr(self, "character", {}).get("inventory") or {}
         item = inventory.get(int(slot))
         if item is not None:
@@ -2391,16 +2388,11 @@ class SpellsMixin:
         entry = combat.setdefault("weapon_enchants", {}).pop(slot, None)
         if entry is None:
             return
-        con = sqlite3.connect(self.config.database.world_path)
-        try:
-            con.execute(
-                "UPDATE character_items SET enchantment_2 = 0"
-                " WHERE character_guid = ? AND slot = ?",
-                (int(self.player_guid or 0), int(slot)),
-            )
-            con.commit()
-        finally:
-            con.close()
+        await run_db_write(
+            character_db.update_character_item_enchant,
+            self.config.database.world_path, int(self.player_guid or 0),
+            int(slot), 0,
+        )
         inventory = getattr(self, "character", {}).get("inventory") or {}
         item = inventory.get(int(slot))
         if item is not None:

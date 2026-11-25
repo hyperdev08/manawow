@@ -108,6 +108,7 @@ UNIT_END = 148
 # PLAYER_START = UNIT_END = 148, giving absolute index 148 + 176 = 324.
 PLAYER_START = UNIT_END
 PLAYER_FLAGS = 150
+PLAYER_FLAGS_GHOST = 0x00000010
 PLAYER_BYTES = 153                  # skin | face<<8 | hair style<<16 | hair colour<<24
 PLAYER_BYTES_2 = 154                # facial style in the low byte
 PLAYER_BYTES_3 = 155                # gender in the low byte
@@ -170,6 +171,18 @@ GAMEOBJECT_LEVEL = 16              # uint32
 GAMEOBJECT_BYTES_1 = 17            # state, type, art kit, anim progress
 GAMEOBJECT_END = 18
 
+# --- Corpse (relative to OBJECT_END = 6) --------------------------------
+CORPSE_FIELD_OWNER = 6             # uint64
+CORPSE_FIELD_PARTY = 8             # uint64
+CORPSE_FIELD_DISPLAY_ID = 10       # uint32
+CORPSE_FIELD_ITEM = 11             # 19 x uint32 (display id | inv type<<24)
+CORPSE_FIELD_BYTES_1 = 30          # race<<8 | gender<<16 | skin<<24
+CORPSE_FIELD_BYTES_2 = 31          # face | hair<<8 | colour<<16 | facial<<24
+CORPSE_FIELD_GUILD = 32            # uint32
+CORPSE_FIELD_FLAGS = 33            # uint32
+CORPSE_FIELD_DYNAMIC_FLAGS = 34    # uint32
+CORPSE_END = 36
+
 # Type masks for OBJECT_FIELD_TYPE
 TYPEMASK_OBJECT = 0x0001
 TYPEMASK_ITEM = 0x0002
@@ -177,6 +190,10 @@ TYPEMASK_CONTAINER = 0x0004
 TYPEMASK_UNIT = 0x0008
 TYPEMASK_PLAYER = 0x0010
 TYPEMASK_GAMEOBJECT = 0x0020
+TYPEMASK_CORPSE = 0x0080
+
+# Corpse object guids use HighGuid::Corpse (0xF101 in 3.3.5).
+CORPSE_HIGH_GUID = 0xF101000000000000
 
 # Inventory slot constants (client-side slot numbers)
 INVSLOT_HEAD = 0

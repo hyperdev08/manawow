@@ -1439,7 +1439,8 @@ async def authserver_flow(host: str, port: int, username: str = USERNAME,
 # Worldserver flow
 # ----------------------------------------------------------------------
 async def worldserver_flow(host: str, port: int, session_key: bytes, realm_id: int,
-                           world_db_path: str | None = None):
+                           world_db_path: str | None = None,
+                           character_db_path: str | None = None):
     reader, writer = await asyncio.open_connection(host, port)
     try:
         opcode, challenge = await read_server_packet(reader)
@@ -2176,7 +2177,7 @@ async def worldserver_flow(host: str, port: int, session_key: bytes, realm_id: i
         assert_eq(values.get(F.PLAYER_FIELD_PACK_SLOT_1), 0,
                   "backpack slot 0 emptied by auto-equip")
         if world_db_path:
-            con = sqlite3.connect(world_db_path)
+            con = sqlite3.connect(character_db_path or world_db_path)
             try:
                 row = con.execute(
                     "SELECT slot FROM character_items WHERE character_guid = ?"
@@ -2350,7 +2351,7 @@ async def worldserver_flow(host: str, port: int, session_key: bytes, realm_id: i
 
         # Logout must have written the last position to the character row.
         if world_db_path:
-            con = sqlite3.connect(world_db_path)
+            con = sqlite3.connect(character_db_path or world_db_path)
             try:
                 row = con.execute(
                     "SELECT x, y, z, o, zone FROM characters WHERE guid = ?", (guid,)
@@ -2825,6 +2826,7 @@ async def run_selftest():
     temp_dir = tempfile.mkdtemp(prefix="manawow-selftest-")
     auth_db = os.path.join(temp_dir, "auth.db")
     world_db = os.path.join(temp_dir, "world.db")
+    characters_db = os.path.join(temp_dir, "characters.db")
     log_dir = os.path.join(temp_dir, "logs")
 
     cfg = Config(
@@ -2847,7 +2849,8 @@ async def run_selftest():
             realm_id=1,
             motd="SelfTest",
         ),
-        database=DBConfig(auth_path=auth_db, world_path=world_db),
+        database=DBConfig(auth_path=auth_db, world_path=world_db,
+                          character_path=characters_db),
         logging=LogConfig(level="WARNING", log_dir=log_dir, console=False),
     )
     init_databases(cfg)
@@ -2961,7 +2964,7 @@ async def run_selftest():
 
         print("[3/5] worldserver encrypted auth + character selection + world entry")
         await worldserver_flow(cfg.worldserver.host, cfg.worldserver.port, session_key,
-                               realm_id, world_db)
+                               realm_id, world_db, characters_db)
 
         print("[4/5] cross-account spawn + movement relay")
         session_key2, _realm_addr2, _realm_id2 = await authserver_flow(

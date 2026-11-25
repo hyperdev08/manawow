@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import asyncio
-import sqlite3
 import struct
 import time
 
@@ -12,6 +11,7 @@ from src.world import creature
 from src.world import gameobject
 from src.world import login_packets
 from src.world import object_update
+from src.world import trainer
 from src.world import update_fields as F
 
 from .constants import (
@@ -70,6 +70,26 @@ class WorldEntryMixin:
                 item_dict["owner_guid"] = guid
                 mutable_inventory[slot] = item_dict
             self.character["inventory"] = mutable_inventory
+        # Profession/weapon/riding skill lines for the client's skill array and
+        # the trainer requirement checks.
+        skill_rows = character_db.get_character_skills(
+            self.config.database.world_path, guid)
+        self.character["skills"] = {
+            int(row["skill"]): {
+                "slot": int(row["slot"] or 0),
+                "value": int(row["value"] or 0),
+                "max_value": int(row["max_value"] or 0),
+                "step": int(row["step"] or 0),
+            }
+            for row in skill_rows
+        }
+        object_update.assign_skill_slots(self.character)
+        proficiency_rows = character_db.get_character_proficiencies(
+            self.config.database.world_path, guid)
+        self.character["proficiencies"] = {
+            int(row["item_class"]): int(row["subclass_mask"] or 0)
+            for row in proficiency_rows
+        }
         self.movement_info = None
         self.active_mover_guid = guid
         self._last_position_save = time.monotonic()
@@ -80,6 +100,8 @@ class WorldEntryMixin:
             del self._combat_state
         self._get_combat_state()
         self._apply_combat_stats()
+        if hasattr(self, "_restore_death_state"):
+            await self._restore_death_state()
         if hasattr(self, "_load_quest_state"):
             # Before the create block: it carries the PLAYER_QUEST_LOG fields.
             self._load_quest_state()
@@ -109,8 +131,12 @@ class WorldEntryMixin:
         # inventory we attached above, and a sqlite3.Row has no ``get``.
         # Static creatures are added to the same update packet so the client
         # receives the whole visible world in one atomic create update.
-        creature_blocks = await self.send_npc_spawns()
-        creature_blocks += await self.send_gameobject_spawns()
+        # The two scans touch independent caches and databases.  Running them
+        # together overlaps the creature query with the first game-object map
+        # load instead of serializing both on the client's loading screen.
+        creature_blocks, gameobject_blocks = await asyncio.gather(
+            self.send_npc_spawns(), self.send_gameobject_spawns())
+        creature_blocks += gameobject_blocks
         # Fetch known spells for this character
         known_spells = character_db.get_character_spells(
             self.config.database.world_path, self.player_guid
@@ -126,6 +152,14 @@ class WorldEntryMixin:
             known_spell_ids, action_buttons,
         ):
             await self.send_packet(opcode, payload)
+        # Trainer-taught weapon/armour proficiencies are server state and must
+        # be re-sent after every login (the client only mirrors the packet).
+        for item_class, subclass_mask in self.character.get(
+                "proficiencies", {}).items():
+            if subclass_mask:
+                await self.send_packet(
+                    Opcodes.SMSG_SET_PROFICIENCY,
+                    trainer.build_proficiency(item_class, subclass_mask))
         if self._is_death_knight():
             await self._send_resync_runes()
 
@@ -140,14 +174,24 @@ class WorldEntryMixin:
         # burst complete first also lets a peer that logged in at the same
         # time deliver its own block instead of being skipped.
         self.world_entry_complete = True
+        if hasattr(self, "_prewarm_local_geometry"):
+            self._prewarm_task = asyncio.ensure_future(
+                self._prewarm_local_geometry())
         await self.send_peer_spawns()
         await self.announce_self_to_peers()
         if hasattr(self, "_send_all_auras"):
             await self._send_all_auras()
+        if hasattr(self, "_send_login_death_location"):
+            await self._send_login_death_location()
+        if hasattr(self, "_send_login_corpse_spawns"):
+            await self._send_login_corpse_spawns()
+        if self.server is not None and getattr(
+                self.server, "groups", None) is not None:
+            await self.server.groups.on_player_login(self)
 
     async def handle_logout_request(self, data: bytes):
         if self.in_world:
-            self.persist_position(force=True)
+            await self.persist_position(force=True)
             # Remove pets/guardians while the session still has its map/guid so
             # peers receive the destroy packet.
             await self.dismiss_all_summons()
@@ -158,12 +202,15 @@ class WorldEntryMixin:
                     self.server, "creature_combat", None) is not None:
                 self.server.creature_combat.detach_session(
                     int(self.player_guid or 0))
+            # Mark this session offline before the group manager broadcasts the
+            # updated group list, so peers see the member as disconnected but
+            # the persisted group keeps them.
+            self.in_world = False
             if self.server is not None and getattr(
                     self.server, "groups", None) is not None:
                 await self.server.groups.on_session_end(
-                    int(self.player_guid or 0))
+                    int(self.player_guid or 0), self)
             self.log.info(f"Returning '{self.account_name}' to character selection")
-            self.in_world = False
             self.world_entry_complete = False
             self.player_guid = None
             self.character = None
@@ -212,42 +259,10 @@ class WorldEntryMixin:
         """
         if not self.in_world or not self.character:
             return
-        combat = self._get_combat_state()
-        if not combat["dead"]:
+        if not self._get_combat_state()["dead"]:
             return
-        map_id, zone, x, y, z, o = character_db.start_position(
-            int(self.character["race"]), int(self.character["class"])
-        )
-        self.character["map"] = map_id
-        self.character["zone"] = zone
-        self.character["x"] = x
-        self.character["y"] = y
-        self.character["z"] = z
-        self.character["o"] = o
-        self._apply_combat_stats()
-        self.character["health"] = int(self.character["max_health"])
-        self.character["power"] = self._power_after_reset()
-        con = sqlite3.connect(self.config.database.world_path)
-        try:
-            con.execute(
-                "UPDATE characters SET map = ?, zone = ?, x = ?, y = ?, z = ?, o = ?"
-                " WHERE guid = ?",
-                (map_id, zone, x, y, z, o, int(self.player_guid)),
-            )
-            con.commit()
-        finally:
-            con.close()
-
-        self._repop_pending = True
-        self.movement_info = None
-        await self.send_packet(
-            Opcodes.SMSG_NEW_WORLD,
-            login_packets.build_login_verify_world(self.character),
-        )
-        self.log.info(
-            f"'{self.character['name']}' released spirit at "
-            f"map {map_id} zone {zone}, awaiting worldport ack"
-        )
+        if hasattr(self, "_release_spirit"):
+            await self._release_spirit()
 
     async def handle_worldport_ack(self, data: bytes):
         """``MSG_MOVE_WORLDPORT_ACK``: the client finished loading the new map.
@@ -266,10 +281,23 @@ class WorldEntryMixin:
         # the world is rebuilt so the stale coordinates are not re-sent.
         await self.dismiss_all_summons()
 
-        # Leaving the death state before re-sending the world keeps the combat
-        # tick from immediately killing the player again.
         combat = self._get_combat_state()
-        combat["dead"] = False
+        ghost = bool(combat.get("ghost"))
+        if ghost:
+            # Still a ghost at the graveyard.  Keep the death state and the
+            # ghost flag; only the world around the player is rebuilt.
+            combat["dead"] = True
+            combat["ghost"] = True
+            self.character["health"] = 1
+            self.character["power"] = 0
+            self.character["player_flags"] = F.PLAYER_FLAGS_GHOST
+            self.character["death_state"] = 2
+        else:
+            # A non-release worldport (kept for future teleport paths).
+            combat["dead"] = False
+            combat["ghost"] = False
+            self.character["player_flags"] = 0
+            self.character["death_state"] = 0
         combat["in_combat"] = False
         combat["auto_attacking"] = False
         combat["target_guid"] = 0
@@ -283,7 +311,7 @@ class WorldEntryMixin:
         combat["aggro"].clear()
         # CMaNGOS resurrects with a full rune set; re-init and resync so the
         # client does not keep the cooldowns from before the death.
-        if self._is_death_knight():
+        if not ghost and self._is_death_knight():
             self._init_runes()
         await self._close_loot()
 
@@ -311,10 +339,15 @@ class WorldEntryMixin:
         )
         await self._send_player_fields({
             F.UNIT_FIELD_HEALTH: int(self.character["health"]),
+            F.PLAYER_FLAGS: int(self.character.get("player_flags", 0) or 0),
             self._power_field(F.UNIT_FIELD_POWER1): int(self.character["power"]),
             self._power_field(F.UNIT_FIELD_MAXPOWER1): int(self.character["max_power"]),
         })
-        if self._is_death_knight():
+        if ghost and hasattr(self, "_set_ghost_auras"):
+            # ``combat["auras"]`` was reset above; the ghost aura must be
+            # recreated for the rebuilt client world.
+            await self._set_ghost_auras(True)
+        if not ghost and self._is_death_knight():
             await self._send_resync_runes()
         await self.send_packet(
             Opcodes.SMSG_INIT_WORLD_STATES,
@@ -325,12 +358,24 @@ class WorldEntryMixin:
             login_packets.build_login_set_time_speed(),
         )
         await self.send_packet(Opcodes.SMSG_TIME_SYNC_REQ, struct.pack("<I", 0))
-        # uint32(-1) removes the spirit-healer marker from the minimap, exactly
-        # like CMaNGOS ``Player::ResurrectPlayer``.
-        await self.send_packet(
-            Opcodes.SMSG_DEATH_RELEASE_LOC,
-            struct.pack("<Ifff", 0xFFFFFFFF, 0.0, 0.0, 0.0),
-        )
+        if ghost:
+            grave = combat.get("death_graveyard")
+            if grave is None:
+                grave = await self._nearest_graveyard()
+            if grave is not None:
+                await self.send_packet(
+                    Opcodes.SMSG_DEATH_RELEASE_LOC,
+                    struct.pack("<Ifff", int(grave["map"]),
+                                float(grave["x"]), float(grave["y"]),
+                                float(grave["z"])),
+                )
+        else:
+            # uint32(-1) removes the spirit-healer marker from the minimap,
+            # exactly like CMaNGOS ``Player::ResurrectPlayer``.
+            await self.send_packet(
+                Opcodes.SMSG_DEATH_RELEASE_LOC,
+                struct.pack("<Ifff", 0xFFFFFFFF, 0.0, 0.0, 0.0),
+            )
         await self.refresh_creature_visibility(force=True)
         await self.announce_self_to_peers()
         self.log.info(
@@ -353,7 +398,8 @@ class WorldEntryMixin:
 
     async def _creature_spawns_near(self, x: float, y: float, z: float) -> list:
         """Static creatures in range, without the pool members that are not up."""
-        spawns = creature.get_creature_spawns_near(
+        spawns = await asyncio.to_thread(
+            creature.get_creature_spawns_near,
             self.config.database.world_path,
             int(self.character["map"]),
             x, y, z,
@@ -398,6 +444,8 @@ class WorldEntryMixin:
         """
         if not self.in_world or not self.character:
             return
+        if hasattr(self, "refresh_corpse_visibility"):
+            await self.refresh_corpse_visibility(force=force)
         await self.refresh_gameobject_visibility(force=force)
         point = self._creature_scan_point()
         if point is None:

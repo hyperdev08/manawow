@@ -9,6 +9,7 @@ import time
 
 from src.protocol.opcodes import Opcodes
 from src.world import creature
+from src.world import databases
 from src.world import spells
 
 from .constants import (
@@ -52,6 +53,8 @@ class CombatMixin:
             pass
 
     async def _combat_tick(self, now: float) -> None:
+        if not self.in_world or not self.character:
+            return
         combat = self._get_combat_state()
 
         # 1. finish a cast whose casting time elapsed
@@ -108,7 +111,13 @@ class CombatMixin:
         # 4. creatures that are fighting us
         if combat["aggro"] and not combat["dead"]:
             for low_guid in list(combat["aggro"]):
-                await self._creature_combat_tick(low_guid, now)
+                try:
+                    await self._creature_combat_tick(low_guid, now)
+                except Exception as exc:
+                    # One bad spawn must not abort idle movement, pets and
+                    # regeneration for every other creature in this tick.
+                    self.log.warning(
+                        f"Creature combat tick failed for {low_guid}: {exc}")
 
         # 5. idle creatures wander or follow their waypoint path
         await self._creature_idle_tick_all(now)
@@ -116,7 +125,10 @@ class CombatMixin:
         # 5b. summoned pets/guardians follow the owner and assist in combat
         await self._summon_tick_all(now)
 
-        # 6. out-of-combat regeneration
+        # 6. out-of-combat regeneration.  A logout can clear ``character``
+        # while this tick was awaiting a packet; do not dereference it then.
+        if not self.character:
+            return
         await self._regenerate(now)
         if hasattr(self, "_party_stats_tick"):
             await self._party_stats_tick(now)
@@ -163,7 +175,7 @@ class CombatMixin:
                 and not self._target_in_front(target_guid):
             await self.send_packet(Opcodes.SMSG_ATTACKSWING_BADFACING, b"")
             return
-        if hasattr(self, "_has_line_of_sight") and not self._has_line_of_sight(
+        if hasattr(self, "_has_line_of_sight") and not await self._has_line_of_sight(
                 self._unit_eye_position(self.player_guid),
                 self._unit_eye_position(target_guid)):
             await self.send_packet(Opcodes.SMSG_ATTACKSWING_CANT_ATTACK, b"")
@@ -244,7 +256,7 @@ class CombatMixin:
                 and not self._target_in_front(target_guid):
             await self.send_packet(Opcodes.SMSG_ATTACKSWING_BADFACING, b"")
             return
-        if hasattr(self, "_has_line_of_sight") and not self._has_line_of_sight(
+        if hasattr(self, "_has_line_of_sight") and not await self._has_line_of_sight(
                 self._unit_eye_position(self.player_guid),
                 self._unit_eye_position(target_guid)):
             return
@@ -390,22 +402,30 @@ class CombatMixin:
         return result
 
     def _equipped_weapon_stats(self, slot: int, fallback: bool):
-        con = sqlite3.connect(self.config.database.world_path)
-        try:
-            row = con.execute(
-                "SELECT it.damage_min1, it.damage_max1, it.delay "
-                "FROM character_items ci "
-                "JOIN item_templates it ON it.entry = ci.item_entry "
-                "WHERE ci.character_guid = ? AND ci.slot = ?",
-                (int(self.player_guid or 0), int(slot)),
-            ).fetchone()
-        finally:
-            con.close()
+        cache = getattr(self, "_weapon_stats_cache", None)
+        if cache is None:
+            cache = {}
+            self._weapon_stats_cache = cache
+        if int(slot) in cache:
+            row = cache[int(slot)]
+        else:
+            con = databases.connect_character(self.config.database.world_path)
+            try:
+                db_row = con.execute(
+                    "SELECT it.damage_min1, it.damage_max1, it.delay "
+                    "FROM character_items ci "
+                    "JOIN item_templates it ON it.entry = ci.item_entry "
+                    "WHERE ci.character_guid = ? AND ci.slot = ?",
+                    (int(self.player_guid or 0), int(slot)),
+                ).fetchone()
+            finally:
+                con.close()
+            row = (float(db_row[0] or 0.0), float(db_row[1] or 0.0),
+                   int(db_row[2] or 0)) if db_row else None
+            cache[int(slot)] = row
         if not row:
             return dict(self._BARE_HAND) if fallback else None
-        low = float(row[0] or 0.0)
-        high = float(row[1] or 0.0)
-        delay = int(row[2] or 0)
+        low, high, delay = row
         if high <= 0.0:
             return dict(self._BARE_HAND) if fallback else None
         if low <= 0.0:
@@ -459,9 +479,16 @@ class CombatMixin:
 
         ``item_template.spelltrigger_N == 2`` is chance-on-hit; the actual rate
         is stored in ``spellppmRate_N`` (procs per minute).  A ppm of zero is
-        treated as "not configured" and skipped.
+        treated as "not configured" and skipped.  The rows are immutable for a
+        session, so cache them and invalidate only when equipment changes.
         """
-        con = sqlite3.connect(self.config.database.world_path)
+        cache = getattr(self, "_weapon_proc_cache", None)
+        if cache is None:
+            cache = {}
+            self._weapon_proc_cache = cache
+        if int(slot) in cache:
+            return cache[int(slot)]
+        con = databases.connect_character(self.config.database.world_path)
         con.row_factory = sqlite3.Row
         try:
             row = con.execute(
@@ -483,6 +510,7 @@ class CombatMixin:
         finally:
             con.close()
         if row is None:
+            cache[int(slot)] = []
             return []
         result = []
         for index in range(1, 6):
@@ -499,6 +527,7 @@ class CombatMixin:
                 "cooldown": int(row[f"spell_cooldown{index}"] or 0),
                 "charges": int(row[f"spell_charges{index}"] or 0),
             })
+        cache[int(slot)] = result
         return result
 
     def _weapon_enchant_procs(self, slot: int) -> dict | None:
@@ -594,7 +623,7 @@ class CombatMixin:
         """Reload ``enchantment_2`` temporary weapon enchants after login."""
         if not self.player_guid:
             return
-        con = sqlite3.connect(self.config.database.world_path)
+        con = databases.connect_character(self.config.database.world_path)
         con.row_factory = sqlite3.Row
         try:
             rows = con.execute(
@@ -669,7 +698,7 @@ class CombatMixin:
                 and not self._target_in_front(target_guid):
             await self.send_packet(Opcodes.SMSG_ATTACKSWING_BADFACING, b"")
             return
-        if hasattr(self, "_has_line_of_sight") and not self._has_line_of_sight(
+        if hasattr(self, "_has_line_of_sight") and not await self._has_line_of_sight(
                 self._unit_eye_position(self.player_guid),
                 self._unit_eye_position(target_guid)):
             await self.send_packet(Opcodes.SMSG_ATTACKSWING_CANT_ATTACK, b"")
@@ -714,7 +743,7 @@ class CombatMixin:
                 and not self._target_in_front(target_guid):
             await self.send_packet(Opcodes.SMSG_ATTACKSWING_BADFACING, b"")
             return
-        if hasattr(self, "_has_line_of_sight") and not self._has_line_of_sight(
+        if hasattr(self, "_has_line_of_sight") and not await self._has_line_of_sight(
                 self._unit_eye_position(self.player_guid),
                 self._unit_eye_position(target_guid)):
             return

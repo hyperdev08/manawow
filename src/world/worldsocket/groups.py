@@ -39,15 +39,19 @@ class GroupsMixin:
             return
         if now - float(getattr(self, "_last_party_stats", 0.0)) < 1.0:
             return
-        group = manager.group_for(int(self.player_guid))
-        if group is None:
-            return
         self._last_party_stats = now
-        payload = build_party_member_stats_full(self)
-        for session in manager.member_sessions(group):
-            if session is not self:
-                await session.send_packet(
-                    Opcodes.SMSG_PARTY_MEMBER_STATS_FULL, payload)
+        group = manager.group_for(int(self.player_guid))
+        if group is not None:
+            payload = build_party_member_stats_full(self)
+            for session in manager.member_sessions(group):
+                if session is not self:
+                    await session.send_packet(
+                        Opcodes.SMSG_PARTY_MEMBER_STATS_FULL, payload)
+            await manager.tick_rolls(now)
+            await manager.tick_ready_checks(now)
+        # Runs even for ungrouped players so a fully offline group can expire
+        # while the rest of the realm is still online.
+        await manager.expire_offline_groups()
 
     # -- CMSG handlers -------------------------------------------------
     async def handle_group_invite(self, data: bytes):
@@ -116,20 +120,71 @@ class GroupsMixin:
             return
         first, pos = self._read_cstring(data, 0)
         second, _pos = self._read_cstring(data, pos)
-        group = manager.group_for(int(self.player_guid))
-        if group is None or not group.is_leader(self.player_guid):
+        await manager.swap_subgroup(self, first, second)
+
+    async def handle_group_assistant_leader(self, data: bytes):
+        manager = self._group_manager()
+        if manager is None or len(data) < 9:
             return
-        first_session = manager.session_by_name(first)
-        second_session = manager.session_by_name(second)
-        if first_session is None or second_session is None:
+        guid = struct.unpack_from("<Q", data, 0)[0]
+        apply = bool(data[8])
+        await manager.set_assistant(self, int(guid), apply)
+
+    async def handle_loot_method(self, data: bytes):
+        manager = self._group_manager()
+        if manager is None or len(data) < 16:
             return
-        first_slot = group.members.get(int(first_session.player_guid))
-        second_slot = group.members.get(int(second_session.player_guid))
-        if first_slot is None or second_slot is None:
+        method = struct.unpack_from("<I", data, 0)[0]
+        master = struct.unpack_from("<Q", data, 4)[0]
+        threshold = struct.unpack_from("<I", data, 12)[0]
+        await manager.set_loot_method(
+            self, int(method), int(master), int(threshold))
+
+    async def handle_loot_roll(self, data: bytes):
+        manager = self._group_manager()
+        if manager is None or len(data) < 13:
             return
-        first_slot.subgroup, second_slot.subgroup = (
-            second_slot.subgroup, first_slot.subgroup)
-        await manager.send_group_list(group)
+        item_guid = struct.unpack_from("<Q", data, 0)[0]
+        slot = struct.unpack_from("<I", data, 8)[0]
+        roll_type = data[12]
+        await manager.cast_roll_vote(
+            self, int(item_guid), int(slot), int(roll_type))
+
+    async def handle_opt_out_of_loot(self, data: bytes):
+        manager = self._group_manager()
+        if manager is None or len(data) < 4:
+            return
+        enabled = struct.unpack_from("<I", data, 0)[0]
+        await manager.set_pass_on_loot(self, bool(enabled))
+
+    async def handle_raid_target_update(self, data: bytes):
+        manager = self._group_manager()
+        if manager is None or not self.player_guid or not data:
+            return
+        icon_id = data[0]
+        if icon_id == 0xFF:
+            group = manager.group_for(int(self.player_guid))
+            if group is not None:
+                await manager.send_target_icons(self, group)
+            return
+        if len(data) < 9:
+            return
+        target_guid = struct.unpack_from("<Q", data, 1)[0]
+        await manager.set_target_icon(self, int(icon_id), int(target_guid))
+
+    async def handle_raid_ready_check(self, data: bytes):
+        manager = self._group_manager()
+        if manager is None or not self.player_guid:
+            return
+        if not data:
+            await manager.start_ready_check(self)
+        else:
+            await manager.confirm_ready(self, int(data[0]))
+
+    async def handle_raid_ready_check_finished(self, data: bytes):
+        manager = self._group_manager()
+        if manager is not None and self.player_guid:
+            await manager.finish_ready_check(self)
 
     async def handle_request_party_member_stats(self, data: bytes):
         manager = self._group_manager()

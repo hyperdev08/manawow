@@ -38,7 +38,7 @@ class FakeLoot(LootMixin):
     def _get_creature_spawn(self, low_guid):
         return self.spawn
 
-    async def _send_loot_response(self, guid, items, money):
+    async def _send_loot_response(self, guid, items, money, slot_types=None):
         self.responses.append((guid, list(items), money))
 
     async def _send_creature_fields(self, low_guid, fields):
@@ -126,6 +126,12 @@ def test_loot_money_uses_creature_template_range():
         {"min_loot_gold": 0, "max_loot_gold": 0}) == 0
     # Missing columns are treated as "no money", not a synthetic level drop.
     assert LootMixin._loot_money({}) == 0
+
+
+def test_loot_slot_keys_preserve_corpse_indices():
+    raw = [(100, 1), (0, 0), (101, 2)]
+    filtered = [(100, 1), (101, 2)]
+    assert LootMixin._loot_slot_keys(raw, filtered) == [0, 2]
 
 
 def test_real_northshire_loot_uses_known_items_and_gold():

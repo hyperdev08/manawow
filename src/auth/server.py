@@ -18,7 +18,9 @@ class AuthServer:
         self.log = setup_logger("authserver", config.logging.log_dir, config.logging.level, config.logging.console)
         self._server: Optional[asyncio.AbstractServer] = None
         self.packet_log = get_packet_log()
-        self.packet_log.Initialize(config.logging.log_dir)
+        self.packet_log.Initialize(
+            config.logging.log_dir,
+            enabled=getattr(config.logging, "packet_log", True))
 
     async def handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
         peer = writer.get_extra_info("peername")

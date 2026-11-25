@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import sqlite3
 
+from src.common.db_io import run_db_write
 from src.protocol.opcodes import Opcodes
 from src.world import character_db
 from src.world import creature
@@ -110,7 +111,8 @@ class VendorsMixin:
             return
 
         quantity = max(1, int(item.get("buy_count") or 1)) * count
-        changes = character_db.add_item_to_inventory(
+        changes = await run_db_write(
+            character_db.add_item_to_inventory,
             self.config.database.world_path, int(self.player_guid),
             int(item_entry), quantity,
         )

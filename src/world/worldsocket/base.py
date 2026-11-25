@@ -8,6 +8,7 @@ import struct
 import time
 
 from src.common.config import Config
+from src.common.geometry_io import run_geometry
 from src.common.logger import setup_logger
 from src.crypto.world_crypt import WorldCrypt
 from src.network.packet_header import ClientPacketHeader
@@ -180,7 +181,9 @@ class SocketBase:
         finally:
             self.stop_combat_loop()
             try:
-                self.persist_position(force=True)
+                await self.persist_position(force=True)
+            except asyncio.CancelledError:
+                pass
             except Exception:
                 pass
             # Tell the other clients to remove this character before the
@@ -361,12 +364,28 @@ class SocketBase:
                 await self.handle_group_change_subgroup(data)
             elif opcode == Opcodes.CMSG_GROUP_SWAP_SUB_GROUP:
                 await self.handle_group_swap_subgroup(data)
+            elif opcode == Opcodes.CMSG_GROUP_ASSISTANT_LEADER:
+                await self.handle_group_assistant_leader(data)
+            elif opcode == Opcodes.CMSG_LOOT_METHOD:
+                await self.handle_loot_method(data)
+            elif opcode == Opcodes.MSG_RAID_TARGET_UPDATE:
+                await self.handle_raid_target_update(data)
+            elif opcode == Opcodes.MSG_RAID_READY_CHECK:
+                await self.handle_raid_ready_check(data)
+            elif opcode == Opcodes.MSG_RAID_READY_CHECK_FINISHED:
+                await self.handle_raid_ready_check_finished(data)
             elif opcode == Opcodes.CMSG_REQUEST_PARTY_MEMBER_STATS:
                 await self.handle_request_party_member_stats(data)
             elif opcode == Opcodes.CMSG_LOOT_RELEASE:
                 await self.handle_loot_release(data)
             elif opcode == Opcodes.CMSG_LOOT_MONEY:
                 await self.handle_loot_money(data)
+            elif opcode == Opcodes.CMSG_LOOT_MASTER_GIVE:
+                await self.handle_loot_master_give(data)
+            elif opcode == Opcodes.CMSG_LOOT_ROLL:
+                await self.handle_loot_roll(data)
+            elif opcode == Opcodes.CMSG_OPT_OUT_OF_LOOT:
+                await self.handle_opt_out_of_loot(data)
             elif opcode == Opcodes.CMSG_AUTOSTORE_LOOT_ITEM:
                 await self.handle_autostore_loot_item(data)
             elif opcode == Opcodes.CMSG_LIST_INVENTORY:
@@ -377,8 +396,22 @@ class SocketBase:
                 await self.handle_buy_item(data, in_slot=True)
             elif opcode == Opcodes.CMSG_SELL_ITEM:
                 await self.handle_sell_item(data)
+            elif opcode == Opcodes.CMSG_TRAINER_LIST:
+                await self.handle_trainer_list(data)
+            elif opcode == Opcodes.CMSG_TRAINER_BUY_SPELL:
+                await self.handle_trainer_buy_spell(data)
             elif opcode == Opcodes.CMSG_REPOP_REQUEST:
                 await self.handle_repop_request(data)
+            elif opcode == Opcodes.CMSG_RECLAIM_CORPSE:
+                await self.handle_reclaim_corpse(data)
+            elif opcode == Opcodes.CMSG_SPIRIT_HEALER_ACTIVATE:
+                await self.handle_spirit_healer_activate(data)
+            elif opcode == Opcodes.CMSG_GHOST:
+                await self.handle_ghost(data)
+            elif opcode == Opcodes.MSG_CORPSE_QUERY:
+                await self.handle_corpse_query(data)
+            elif opcode == Opcodes.CMSG_CORPSE_MAP_POSITION_QUERY:
+                await self.handle_corpse_map_position_query(data)
             elif opcode == Opcodes.MSG_MOVE_WORLDPORT_ACK:
                 await self.handle_worldport_ack(data)
             elif opcode in MOVEMENT_OPCODES:
@@ -425,7 +458,9 @@ class SocketBase:
                 "loot_target": 0,
                 "loot_items": [],
                 "loot_taken": [],
+                "loot_slot_keys": [],
                 "loot_money": 0,
+                "pass_on_group_loot": False,
                 "selected_guid": 0,
                 "dead": False,
                 "last_respawn_scan": 0.0,
@@ -566,7 +601,14 @@ class SocketBase:
     def _current_map_id(self) -> int:
         return int((getattr(self, "character", None) or {}).get("map", 0) or 0)
 
-    def _has_line_of_sight(self, start, end, map_id: int | None = None) -> bool:
+    async def _has_line_of_sight(self, start, end,
+                                 map_id: int | None = None) -> bool:
+        """Line-of-sight check, run on the geometry worker.
+
+        VMap WMO parsing and ray tests are CPU-heavy; doing them on the
+        asyncio thread blocked combat for hundreds of milliseconds.  The
+        geometry worker also serialises access to the lazy terrain/VMap caches.
+        """
         if not getattr(self, "character", None):
             return True
         if map_id is None:
@@ -578,7 +620,8 @@ class SocketBase:
         world = (self._get_geometry()
                  if hasattr(self, "_get_geometry") else None)
         if world is not None:
-            return world.has_line_of_sight(int(map_id), start, end)
+            return await run_geometry(
+                world.has_line_of_sight, int(map_id), start, end)
         return los.has_los(
             self.config.database.world_path, int(map_id), start, end)
 
@@ -591,25 +634,59 @@ class SocketBase:
             self._current_map_id() if map_id is None else int(map_id),
             float(x), float(y))
 
-    def _find_world_path(self, start, end, max_tiles: int = 2):
+    async def _find_world_path(self, start, end, max_tiles: int = 2):
         """Navmesh waypoints for ``start`` -> ``end`` (``None`` when unavailable)."""
         world = self._get_geometry()
         if world is None:
             return None
-        return world.find_path(self._current_map_id(), start, end,
-                               max_tiles=max_tiles)
+        return await run_geometry(
+            world.find_path, self._current_map_id(), start, end,
+            max_tiles=max_tiles)
 
-    def _navmesh_point(self, point, max_distance: float = 8.0):
+    async def _prewarm_local_geometry(self) -> None:
+        """Load the player's terrain/VMap tile off the event loop.
+
+        The first line-of-sight query in an area reads and parses map files.
+        Doing that in the background when the player enters the world avoids a
+        multi-hundred-millisecond freeze on the first combat swing.
+        """
+        if not self.character:
+            return
+        world = self._get_geometry()
+        if world is None:
+            return
+        try:
+            x = float(self.character.get("x", 0.0) or 0.0)
+            y = float(self.character.get("y", 0.0) or 0.0)
+            z = float(self.character.get("z", 0.0) or 0.0)
+            map_id = self._current_map_id()
+            await run_geometry(
+                world.has_line_of_sight, map_id,
+                (x, y, z + 1.5), (x + 8.0, y + 4.0, z + 1.5))
+            await run_geometry(world.ground_height, map_id, x, y)
+        except Exception:
+            pass
+
+    async def _navmesh_point(self, point, max_distance: float = 8.0):
         world = self._get_geometry()
         if world is None:
             return None
-        return world.point_on_mesh(self._current_map_id(), point)
+        return await run_geometry(
+            world.point_on_mesh, self._current_map_id(), point)
 
-    def _random_world_point(self, center, radius: float):
+    def _has_navmesh_at(self, point) -> bool:
+        """Whether a generated navmesh tile exists at ``point``."""
+        world = self._get_geometry()
+        if world is None:
+            return False
+        return world.has_navmesh_at(self._current_map_id(), point)
+
+    async def _random_world_point(self, center, radius: float):
         world = self._get_geometry()
         if world is None:
             return None
-        return world.random_point(self._current_map_id(), center, radius)
+        return await run_geometry(
+            world.random_point, self._current_map_id(), center, radius)
 
     @staticmethod
     def _path_prefix(start, path, travel: float, stop_distance: float = 0.0):

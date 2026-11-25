@@ -262,12 +262,19 @@ def init_gameobject_db(path: str) -> None:
 # Static data access
 # ---------------------------------------------------------------------------
 class _MapGrid:
-    """All visible spawns of one map, bucketed into 64-yard cells."""
+    """All visible spawns of one map, bucketed into 64-yard cells.
+
+    Rows stay in their ``sqlite3.Row`` form until a scan selects them.  A map
+    can hold tens of thousands of spawns and converting every row to a dict
+    when the map is first loaded cost over a second of GIL time, which the
+    watchdog saw as login/combat stalls.  ``near`` only converts the handful
+    of rows that are actually within range.
+    """
 
     __slots__ = ("cells", "count")
 
-    def __init__(self, spawns: Iterable[dict]):
-        self.cells: Dict[Tuple[int, int], List[dict]] = {}
+    def __init__(self, spawns: Iterable[Mapping]):
+        self.cells: Dict[Tuple[int, int], List[Mapping]] = {}
         self.count = 0
         for spawn in spawns:
             key = (int(spawn["x"] // _CELL_SIZE), int(spawn["y"] // _CELL_SIZE))
@@ -282,9 +289,15 @@ class _MapGrid:
         for cx in range(lo_x, hi_x + 1):
             for cy in range(lo_y, hi_y + 1):
                 for spawn in self.cells.get((cx, cy), ()):
-                    dx, dy, dz = spawn["x"] - x, spawn["y"] - y, spawn["z"] - z
+                    dx = float(spawn["x"]) - x
+                    dy = float(spawn["y"]) - y
+                    dz = float(spawn["z"]) - z
                     if dx * dx + dy * dy + dz * dz <= limit:
-                        found.append(spawn)
+                        selected = dict(spawn)
+                        selected["x"] = float(selected["x"])
+                        selected["y"] = float(selected["y"])
+                        selected["z"] = float(selected["z"])
+                        found.append(selected)
         found.sort(key=lambda s: s["guid"])
         return found
 
@@ -358,14 +371,11 @@ def load_map(path: str, map_id: int) -> _MapGrid:
             rows = []
     finally:
         con.close()
-    spawns = []
-    for row in rows:
-        spawn = dict(row)
-        if int(spawn["type"]) in UNSUPPORTED_TYPES:
-            continue
-        spawn["x"], spawn["y"], spawn["z"] = (
-            float(spawn["x"]), float(spawn["y"]), float(spawn["z"]))
-        spawns.append(spawn)
+    # Keep the rows lazy: converting every spawn dict here was the dominant
+    # cost of the first map load.  ``_MapGrid.near`` converts only the rows a
+    # visibility scan actually returns.
+    spawns = [row for row in rows
+              if int(row["type"]) not in UNSUPPORTED_TYPES]
     grid = _MapGrid(spawns)
     with _LOCK:
         _GRIDS.setdefault(key, grid)
@@ -863,14 +873,24 @@ class SpawnPools:
         """Activate ``count`` members (0 = all) of ``pool`` or of its child pools."""
         if pool in self.children:
             options = list(self.children[pool])
-            picks = len(options) if count <= 0 else min(count, len(options))
+            if count <= 0:
+                # "Spawn every member" does not need to remove picks one at a
+                # time; the old O(n^2) list rebuilds made pool loading dominate
+                # the first login for large world-event pools.
+                for child, _chance in options:
+                    self._spawn_pool(child, self.limits.get(child, 0))
+                return
+            picks = min(count, len(options))
             for _ in range(picks):
                 child = _roll_member(options)
                 options = [o for o in options if o[0] != child]
                 self._spawn_pool(child, self.limits.get(child, 0))
             return
         options = [m for m in self.members.get(pool, []) if m[0] not in self.active]
-        picks = len(options) if count <= 0 else min(count, len(options))
+        if count <= 0:
+            self.active.update(guid for guid, _chance in options)
+            return
+        picks = min(count, len(options))
         for _ in range(picks):
             guid = _roll_member(options)
             options = [o for o in options if o[0] != guid]

@@ -13,7 +13,10 @@ sys.path.insert(0, root)
 
 from src.common.config import Config
 from src.crypto.srp6 import SRP6
-from src.world.character_db import init_character_db
+from src.world import databases
+from src.world.character_db import (configure as configure_character_db,
+                                    init_character_db,
+                                    init_split_databases)
 from tools.init_db import init_auth_schema
 
 
@@ -58,13 +61,19 @@ def create_account(username: str, password: str, email: str = "") -> None:
     finally:
         con.close()
 
-    init_character_db(cfg.database.world_path)
+    character_path = getattr(cfg.database, "character_path", "")
+    configure_character_db(cfg.database.world_path, character_path)
+    if databases.is_split():
+        init_split_databases(cfg.database.world_path, character_path)
+    else:
+        init_character_db(cfg.database.world_path)
 
     print(f"Account ready: {user} (id {row[0] if row else '?'})")
     print(f"  password: {password}")
     print(f"  salt:     {salt.hex().upper()}")
     print(f"  verifier: {verifier.hex().upper()}")
     print(f"  auth db:  {cfg.database.auth_path}")
+    print(f"  character db: {databases.character_path(cfg.database.world_path)}")
 
 
 def main() -> None:

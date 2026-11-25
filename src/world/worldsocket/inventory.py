@@ -1,9 +1,9 @@
 """Inventory swaps, autoequip and item destruction."""
 from __future__ import annotations
 
-import sqlite3
 import struct
 
+from src.common.db_io import run_db_write
 from src.protocol.opcodes import Opcodes
 from src.world import character_db
 from src.world import login_packets
@@ -101,7 +101,8 @@ class InventoryMixin:
             self.log.warning(f"CMSG_SWAP_INV_ITEM: invalid slots {src_slot}->{dst_slot}")
             await self._send_inventory_failure()
             return
-        ok = character_db.swap_character_items(
+        ok = await run_db_write(
+            character_db.swap_character_items,
             self.config.database.world_path, self.player_guid, src_int, dst_int
         )
         if ok:
@@ -252,7 +253,8 @@ class InventoryMixin:
             return 0
         current = max(1, int(item.get("stack_count", 1)))
         if count == 0 or count >= current:
-            character_db.delete_character_item(
+            await run_db_write(
+                character_db.delete_character_item,
                 self.config.database.world_path, self.player_guid, internal_slot
             )
             del inv[internal_slot]
@@ -271,16 +273,11 @@ class InventoryMixin:
             return current
 
         new_count = current - int(count)
-        con = sqlite3.connect(self.config.database.world_path)
-        try:
-            con.execute(
-                "UPDATE character_items SET stack_count = ? "
-                "WHERE character_guid = ? AND slot = ?",
-                (new_count, self.player_guid, internal_slot),
-            )
-            con.commit()
-        finally:
-            con.close()
+        await run_db_write(
+            character_db.update_character_item_stack,
+            self.config.database.world_path, int(self.player_guid),
+            int(internal_slot), new_count,
+        )
         item["stack_count"] = new_count
         opcode, payload = object_update.build_item_values_update(
             item, {F.ITEM_FIELD_STACK_COUNT: new_count}
@@ -344,13 +341,10 @@ class InventoryMixin:
         """Add ``delta`` copper (negative to spend), persist it, update the client."""
         total = max(0, min(int(self.character.get("money", 0)) + int(delta), 0x7FFFFFFF))
         self.character["money"] = total
-        con = sqlite3.connect(self.config.database.world_path)
-        try:
-            con.execute("UPDATE characters SET money = ? WHERE guid = ?",
-                        (total, int(self.player_guid)))
-            con.commit()
-        finally:
-            con.close()
+        await run_db_write(
+            character_db.set_character_money,
+            self.config.database.world_path, int(self.player_guid), total,
+        )
         await self._send_player_fields({F.PLAYER_FIELD_COINAGE: total & 0xFFFFFFFF})
         return total
 

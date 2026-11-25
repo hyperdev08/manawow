@@ -6,6 +6,7 @@ import sqlite3
 import struct
 import time
 
+from src.common.db_io import run_db_write
 from src.protocol.opcodes import Opcodes
 from src.world import character_db
 from src.world import login_packets
@@ -272,6 +273,12 @@ class StatsMixin:
         ``GetCreateMana`` values, so ``UNIT_FIELD_BASE_HEALTH`` stays the raw
         ``basehp`` (20 for a level-1 warrior) rather than the finished pool.
         """
+        # Equipment or level changed: the next swing must reread the weapon
+        # rows instead of using the session's cached values.
+        for attribute in ("_weapon_stats_cache", "_weapon_proc_cache"):
+            cache = getattr(self, attribute, None)
+            if cache is not None:
+                cache.clear()
         if not self.character:
             return
         level = max(1, int(self.character.get("level", 1)))
@@ -700,15 +707,11 @@ class StatsMixin:
             self.character["health"] = new_max
             self.character["power"] = self._power_after_reset()
             await self._send_level_up_packet(new_max - old_max)
-        con = sqlite3.connect(self.config.database.world_path)
-        try:
-            con.execute(
-                "UPDATE characters SET level = ?, xp = ? WHERE guid = ?",
-                (level, total_xp, self.player_guid),
-            )
-            con.commit()
-        finally:
-            con.close()
+        await run_db_write(
+            character_db.update_character_progress,
+            self.config.database.world_path, int(self.player_guid), level,
+            total_xp,
+        )
         fields = {
             F.PLAYER_XP: total_xp,
             F.PLAYER_NEXT_LEVEL_XP: threshold,
@@ -883,19 +886,14 @@ class StatsMixin:
         combat["target_guid"] = 0
         for low_guid in list(combat["aggro"]):
             await self._reset_creature(low_guid)
+        if hasattr(self, "dismiss_all_summons"):
+            await self.dismiss_all_summons()
 
-        # UNIT_FIELD_HEALTH is already 0; PLAYER_FLAGS/GHOST is not needed for
-        # the client to show the death screen, it only needs the location.
-        await self.send_packet(
-            Opcodes.SMSG_DEATH_RELEASE_LOC,
-            struct.pack(
-                "<Ifff",
-                int(self.character["map"]),
-                float(self.character["x"]),
-                float(self.character["y"]),
-                float(self.character["z"]),
-            ),
-        )
+        combat["ghost"] = False
+        # Persist the corpse, record death state and show the closest
+        # graveyard's release marker.
+        if hasattr(self, "_record_death"):
+            await self._record_death()
         await self._send_system_message("You have died.")
         self.log.info(f"'{self.character['name']}' was killed by {source}")
 
@@ -928,6 +926,8 @@ class StatsMixin:
         mana.  Fractional power is carried between ticks, otherwise a low-level
         character's sub-1-mana-per-tick regen would round down to nothing.
         """
+        if not self.character:
+            return
         combat = self._get_combat_state()
         if combat["dead"]:
             return

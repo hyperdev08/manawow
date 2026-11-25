@@ -1,12 +1,13 @@
 """Creature spawn state, health, aggro and combat ticks."""
 from __future__ import annotations
 
+import asyncio
 import json
 import math
 import random
-import sqlite3
 import time
 
+from src.common.db_io import execute_write, run_db_write, submit_db_write
 from src.protocol.opcodes import Opcodes
 from src.world import creature
 from src.world import login_packets
@@ -134,10 +135,12 @@ class CreaturesMixin:
         await self._send_creature_packet(int(low_guid), opcode, payload)
 
     def _creature_health(self, guid: int) -> int:
-        """Get the current health of a creature from the DB.
+        """Get the current health, preferring the shared in-memory value.
 
         ``dead_since > 0`` marks a corpse even though ``current_health`` is 0
-        both for a corpse and for a spawn that has never been damaged.
+        both for a corpse and for a spawn that has never been damaged.  The
+        database write is asynchronous, so reading the row back after every
+        hit would lose the second hit of the same combat tick.
         """
         low_guid = creature.creature_low_guid(guid)
         spawn = self._get_creature_spawn(low_guid)
@@ -145,6 +148,15 @@ class CreaturesMixin:
             return 0
         if int(spawn["dead_since"] or 0) > 0:
             return 0
+        manager = self._creature_combat_manager()
+        if manager is not None:
+            health = manager.get_health(low_guid, spawn)
+            if health is not None:
+                return max(0, int(health))
+        combat = self._get_combat_state()
+        cached = combat.setdefault("creature_health", {})
+        if int(low_guid) in cached:
+            return max(0, int(cached[int(low_guid)]))
         current = int(spawn["current_health"] or 0)
         if current > 0:
             return current
@@ -157,20 +169,23 @@ class CreaturesMixin:
         return max(1, int(base * multiplier))
 
     def _set_creature_health(self, low_guid: int, health: int) -> None:
-        """Persist a creature's current health (summons stay in memory)."""
-        summon = getattr(self, "_summoned_creatures", {}).get(int(low_guid))
+        """Update the authoritative health in memory, then persist lazily."""
+        low_guid = int(low_guid)
+        health = max(0, int(health))
+        summon = getattr(self, "_summoned_creatures", {}).get(low_guid)
         if summon is not None:
-            summon["current_health"] = max(0, int(health))
+            summon["current_health"] = health
             return
-        con = sqlite3.connect(self.config.database.world_path)
-        try:
-            con.execute(
-                "UPDATE creature_spawns SET current_health = ? WHERE guid = ?",
-                (max(0, int(health)), int(low_guid)),
-            )
-            con.commit()
-        finally:
-            con.close()
+        combat = self._get_combat_state()
+        combat.setdefault("creature_health", {})[low_guid] = health
+        manager = self._creature_combat_manager()
+        if manager is not None:
+            manager.set_health(low_guid, health)
+        submit_db_write(
+            execute_write, self.config.database.world_path,
+            "UPDATE creature_spawns SET current_health = ? WHERE guid = ?",
+            (health, low_guid),
+        )
 
     def _get_creature_spawn(self, low_guid: int):
         """Get a creature spawn row (session summons first, then the DB)."""
@@ -264,16 +279,12 @@ class CreaturesMixin:
                     "last_power_update": now,
                 }
             self._call_for_help(int(low_guid))
-        con = sqlite3.connect(self.config.database.world_path)
-        try:
-            con.execute(
-                "UPDATE creature_spawns SET combat_state = 1, target_guid = ? "
-                "WHERE guid = ? AND dead_since = 0",
-                (int(self.player_guid or 0), int(low_guid)),
-            )
-            con.commit()
-        finally:
-            con.close()
+        submit_db_write(
+            execute_write, self.config.database.world_path,
+            "UPDATE creature_spawns SET combat_state = 1, target_guid = ? "
+            "WHERE guid = ? AND dead_since = 0",
+            (int(self.player_guid or 0), int(low_guid)),
+        )
 
     def _threat_source_guid(self, source_guid: int) -> int:
         """Attribute pet damage to the pet's owner, not the pet guid."""
@@ -422,17 +433,13 @@ class CreaturesMixin:
         loot_items = self._generate_loot(entry, loot_id or entry)
         loot_money = self._loot_money(spawn)
         loot_json = json.dumps({"items": loot_items, "money": loot_money})
-        con = sqlite3.connect(self.config.database.world_path)
-        try:
-            con.execute(
-                "UPDATE creature_spawns SET current_health = 0, dead_since = ?, "
-                "combat_state = 3, target_guid = 0, loot_json = ?, "
-                "loot_owner = ? WHERE guid = ?",
-                (int(time.time()), loot_json, int(tagger_guid), low_guid),
-            )
-            con.commit()
-        finally:
-            con.close()
+        await run_db_write(
+            execute_write, self.config.database.world_path,
+            "UPDATE creature_spawns SET current_health = 0, dead_since = ?, "
+            "combat_state = 3, target_guid = 0, loot_json = ?, "
+            "loot_owner = ? WHERE guid = ?",
+            (int(time.time()), loot_json, int(tagger_guid), low_guid),
+        )
         combat = self._get_combat_state()
         # ``Unit::ClearComboPointHolders``: a target's death drops every
         # player's combo points on it.  Only this session can hold points, so
@@ -604,7 +611,7 @@ class CreaturesMixin:
             # player circles around it.
             await self._face_creature_at_player(int(low_guid), state, spawn,
                                                 here, player, now)
-            if hasattr(self, "_has_line_of_sight") and not self._has_line_of_sight(
+            if hasattr(self, "_has_line_of_sight") and not await self._has_line_of_sight(
                     self._unit_eye_position(
                         self._creature_object_guid(
                             int(low_guid), int(spawn["entry"]))),
@@ -710,8 +717,16 @@ class CreaturesMixin:
         if hasattr(self, "_find_world_path"):
             eye_a = (here[0], here[1], here[2] + 0.9)
             eye_b = (player[0], player[1], player[2] + 0.9)
-            if not self._has_line_of_sight(eye_a, eye_b):
-                path = self._find_world_path(here, player)
+            if not await self._has_line_of_sight(eye_a, eye_b):
+                path = await self._find_world_path(here, player)
+                if path is None and hasattr(self, "_has_navmesh_at") \
+                        and self._has_navmesh_at(here) \
+                        and self._has_navmesh_at(player):
+                    # Both ends are on real navmesh but no corridor exists.
+                    # Do not fake a straight line through a wall; retry a
+                    # little later instead of running A* every AI tick.
+                    state["chase_until"] = now + 0.5
+                    return
         points = None
         if path and len(path) > 1:
             points = self._path_prefix(here, path, travel,
@@ -759,17 +774,22 @@ class CreaturesMixin:
                 here[1] + dy / length * distance, here[2])
         # Snap the run-away point onto walkable ground; otherwise a flee can
         # pick the far side of a wall and the client receives an invalid spline.
-        snapped = (self._navmesh_point((dest[0], dest[1], here[2]),
-                                       max_distance=6.0)
+        snapped = (await self._navmesh_point((dest[0], dest[1], here[2]),
+                                             max_distance=6.0)
                    if hasattr(self, "_navmesh_point") else None)
         if snapped is not None:
             dest = snapped
         path = None
         if hasattr(self, "_find_world_path"):
-            if not self._has_line_of_sight(
+            if not await self._has_line_of_sight(
                     (here[0], here[1], here[2] + 0.9),
                     (dest[0], dest[1], dest[2] + 0.9)):
-                path = self._find_world_path(here, dest)
+                path = await self._find_world_path(here, dest)
+                if path is None and hasattr(self, "_has_navmesh_at") \
+                        and self._has_navmesh_at(here) \
+                        and self._has_navmesh_at(dest):
+                    state["chase_until"] = now + 0.5
+                    return
         points = None
         if path and len(path) > 1:
             points = self._path_prefix(here, path, 12.0)
@@ -821,25 +841,26 @@ class CreaturesMixin:
             self._set_creature_power(int(low_guid), ai["mana"])
             await self._send_creature_power(int(low_guid), ai)
         home = (float(spawn["x"]), float(spawn["y"]), float(spawn["z"]))
-        con = sqlite3.connect(self.config.database.world_path)
-        try:
-            con.execute(
-                "UPDATE creature_spawns SET combat_state = 0, target_guid = 0 "
-                "WHERE guid = ?",
-                (int(low_guid),),
-            )
-            con.commit()
-        finally:
-            con.close()
+        await run_db_write(
+            execute_write, self.config.database.world_path,
+            "UPDATE creature_spawns SET combat_state = 0, target_guid = 0 "
+            "WHERE guid = ?",
+            (int(low_guid),),
+        )
         distance = self._distance(home, here)
         settle_until = time.monotonic()
+        can_move = True
         if distance > 1.0:
             path = None
             if hasattr(self, "_find_world_path"):
-                if not self._has_line_of_sight(
+                if not await self._has_line_of_sight(
                         (here[0], here[1], here[2] + 0.9),
                         (home[0], home[1], home[2] + 0.9)):
-                    path = self._find_world_path(here, home)
+                    path = await self._find_world_path(here, home)
+                    if path is None and hasattr(self, "_has_navmesh_at") \
+                            and self._has_navmesh_at(here) \
+                            and self._has_navmesh_at(home):
+                        can_move = False
             points = None
             if path and len(path) > 1:
                 points = self._path_prefix(here, path, 7.0 * 6.0)
@@ -850,17 +871,18 @@ class CreaturesMixin:
             duration_ms = max(250, int(distance / 7.0 * 1000))
             duration_ms = min(duration_ms, 6000)
             settle_until = time.monotonic() + duration_ms / 1000.0
-            await self._send_creature_packet(
-                int(low_guid), Opcodes.SMSG_MONSTER_MOVE,
-                object_update.build_monster_move_path(
-                    self._creature_object_guid(int(low_guid), int(spawn["entry"])),
-                    here[0], here[1], here[2],
-                    math.atan2(home[1] - here[1], home[0] - here[0]),
-                    points if points else [home],
-                    duration_ms=duration_ms,
-                    move_id=self._next_move_id(),
-                ),
-            )
+            if can_move:
+                await self._send_creature_packet(
+                    int(low_guid), Opcodes.SMSG_MONSTER_MOVE,
+                    object_update.build_monster_move_path(
+                        self._creature_object_guid(int(low_guid), int(spawn["entry"])),
+                        here[0], here[1], here[2],
+                        math.atan2(home[1] - here[1], home[0] - here[0]),
+                        points if points else [home],
+                        duration_ms=duration_ms,
+                        move_id=self._next_move_id(),
+                    ),
+                )
         # Restart the idle generator at home, but only after the walk-home
         # spline has finished so it cannot immediately override it.
         combat.setdefault("idle", {}).pop(int(low_guid), None)
@@ -869,44 +891,48 @@ class CreaturesMixin:
             self.log.debug(f"Creature {spawn['entry']} left combat")
 
     async def _respawn_corpses(self, now: float) -> None:
-        """Re-create dead spawns whose respawn timer expired."""
+        """Re-create dead spawns whose respawn timer expired.
+
+        The scan runs every two seconds.  One bulk query (off the event loop)
+        replaces the old query-per-visible-creature loop, which was a periodic
+        stall while the player moved through a crowded zone.
+        """
         if not self._visible_creatures:
             return
-        rows = []
-        con = sqlite3.connect(self.config.database.world_path)
-        try:
-            for low_guid in list(self._visible_creatures):
-                row = con.execute(
-                    "SELECT s.dead_since, t.respawn_time, s.map "
-                    "FROM creature_spawns s "
-                    "JOIN creature_templates t ON t.entry = s.entry "
-                    "WHERE s.guid = ?",
-                    (int(low_guid),),
-                ).fetchone()
-                if row is None or int(row[0] or 0) <= 0:
-                    continue
-                delay = max(5, int(row[1] or 0))
-                if int(row[0]) + delay <= int(time.time()):
-                    rows.append(int(low_guid))
-        finally:
-            con.close()
+        statuses = await asyncio.to_thread(
+            creature.get_creature_respawn_statuses,
+            self.config.database.world_path,
+            list(self._visible_creatures),
+        )
+        if not statuses:
+            return
+        now_seconds = int(time.time())
+        rows = [
+            int(low_guid) for low_guid, (dead_since, respawn_time) in
+            statuses.items()
+            if dead_since + max(5, respawn_time) <= now_seconds
+        ]
+        if not rows:
+            return
         for low_guid in rows:
-            con = sqlite3.connect(self.config.database.world_path)
-            try:
-                con.execute(
-                    "UPDATE creature_spawns SET dead_since = 0, combat_state = 0, "
-                    "target_guid = 0, current_health = 0, current_power = 0, "
-                    "loot_json = '', loot_owner = 0 "
-                    "WHERE guid = ?",
-                    (int(low_guid),),
-                )
-                con.commit()
-            finally:
-                con.close()
+            await run_db_write(
+                execute_write, self.config.database.world_path,
+                "UPDATE creature_spawns SET dead_since = 0, combat_state = 0, "
+                "target_guid = 0, current_health = 0, current_power = 0, "
+                "loot_json = '', loot_owner = 0 "
+                "WHERE guid = ?",
+                (int(low_guid),),
+            )
             manager = self._creature_combat_manager()
             if manager is not None:
                 manager.forget(int(low_guid))
                 manager.forget_idle(int(low_guid))
+                manager.forget_health(int(low_guid))
+            self._get_combat_state().setdefault(
+                "creature_health", {}).pop(int(low_guid), None)
+            groups = getattr(getattr(self, "server", None), "groups", None)
+            if groups is not None:
+                groups.forget_corpse(int(low_guid))
             combat = self._get_combat_state()
             combat["aggro"].pop(int(low_guid), None)
             combat.setdefault("idle", {}).pop(int(low_guid), None)
@@ -923,8 +949,11 @@ class CreaturesMixin:
                     Opcodes.SMSG_DESTROY_OBJECT,
                     login_packets.build_destroy_object(object_guid, death=True),
                 )
-            await self.refresh_creature_visibility()
             self.log.debug(f"Creature spawn {low_guid} respawned")
+        # One rescan for the whole batch.  The respawned creatures are sent in
+        # the same create update instead of starting a visibility scan per
+        # corpse.
+        await self.refresh_creature_visibility(force=True)
 
     def _melee_reach(self, spawn) -> float:
         """Distance at which this session can hit ``spawn`` (yard, centre to centre)."""

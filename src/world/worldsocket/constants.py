@@ -58,6 +58,7 @@ __all__ = [
     "IDLE_WANDER_MAX_MOVES",
     "IDLE_WANDER_DEFAULT_RADIUS",
     "IDLE_WANDER_RETRY",
+    "IDLE_GEOMETRY_MOVES_PER_TICK",
     "IDLE_MOVE_MIN_DURATION_MS",
     "IDLE_MOVE_MAX_DURATION_MS",
     "UNIT_FLAG_DISABLE_MOVE",
@@ -294,6 +295,13 @@ IDLE_MOVE_MIN_DURATION_MS = 200
 
 
 IDLE_MOVE_MAX_DURATION_MS = 12000
+
+
+# Pathfinding/LOS queries for ambient movement run on the geometry worker and
+# can take tens of milliseconds each.  Spending an unbounded number of them in
+# one combat tick delayed swings and chase updates; a few per tick keeps the
+# tick responsive while the rotating cursor still lets every creature move.
+IDLE_GEOMETRY_MOVES_PER_TICK = 8
 
 
 # ``UNIT_FLAG_DISABLE_MOVE`` (3.3.5): rooted NPCs never wander.

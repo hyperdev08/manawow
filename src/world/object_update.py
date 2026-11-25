@@ -49,6 +49,7 @@ UPDATETYPE_NEAR_OBJECTS = 5
 TYPEID_ITEM = 1
 TYPEID_UNIT = 3
 TYPEID_PLAYER = 4
+TYPEID_CORPSE = 7
 
 # ``Movement::MonsterMoveType`` (CMaNGOS 3.3.5, MoveSpline.h).  This byte
 # replaces the final-facing spline flags inside ``SMSG_MONSTER_MOVE``; note that
@@ -61,8 +62,11 @@ MONSTER_MOVE_FACING_ANGLE = 4
 
 UPDATEFLAG_SELF = 0x0001
 UPDATEFLAG_HIGHGUID = 0x0010
+UPDATEFLAG_LOWGUID = UPDATEFLAG_HIGHGUID
 UPDATEFLAG_LIVING = 0x0020
 UPDATEFLAG_HAS_POSITION = 0x0040
+UPDATEFLAG_STATIONARY_POSITION = UPDATEFLAG_HAS_POSITION
+UPDATEFLAG_POSITION = 0x0100
 
 # HIGHGUID payload the client expects for its own player object.
 PLAYER_SELF_HIGHGUID = 0x2F
@@ -243,6 +247,75 @@ _ALL_LANGUAGE_SKILLS = [
 _LANGUAGE_SKILLS_BY_RACE = {
     race: _ALL_LANGUAGE_SKILLS for race in range(1, 22)
 }
+
+
+def language_skill_count(char: Mapping) -> int:
+    race = int(_char_get(char, "race", 1) or 1)
+    return len(_LANGUAGE_SKILLS_BY_RACE.get(race, _ALL_LANGUAGE_SKILLS))
+
+
+def assign_skill_slots(char: Mapping) -> None:
+    """Give every learned skill a stable PLAYER_SKILL_INFO slot.
+
+    Language skills occupy the first slots in the client's array; professions
+    and weapon skills must never overwrite them.
+    """
+    skills = _char_get(char, "skills", None)
+    if not skills:
+        return
+    start = language_skill_count(char)
+    used = set()
+    next_slot = start
+    for skill_id in sorted(skills):
+        data = skills[skill_id]
+        slot = int(data.get("slot", -1) or -1)
+        if slot >= start and slot not in used:
+            used.add(slot)
+            next_slot = max(next_slot, slot + 1)
+        else:
+            data["slot"] = None
+    for skill_id in sorted(skills):
+        data = skills[skill_id]
+        if data.get("slot") is not None:
+            continue
+        while next_slot in used:
+            next_slot += 1
+        data["slot"] = next_slot
+        used.add(next_slot)
+        next_slot += 1
+
+
+def next_skill_slot(char: Mapping) -> int:
+    assign_skill_slots(char)
+    skills = _char_get(char, "skills", None) or {}
+    if not skills:
+        return language_skill_count(char)
+    return max(int(data.get("slot", 0) or 0) for data in skills.values()) + 1
+
+
+def skill_field_values(char: Mapping, skill_id: int) -> Dict[int, int]:
+    """Return the three PLAYER_SKILL_INFO fields for one skill line."""
+    skills = _char_get(char, "skills", None) or {}
+    data = skills.get(int(skill_id))
+    if not data:
+        return {}
+    slot = int(data.get("slot", -1) or -1)
+    if slot < 0 or slot >= F.PLAYER_SKILL_COUNT:
+        return {}
+    base = F.PLAYER_SKILL_INFO_1_1 + slot * 3
+    step = max(0, int(data.get("step", 0) or 0)) & 0xFFFF
+    value = max(0, int(data.get("value", 0) or 0)) & 0xFFFF
+    maximum = max(0, int(data.get("max_value", 0) or 0)) & 0xFFFF
+    return {
+        base: (int(skill_id) & 0xFFFF) | (step << 16),
+        base + 1: value | (maximum << 16),
+        base + 2: 0,
+    }
+
+
+def skill_value(char: Mapping, skill_id: int) -> int:
+    skills = _char_get(char, "skills", None) or {}
+    return int((skills.get(int(skill_id)) or {}).get("value", 0) or 0)
 
 
 # UNIT_FLAG_PLAYER_CONTROLLED in 3.3.5 (called UNIT_FLAG_PVP_ATTACKABLE in
@@ -443,7 +516,7 @@ def build_player_values(char: Mapping, peer: bool = False) -> Dict[int, int]:
             values[F.UNIT_FIELD_POWER_REGEN_INTERRUPTED_FLAT_MODIFIER + 0] = \
                 interrupted_bits
 
-    values[F.PLAYER_FLAGS] = 0
+    values[F.PLAYER_FLAGS] = int(_char_get(char, "player_flags", 0)) & 0xFFFFFFFF
     values[F.PLAYER_BYTES] = (
         (skin & 0xFF) | ((face & 0xFF) << 8)
         | ((hair_style & 0xFF) << 16) | ((hair_color & 0xFF) << 24)
@@ -468,12 +541,17 @@ def build_player_values(char: Mapping, peer: bool = False) -> Dict[int, int]:
     race = int(char["race"])
     language_skills = _LANGUAGE_SKILLS_BY_RACE.get(race, [(98, 300, 300)])
     for i, (skill_id, rank, max_rank) in enumerate(language_skills):
-        if i >= 128:
+        if i >= F.PLAYER_SKILL_COUNT:
             break
         base = F.PLAYER_SKILL_INFO_1_1 + i * 3
         values[base] = skill_id | (0 << 16)          # skillId | step
         values[base + 1] = rank | (max_rank << 16)   # rank | maxRank
         values[base + 2] = 0                         # tempBonus | permBonus
+
+    # Learned professions/weapon skills follow the language entries.
+    assign_skill_slots(char)
+    for skill_id in sorted(_char_get(char, "skills", None) or {}):
+        values.update(skill_field_values(char, skill_id))
 
     # Inventory: populate visible items + inv slots if we have character items.
     # The caller is expected to set ``char["inventory"]`` = {slot: item dict}.
@@ -614,6 +692,86 @@ def build_update_object(char: Mapping, self_player: bool = True,
     if len(body) > 100:
         return Opcodes.SMSG_COMPRESSED_UPDATE_OBJECT, struct.pack("<I", len(body)) + zlib.compress(body)
     return Opcodes.SMSG_UPDATE_OBJECT, body
+
+
+def build_update_blocks(blocks: List[bytes]) -> Tuple[int, bytes]:
+    """Wrap already-built update blocks in SMSG_UPDATE_OBJECT (compressed if large)."""
+    body = struct.pack("<I", len(blocks)) + b"".join(blocks)
+    if len(body) > 100:
+        return (Opcodes.SMSG_COMPRESSED_UPDATE_OBJECT,
+                struct.pack("<I", len(body)) + zlib.compress(body))
+    return Opcodes.SMSG_UPDATE_OBJECT, body
+
+
+def corpse_guid(owner_guid: int) -> int:
+    return F.CORPSE_HIGH_GUID | (int(owner_guid) & 0xFFFFFFFF)
+
+
+def build_corpse_values(corpse: Mapping) -> Dict[int, int]:
+    """Return ``{field_index: uint32_value}`` for a player corpse object."""
+    owner_guid = int(corpse["owner_guid"])
+    guid = corpse_guid(owner_guid)
+    values: Dict[int, int] = {}
+    values[F.OBJECT_FIELD_GUID] = guid & 0xFFFFFFFF
+    values[F.OBJECT_FIELD_GUID + 1] = (guid >> 32) & 0xFFFFFFFF
+    values[F.OBJECT_FIELD_TYPE] = F.TYPEMASK_OBJECT | F.TYPEMASK_CORPSE
+    values[F.OBJECT_FIELD_ENTRY] = 0
+    values[F.OBJECT_FIELD_SCALE_X] = _float_bits(1.0)
+    values[F.CORPSE_FIELD_OWNER] = owner_guid & 0xFFFFFFFF
+    values[F.CORPSE_FIELD_OWNER + 1] = (owner_guid >> 32) & 0xFFFFFFFF
+    values[F.CORPSE_FIELD_PARTY] = 0
+    values[F.CORPSE_FIELD_PARTY + 1] = 0
+    values[F.CORPSE_FIELD_DISPLAY_ID] = int(corpse.get("display_id", 0) or 0)
+    items = list(corpse.get("items") or [])
+    for slot in range(19):
+        values[F.CORPSE_FIELD_ITEM + slot] = (
+            int(items[slot]) if slot < len(items) else 0)
+    values[F.CORPSE_FIELD_BYTES_1] = int(corpse.get("bytes1", 0) or 0)
+    values[F.CORPSE_FIELD_BYTES_2] = int(corpse.get("bytes2", 0) or 0)
+    values[F.CORPSE_FIELD_GUILD] = int(corpse.get("guild", 0) or 0)
+    values[F.CORPSE_FIELD_FLAGS] = 0
+    values[F.CORPSE_FIELD_DYNAMIC_FLAGS] = 0
+    return values
+
+
+def build_corpse_create_block(corpse: Mapping) -> bytes:
+    """Build one ``UPDATETYPE_CREATE_OBJECT2`` block for a player corpse.
+
+    Corpses are stationary WorldObjects: TrinityCore uses
+    ``LOWGUID | STATIONARY_POSITION | POSITION`` and writes the position twice
+    (plus the orientation twice) before the low-guid word.
+    """
+    owner_guid = int(corpse["owner_guid"])
+    guid = corpse_guid(owner_guid)
+    values = build_corpse_values(corpse)
+    blocks = (F.CORPSE_END + 31) // 32
+    mask = bytearray(blocks * 4)
+    for index in values:
+        mask[(index // 32) * 4 + (index % 32) // 8] |= 1 << (index % 8)
+
+    x = float(corpse["x"])
+    y = float(corpse["y"])
+    z = float(corpse["z"])
+    o = float(corpse.get("o", 0.0) or 0.0)
+    block = bytearray()
+    block.append(UPDATETYPE_CREATE_OBJECT2)
+    block += pack_guid(guid)
+    block.append(TYPEID_CORPSE)
+    block += struct.pack(
+        "<H", UPDATEFLAG_LOWGUID | UPDATEFLAG_STATIONARY_POSITION
+        | UPDATEFLAG_POSITION)
+    block += b"\x00"                     # no transport
+    block += struct.pack("<8f", x, y, z, x, y, z, o, o)
+    block += struct.pack("<I", owner_guid & 0xFFFFFFFF)
+    block.append(blocks)
+    block += mask
+    for index in sorted(values):
+        block += struct.pack("<I", values[index] & 0xFFFFFFFF)
+    return bytes(block)
+
+
+def build_corpse_update(corpse: Mapping) -> Tuple[int, bytes]:
+    return build_update_blocks([build_corpse_create_block(corpse)])
 
 
 # ---------------------------------------------------------------------------

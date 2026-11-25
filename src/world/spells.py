@@ -11,6 +11,8 @@ import time
 import random
 import struct
 import sqlite3
+import threading
+from functools import lru_cache
 from typing import Dict, List, Optional, Tuple, Any, Mapping
 
 try:  # normal package import (the server adds the project root to sys.path)
@@ -476,6 +478,7 @@ class SpellTemplate:
     def __init__(self, row: Mapping):
         self.id = int(_row_get(row, "id", _row_get(row, "Id", 0)))
         self.name = str(_row_get(row, "name", _row_get(row, "SpellName", "")))
+        self.rank = str(_row_get(row, "rank", _row_get(row, "Rank", "")) or "")
         self.school = int(_row_get(row, "school", _row_get(row, "School", 0)))
         self.mana_cost = int(_row_get(row, "mana_cost", _row_get(row, "ManaCost", 0)))
         self.mana_cost_per_level = int(_row_get(row, "mana_cost_per_level", 0))
@@ -525,6 +528,10 @@ class SpellTemplate:
         self.dmg_class = int(_row_get(row, "dmg_class", 0))
         self.spell_family = int(_row_get(row, "spell_family_name", 0))
         self.spell_visual = int(_row_get(row, "spell_visual", 0))
+        # Weapon/armour proficiency spells (SMSG_SET_PROFICIENCY).
+        self.equipped_item_class = int(_row_get(row, "equipped_item_class", 0))
+        self.equipped_item_subclass_mask = int(
+            _row_get(row, "equipped_item_subclass_mask", 0))
         # ``RuneCostID`` points into ``SpellRuneCost.dbc``.  It is only set for
         # death knight abilities (and a few NPC spells that reuse the field).
         self.rune_cost_id = int(_row_get(row, "rune_cost_id", 0))
@@ -934,9 +941,34 @@ class SpellResult:
         self.spell_id = 0
 
 
+_SPELL_TEMPLATE_CACHE: Dict[Tuple[str, int], Optional[SpellTemplate]] = {}
+_SPELL_TEMPLATE_LOCK = threading.RLock()
+_SPELL_TEMPLATE_LIMIT = 8192
+
+
+def _cache_spell_template(key: Tuple[str, int],
+                          template: Optional[SpellTemplate]) -> None:
+    with _SPELL_TEMPLATE_LOCK:
+        if key not in _SPELL_TEMPLATE_CACHE \
+                and len(_SPELL_TEMPLATE_CACHE) >= _SPELL_TEMPLATE_LIMIT:
+            # Cheap FIFO eviction: enough to bound memory for a client dataset
+            # with tens of thousands of spells.
+            _SPELL_TEMPLATE_CACHE.pop(next(iter(_SPELL_TEMPLATE_CACHE)))
+        _SPELL_TEMPLATE_CACHE[key] = template
+
+
 def get_spell_template(path: str, spell_id: int) -> Optional[SpellTemplate]:
-    """Fetch a spell template from the database."""
-    import sqlite3
+    """Fetch a spell template from the database (cached).
+
+    Client spell data is immutable for the lifetime of the server.  Combat,
+    aura ticks and creature AI look the same templates up several times per
+    second; opening a fresh SQLite connection for each lookup measured 6-8 ms
+    on Windows and produced visible combat pauses.
+    """
+    key = (path, int(spell_id))
+    with _SPELL_TEMPLATE_LOCK:
+        if key in _SPELL_TEMPLATE_CACHE:
+            return _SPELL_TEMPLATE_CACHE[key]
     con = sqlite3.connect(path)
     con.row_factory = sqlite3.Row
     try:
@@ -945,9 +977,42 @@ def get_spell_template(path: str, spell_id: int) -> Optional[SpellTemplate]:
         ).fetchone()
     finally:
         con.close()
-    if row is None:
-        return None
-    return SpellTemplate(row)
+    template = SpellTemplate(row) if row is not None else None
+    _cache_spell_template(key, template)
+    return template
+
+
+def warm_spell_templates(path: str, spell_ids) -> None:
+    """Load many spell templates in one query and put them in the cache.
+
+    Opening the trainer window needs every spell in the list; doing that as
+    dozens of separate connections was a visible first-open pause.
+    """
+    wanted = sorted({int(spell_id) for spell_id in spell_ids if spell_id})
+    if not wanted:
+        return
+    with _SPELL_TEMPLATE_LOCK:
+        missing = [spell_id for spell_id in wanted
+                   if (path, spell_id) not in _SPELL_TEMPLATE_CACHE]
+    if not missing:
+        return
+    con = sqlite3.connect(path)
+    con.row_factory = sqlite3.Row
+    try:
+        found: Dict[int, SpellTemplate] = {}
+        for start in range(0, len(missing), 500):
+            chunk = missing[start:start + 500]
+            placeholders = ",".join("?" for _ in chunk)
+            rows = con.execute(
+                f"SELECT * FROM spell_templates WHERE id IN ({placeholders})",
+                chunk,
+            ).fetchall()
+            for row in rows:
+                found[int(row["id"])] = SpellTemplate(row)
+        for spell_id in missing:
+            _cache_spell_template((path, spell_id), found.get(spell_id))
+    finally:
+        con.close()
 
 
 # ``SpellDuration.dbc`` values used when the table has not been imported from
@@ -1077,14 +1142,15 @@ SPELL_DURATION_FALLBACK_MS = {
 SUMMON_DURATION_FALLBACK_MS = SPELL_DURATION_FALLBACK_MS
 
 
+@lru_cache(maxsize=2048)
 def get_spell_duration(path: str, duration_index: int) -> Optional[Tuple[int, int, int]]:
     """Return ``(duration, duration_per_level, max_duration)`` for an index.
 
     ``None`` means the index is unknown (the table is missing or has no row).
+    Durations are immutable DBC data, so the row is cached.
     """
     if not duration_index:
         return None
-    import sqlite3
     con = sqlite3.connect(path)
     con.row_factory = sqlite3.Row
     try:
@@ -1132,14 +1198,8 @@ def summon_duration_ms(path: str, duration_index: int, level: int = 1) -> int:
     return total if total > 0 else -1
 
 
-def get_creature_spells(path: str, entry: int) -> List[int]:
-    """Fetch the spell IDs a creature can cast.
-
-    ``creature_template_spells`` is keyed by ``(entry, set_id)``; a normal
-    creature uses set 0 (difficulty/instance sets are not simulated).  The
-    legacy list is only consulted when ``creature_template.SpellList`` is 0.
-    """
-    import sqlite3
+@lru_cache(maxsize=4096)
+def _creature_spells_cached(path: str, entry: int) -> Tuple[int, ...]:
     con = sqlite3.connect(path)
     con.row_factory = sqlite3.Row
     try:
@@ -1155,28 +1215,31 @@ def get_creature_spells(path: str, entry: int) -> List[int]:
     finally:
         con.close()
     if row is None:
-        return []
+        return ()
     spells = []
     for col in ("spell1", "spell2", "spell3", "spell4", "spell5",
                 "spell6", "spell7", "spell8", "spell9", "spell10"):
         value = row[col] if col in row.keys() else 0
         if value:
             spells.append(int(value))
-    return spells
+    return tuple(spells)
 
 
-def get_creature_spell_list(path: str, spell_list_id: int) -> List[dict]:
-    """Return a ``creature_spell_list`` as an ordered list of spell entries.
+def get_creature_spells(path: str, entry: int) -> List[int]:
+    """Fetch the spell IDs a creature can cast.
 
-    CMaNGOS 3.3.5 keeps scripted creature spells in ``creature_spell_list``
-    (``creature_template.SpellList``) instead of the older
-    ``creature_template_spells`` set.  Every row carries the spell's target,
-    availability, probability and repeat/initial delay, which is what the AI
-    uses to decide whether a spell may be cast right now.
+    ``creature_template_spells`` is keyed by ``(entry, set_id)``; a normal
+    creature uses set 0 (difficulty/instance sets are not simulated).  The
+    legacy list is only consulted when ``creature_template.SpellList`` is 0.
     """
+    return list(_creature_spells_cached(path, int(entry)))
+
+
+@lru_cache(maxsize=2048)
+def _creature_spell_list_cached(path: str, spell_list_id: int
+                                ) -> Tuple[dict, ...]:
     if not spell_list_id:
-        return []
-    import sqlite3
+        return ()
     con = sqlite3.connect(path)
     con.row_factory = sqlite3.Row
     try:
@@ -1207,12 +1270,25 @@ def get_creature_spell_list(path: str, spell_list_id: int) -> List[dict]:
             "repeat_min": int(row["repeat_min"] or 0),
             "repeat_max": int(row["repeat_max"] or 0),
         })
-    return entries
+    return tuple(entries)
 
 
-def get_creature_cooldowns(path: str, entry: int) -> Dict[int, Tuple[int, int]]:
-    """Return ``{spell_id: (cooldown_min, cooldown_max)}`` for a creature."""
-    import sqlite3
+def get_creature_spell_list(path: str, spell_list_id: int) -> List[dict]:
+    """Return a ``creature_spell_list`` as an ordered list of spell entries.
+
+    CMaNGOS 3.3.5 keeps scripted creature spells in ``creature_spell_list``
+    (``creature_template.SpellList``) instead of the older
+    ``creature_template_spells`` set.  Every row carries the spell's target,
+    availability, probability and repeat/initial delay, which is what the AI
+    uses to decide whether a spell may be cast right now.
+    """
+    return [dict(entry) for entry in
+            _creature_spell_list_cached(path, int(spell_list_id))]
+
+
+@lru_cache(maxsize=2048)
+def _creature_cooldowns_cached(path: str, entry: int
+                               ) -> Tuple[Tuple[int, int, int], ...]:
     con = sqlite3.connect(path)
     try:
         rows = con.execute(
@@ -1222,22 +1298,22 @@ def get_creature_cooldowns(path: str, entry: int) -> Dict[int, Tuple[int, int]]:
         ).fetchall()
     finally:
         con.close()
-    return {
-        int(spell_id): (int(low or 0), int(high or 0))
-        for spell_id, low, high in rows
-    }
+    return tuple((int(spell_id), int(low or 0), int(high or 0))
+                 for spell_id, low, high in rows)
 
 
-def get_creature_spell_list_entry(path: str, spell_list_id: int) -> Dict[str, int]:
-    """Return the ``creature_spell_list_entry`` header for a spell list.
+def get_creature_cooldowns(path: str, entry: int) -> Dict[int, Tuple[int, int]]:
+    """Return ``{spell_id: (cooldown_min, cooldown_max)}`` for a creature."""
+    return {spell_id: (low, high)
+            for spell_id, low, high in _creature_cooldowns_cached(
+                path, int(entry))}
 
-    ``ChanceSupportAction`` / ``ChanceRangedAttack`` are rolled once per 1200 ms
-    spell-list tick to decide whether a support or ranged action is allowed.
-    A missing header simply means both chances are zero.
-    """
+
+@lru_cache(maxsize=1024)
+def _creature_spell_list_entry_cached(path: str, spell_list_id: int
+                                      ) -> Tuple[int, int]:
     if not spell_list_id:
-        return {}
-    import sqlite3
+        return (0, 0)
     con = sqlite3.connect(path)
     try:
         row = con.execute(
@@ -1248,16 +1324,28 @@ def get_creature_spell_list_entry(path: str, spell_list_id: int) -> Dict[str, in
     finally:
         con.close()
     if row is None:
+        return (0, 0)
+    return (int(row[0] or 0), int(row[1] or 0))
+
+
+def get_creature_spell_list_entry(path: str, spell_list_id: int) -> Dict[str, int]:
+    """Return the ``creature_spell_list_entry`` header for a spell list.
+
+    ``ChanceSupportAction`` / ``ChanceRangedAttack`` are rolled once per 1200 ms
+    spell-list tick to decide whether a support or ranged action is allowed.
+    A missing header simply means both chances are zero.
+    """
+    support, ranged = _creature_spell_list_entry_cached(
+        path, int(spell_list_id))
+    if not spell_list_id:
         return {}
-    return {
-        "chance_support_action": int(row[0] or 0),
-        "chance_ranged_attack": int(row[1] or 0),
-    }
+    return {"chance_support_action": support,
+            "chance_ranged_attack": ranged}
 
 
-def get_creature_spell_targeting(path: str, target_id: int) -> Optional[Dict[str, int]]:
-    """Return one ``creature_spell_targeting`` row (``None`` when unknown)."""
-    import sqlite3
+@lru_cache(maxsize=2048)
+def _creature_spell_targeting_cached(path: str, target_id: int
+                                     ) -> Optional[Tuple[int, int, int, int, int]]:
     con = sqlite3.connect(path)
     try:
         row = con.execute(
@@ -1269,18 +1357,22 @@ def get_creature_spell_targeting(path: str, target_id: int) -> Optional[Dict[str
         con.close()
     if row is None:
         return None
-    return {
-        "type": int(row[0] or 0),
-        "param1": int(row[1] or 0),
-        "param2": int(row[2] or 0),
-        "param3": int(row[3] or 0),
-        "unit_condition": int(row[4] if row[4] is not None else -1),
-    }
+    return (int(row[0] or 0), int(row[1] or 0), int(row[2] or 0),
+            int(row[3] or 0), int(row[4] if row[4] is not None else -1))
 
 
+def get_creature_spell_targeting(path: str, target_id: int) -> Optional[Dict[str, int]]:
+    """Return one ``creature_spell_targeting`` row (``None`` when unknown)."""
+    data = _creature_spell_targeting_cached(path, int(target_id))
+    if data is None:
+        return None
+    return {"type": data[0], "param1": data[1], "param2": data[2],
+            "param3": data[3], "unit_condition": data[4]}
+
+
+@lru_cache(maxsize=1024)
 def get_creature_base_mana(path: str, level: int, unit_class: int) -> int:
     """``creature_template_classlevelstats.BaseMana`` for a level/class."""
-    import sqlite3
     con = sqlite3.connect(path)
     try:
         row = con.execute(
@@ -1293,6 +1385,20 @@ def get_creature_base_mana(path: str, level: int, unit_class: int) -> int:
     return int(row[0] or 0) if row else 0
 
 
+def clear_caches() -> None:
+    """Drop cached client data (used by tests and data-import tools)."""
+    with _SPELL_TEMPLATE_LOCK:
+        _SPELL_TEMPLATE_CACHE.clear()
+    for cached in (get_spell_duration,
+                   _creature_spells_cached, _creature_spell_list_cached,
+                   _creature_cooldowns_cached,
+                   _creature_spell_list_entry_cached,
+                   _creature_spell_targeting_cached,
+                   get_creature_base_mana, get_rune_cost):
+        cached.cache_clear()
+
+
+@lru_cache(maxsize=512)
 def get_rune_cost(path: str, rune_cost_id: int) -> Tuple[int, int, int, int]:
     """Return ``(blood, unholy, frost, runic_power)`` for a ``RuneCostID``.
 
@@ -1305,7 +1411,6 @@ def get_rune_cost(path: str, rune_cost_id: int) -> Tuple[int, int, int, int]:
     if rune_cost_id <= 0:
         return (0, 0, 0, 0)
     try:
-        import sqlite3
         con = sqlite3.connect(path)
         try:
             row = con.execute(

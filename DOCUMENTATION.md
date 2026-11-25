@@ -22,11 +22,12 @@ A real 3.3.5a client can now log in, pick a character and **enter the world**:
 - `CMSG_PING` / `SMSG_PONG`, realm split and keep-alive handling
 
 ### SQLite storage
-- Accounts, realms and characters
-- `src/common/sqlite_tuning.py` (installed by the worldserver): WAL journal, `synchronous=NORMAL` and `wal_autocheckpoint=0` on every connection, plus a background thread that keeps one connection open and runs PASSIVE checkpoints. The server opens a connection per query on the event-loop thread, and rollback-journal commits used to freeze every session for seconds on Windows (median 362 ms, worst 16 s per commit; now ~5 ms). Stop the server before committing `data/world.db` so the WAL is folded back in
+- Split storage: `data/auth.db` (accounts/realms), `data/characters.db` (characters, inventory, spells, quest logs) and `data/world.db` (regenerable static content). None of the three is committed; the world bank is rebuilt from the pinned CMaNGOS dump
+- `src/common/sqlite_tuning.py` (installed by the worldserver): WAL journal, `synchronous=NORMAL` and `wal_autocheckpoint=0` on every connection, plus a background thread that keeps one connection open and runs PASSIVE checkpoints. Rollback-journal commits used to freeze every session for seconds on Windows (median 362 ms, worst 16 s per commit)
+- `src/common/db_io.py`: all hot writes run on one dedicated SQLite writer thread. Critical writes (position, inventory, money, XP, quests, loot) are awaited, so callers still read their own committed rows; creature health/power/aggro updates are queued and applied in execution order. Reads stay on the event loop and use WAL snapshots, which never wait for the writer. Hot read helpers share long-lived read connections (`sqlite_tuning.read_connection`), so they do not pay the cold connect/PRAGMA cost on every creature tick. No database write runs on the asyncio thread any more. Stop the server before copying or regenerating a database file so the WAL is folded back in
 
 ### Item system (initial milestone)
-- `SMSG_ITEM_QUERY_SINGLE_RESPONSE` from `item_templates` SQLite table (all 44,613 CMaNGOS `item_template` rows; the shipped `world.db` used to lack 17,539 of them, which silently removed quest items such as 50432 Diseased Wolf Pelt from loot)
+- `SMSG_ITEM_QUERY_SINGLE_RESPONSE` from `item_templates` SQLite table (all 44,613 CMaNGOS `item_template` rows; an older pre-import world database lacked 17,539 of them, which silently removed quest items such as 50432 Diseased Wolf Pelt from loot)
 - Character inventory in `character_items` table (slot -> item instance)
 - Starter kit: the exact `CharStartOutfit.dbc` outfit for the character's race/class (63 rows for the 62 legal 3.3.5a combinations, including the death-knight set and its four bags), with every referenced template seeded from the client's own `Item.dbc` data. Race/class legality comes from `CharBaseInfo.dbc`, so `CMSG_CHAR_CREATE` rejects impossible combinations (e.g., gnome paladin or tauren mage) with `CHAR_CREATE_FAILED`
 - On world entry, items are emitted as `UPDATETYPE_CREATE_OBJECT2` blocks *before* the player block so the `PLAYER_FIELD_INV_SLOT_HEAD` / `PACK_SLOT_1` guids resolve immediately
@@ -55,7 +56,7 @@ A real 3.3.5a client can now log in, pick a character and **enter the world**:
 ### Combat + spells (real 3.3.5a layouts)
 - `character_spells` stores the spells a character knows; each race/class combination gets the exact 3.3.5a level-1 spellbook from CMaNGOS `playercreateinfo_spell` (2919 rows across all 62 legal pairs), including racials, languages, armor and weapon proficiencies
 - The default action bar comes from `playercreateinfo_action` (351 rows): Attack, the class's first ability, racials, and the second bar page; the default Attack macros become a normal Attack button because this server has no macro storage
-- `Summon Imp` (688) is the only deliberate addition to the authentic list: it is trainer-taught at level 1 and this server has no class trainers, so warlocks would otherwise have no summon
+- Class trainers teach the abilities that CMaNGOS does not grant in `playercreateinfo_spell` (for example `Summon Imp`, 688); the starter spellbook stays exactly as imported. `worldserver.start_money` mirrors CMaNGOS `StartPlayerMoney` (copper, default 0) so a new character can afford the first 10-copper trainer spell if the server increases it
 - `SMSG_LOGIN_VERIFY_WORLD` is the first world packet, followed by `SMSG_INITIAL_SPELLS` and `SMSG_ACTION_BUTTONS`
 - `CMSG_CAST_SPELL` / `CMSG_CANCEL_CAST` use imported `spell_templates`: cast time, range, power cost, GCD (`StartRecoveryTime`), school, damage/heal rolls and effect/aura enums
 - Melee auto-attack, weapon damage/delay, creature aggro + chase + leash AI (a creature evades when its victim is more than 60 yards from the spawn, `Creature::CanCreatureAttack`; its own position does not count, so low-health humanoids can flee without resetting), creature melee, death, respawn, XP and level-up
@@ -98,9 +99,28 @@ A real 3.3.5a client can now log in, pick a character and **enter the world**:
 - Party member frames receive periodic `SMSG_PARTY_MEMBER_STATS_FULL` updates (health, power, level, zone, position)
 - Party/raid chat is relayed only to group members; cross-faction invites are rejected
 - Groups are 5-player parties or 40-player raids with eight subgroups; the leader is transferred when the current leader leaves
+- Groups and their members are persisted in `groups` / `group_members` in the character database. A logout keeps the member in the group as offline (`MEMBER_STATUS_OFFLINE`), and both the group and its settings are restored after a server restart or when a member logs back in
+- If every member stays offline for the reconnect window, the group is automatically disbanded. The default is five minutes (`worldserver.group_offline_expiry`, seconds; `0` disables it); a reconnect inside the window clears the timer and restores the group
+- Loot method (`CMSG_LOOT_METHOD`) follows the 3.3.5a enum: free-for-all, round robin, master loot, group loot and need-before-greed, with a configurable loot threshold (uncommon..artifact). The settings are stored with the group and shown in `SMSG_GROUP_LIST`
+- Group loot / need-before-greed start 60-second need/greed/pass rolls for items at or above the threshold (`SMSG_LOOT_START_ROLL`, `SMSG_LOOT_ROLL` roll results, `SMSG_LOOT_ROLL_WON`, `SMSG_LOOT_ALL_PASSED`); silent members pass when the timer expires, and an all-pass leaves the item lootable by hand
+- Master loot blocks above-threshold items for everyone except the master looter, sends `SMSG_LOOT_MASTER_LIST`, and distributes slots through `CMSG_LOOT_MASTER_GIVE`
+- `CMSG_OPT_OUT_OF_LOOT` makes a member automatically pass on future group rolls
+- Ready checks (`MSG_RAID_READY_CHECK`, `MSG_RAID_READY_CHECK_CONFIRM`, `MSG_RAID_READY_CHECK_FINISHED`) are leader/assistant-driven and time out after 30 seconds
+- Raid target icons (`MSG_RAID_TARGET_UPDATE`) support all eight markers, leader/assistant restriction in raids, duplicate-marker cleanup and persistence
 - Group XP is split among nearby living members on the same map with a 10% bonus per extra member (capped at 1.5x)
 - Loot rights belong to the tagger's group; only one member can have a corpse's loot window open at a time to prevent duplicate item takes
-- Limitations: groups are session-scoped (no MySQL persistence/offline members yet); need/greed/master loot, raid markers, ready checks and LFG are not implemented
+- Limitations: round-robin looter rotation, disenchant rolls and LFG are not implemented
+
+### Death, ghosts, corpses and spirit healers
+- On death the server stores a corpse at the death position, records `death_state` (`1` dead, `2` ghost) and sends `SMSG_DEATH_RELEASE_LOC` with the nearest usable graveyard.
+- Graveyards come from the CMaNGOS `world_safe_locs` and `game_graveyard_zone` tables, imported by `tools/import_wotlk_db.py` (including `--graveyards-only`). Selection mirrors `Player::GetClosestGraveYard`: zone + team first, then neutral zone links, then the nearest same-map graveyard.
+- `CMSG_REPOP_REQUEST` teleports the player to that graveyard as a ghost: `PLAYER_FLAGS_GHOST`, one health point, `SMSG_PRE_RESURRECT`, `SMSG_CORPSE_RECLAIM_DELAY` and the usual worldport handshake. The ghost can walk around but cannot fight, loot or cast.
+- `CMSG_RECLAIM_CORPSE` resurrects at the corpse (same map within 39 yards, or at the instance entrance graveyard for a cross-map corpse) after the 30-second reclaim delay, at 50% health/mana. `CMSG_SPIRIT_HEALER_ACTIVATE` (or the spirit healer gossip option) resurrects at the graveyard with 50% health/mana, 25% durability loss and Resurrection Sickness (no sickness below level 11, one minute per level from 11–19, ten minutes from 20).
+- `MSG_CORPSE_QUERY` returns the corpse's `(map, x, y, z)`, and `SMSG_DEATH_RELEASE_LOC` is cleared with map `-1` on resurrection.
+- The corpse is also a real `TYPEID_CORPSE` object (`HighGuid::Corpse`, `CORPSE_FIELD_*`): it is broadcast to other players in range, appears when they log in or walk nearby, and is destroyed on resurrection.
+- Cross-map instance corpses can be reclaimed while standing at the corpse's entrance graveyard; the server switches to the corpse map through the normal `SMSG_NEW_WORLD` worldport handshake.
+- The ghost flag and corpse survive logout/relogin; the character list marks ghosts with `CHARACTER_FLAG_GHOST`.
+- Limitations: no PvP corpse reclaim tiers (30/60/120 s), and battleground spirit guides/resurrect queues are not implemented.
 
 ### Auras (buffs, debuffs, control and mitigation)
 - A real aura registry for players (`combat["auras"]`) and creatures (`combat["creature_auras"]`), keyed by spell so a recast refreshes the duration and stacks up to `Spell.dbc` `StackAmount`
@@ -160,10 +180,14 @@ A real 3.3.5a client can now log in, pick a character and **enter the world**:
 - The server never downloads data at runtime. If the directory is empty or a tile is missing, LOS returns clear and pathfinding falls back to the previous straight-line movement.
 - Terrain (`src/world/terrain.py`) reads `maps/MMMXXYY.map`: float/int16/int8 heightmaps, current and legacy (CMaNGOS 512-byte) holes, and exposes ground height plus sampled segment occlusion. This catches hills, cliffs and cave holes even when both ray endpoints are in the air.
 - Static world models (`src/world/vmap.py`) read `vmaps/MMM_YY_XX.vmtile` placements, global WMOs from non-tiled `MMM.vmtree` maps, and `vmaps/<model>.vmo` collision groups. WMOs test their real collision triangles through a lazily built BVH, which preserves doorways and interior walls; if a `.vmo` is missing they fall back to the transformed per-group AABB. M2 placements use their transformed model bound. The extractor's reflected placement space (`17066.666 - x/y`) is converted back to world coordinates.
-- Wayfinding (`src/world/navmesh.py`) reads the Detour `mmaps/MMMXXYY.mmtile` polygon mesh, converts Detour's Y-up vertices back to WoW coordinates, links internal `neis` and cross-tile shared portal edges, and runs A* over polygon centres. The resulting corridor is replaced by shared-edge portal midpoints, so the client receives a smooth multi-point `SMSG_MONSTER_MOVE` spline instead of walking through polygon centres.
+- Wayfinding (`src/world/navmesh.py`) reads the Detour `mmaps/MMMXXYY.mmtile` polygon mesh, converts Detour's Y-up vertices back to WoW coordinates, links internal `neis`, cross-tile shared portal edges and off-mesh connections, and runs A* over polygon centres. Detail sub-meshes are read too, so `point_on_mesh`/`nearest_poly` heights follow stairs and uneven WMO floors instead of a flat polygon plane.
+- The corridor is converted to a taut path with Detour's funnel/string-pulling algorithm; off-mesh links contribute their actual jump endpoints. Area/flags from the tile (ground, steep ground, water, magma/slime) are filtered through TrinityCore's `NavTerrainFlag`; movement queries default to ground/steep and only include water when the caller explicitly asks for `NAV_WATER`.
 - Chase and flee only pay for an A* query when the straight line is obstructed. Summons, waypoint movement, wander and the evade walk-home path use the same helper; a multi-point spline carries all waypoints in one packet.
-- Tile caches are bounded (32 navmesh tiles, 64 VMap tiles, 48 WMO models) so exploring the world does not grow memory without limit.
-- Limitations: only static VMap geometry blocks sight (dynamic doors/gameobjects are not included); Detour off-mesh links (jumps, transports) are skipped; there is no creature jump/climb animation selection; terrain LOS is sampled at 0.5 yards; and player movement remains client-authoritative (no server-side collision correction).
+- Tile caches are bounded (64 navmesh tiles, 64 VMap tiles, 48 WMO models) so exploring the world does not grow memory without limit. If the first A* attempt only has the endpoint tiles, the direct start-to-end corridor is loaded and the search is retried; endpoint/corridor tiles are kept in the LRU so the cache cannot evict the path while it is being built. Routes longer than the cache are solved in overlapping eight-tile chunks, releasing each chunk before loading the next.
+- Each parsed tile carries a 16-yard spatial hash of its walkable polygon indices. `nearest_poly`/`point_on_mesh` only inspect the cells overlapping the query instead of walking every polygon of every loaded tile, which cut warm point/random/wander lookups from tens of milliseconds to well under one.
+- If a navmesh tile exists at the unit's position but no corridor can be generated, the creature holds position instead of faking a straight spline through the obstacle. Maps or areas without generated navmesh keep the previous straight-line fallback.
+- Navmesh tile parsing, polygon-graph rebuilds, A* and `random_point`/`nearest_poly` scans run on a dedicated geometry thread (`src/common/geometry_io.py`), serialised so the lazily built mesh cache stays consistent. The asyncio loop only receives the finished spline.
+- Limitations: only static VMap geometry blocks sight (dynamic doors/gameobjects are not included); there is no creature jump/climb animation selection; terrain LOS is sampled at 0.5 yards; and player movement remains client-authoritative (no server-side collision correction).
 
 ### Loot
 - `creature_loot_template` (218,066 rows) and `reference_loot_template` (44,244 rows / 896 pools) imported from CMaNGOS
@@ -172,10 +196,10 @@ A real 3.3.5a client can now log in, pick a character and **enter the world**:
 - Corpse money uses the real `creature_template.MinLootGold` / `MaxLootGold` values imported from CMaNGOS (no synthetic level-based coins)
 - `CMSG_LOOT`, `CMSG_AUTOSTORE_LOOT_ITEM`, `CMSG_LOOT_MONEY`, `CMSG_LOOT_RELEASE`
 - Quest items (negative `ChanceOrQuestChance`) only drop for a player with an active, unfinished quest that needs them
-- Drop chances are stored as floats (`0.5`, `6.4011`...); refresh the loot tables of an older `world.db` with `python tools/import_wotlk_db.py --dump WoTLKDB.sql --loot-only`
+- Drop chances are stored as floats (`0.5`, `6.4011`...); refresh the loot tables of an older `world.db` with `python tools/import_wotlk_db.py --loot-only`
 
 ### Quests
-- `quest_templates` (9,086 quests), `creature_quest_starters` / `creature_quest_enders` (from `creature_questrelation` / `creature_involvedrelation`) and `areatrigger_quests` (from `areatrigger_involvedrelation`) imported from CMaNGOS; an existing `world.db` gets them with `python tools/import_wotlk_db.py --dump WoTLKDB.sql --quests-only`
+- `quest_templates` (9,086 quests), `creature_quest_starters` / `creature_quest_enders` (from `creature_questrelation` / `creature_involvedrelation`) and `areatrigger_quests` (from `areatrigger_involvedrelation`) imported from CMaNGOS; an existing `world.db` gets them with `python tools/import_wotlk_db.py --quests-only`
 - Rules and packet builders live in `src/world/quests.py` (socket-free), handlers in `src/world/worldsocket/quests.py`
 - Quest giver markers: `CMSG_QUESTGIVER_STATUS_QUERY` / `CMSG_QUESTGIVER_STATUS_MULTIPLE_QUERY` answer with the 3.3.5 dialog status (yellow/grey "!" and "?"); statuses are re-sent after accepting, abandoning, progressing or turning in a quest
 - `CMSG_QUESTGIVER_HELLO` and `CMSG_GOSSIP_HELLO`: quests are appended to the gossip window; a giver whose menu has no options opens the quest list, or the single quest directly (`Player::SendPreparedQuest`)
@@ -197,7 +221,15 @@ A real 3.3.5a client can now log in, pick a character and **enter the world**:
 - `CMSG_SELL_ITEM` for backpack items at `sell_price`, whole or partial stacks
 - Hidden from the list: other-faction items and bind-on-pickup gear for other classes
 - Not implemented yet: honor/token prices (`ExtendedCost`, those items are hidden), buyback, repair, reputation discounts, `condition_id`
-- Upgrade an existing `world.db` with `python tools/import_wotlk_db.py --dump WoTLKDB.sql --vendors-only`
+- Upgrade an existing `world.db` with `python tools/import_wotlk_db.py --vendors-only`
+
+### Spell trainers
+- `npc_trainer` (18,146 rows), shared `npc_trainer_template` (2,812 rows), `trainer_greeting` (698 rows) and the `TrainerType`/`TrainerSpell`/`TrainerClass`/`TrainerRace`/`TrainerTemplateId` columns of `creature_templates` are imported from CMaNGOS. All four trainer types are handled: class, mount, tradeskill and pet trainers, including the shared template lists used by 421 creatures
+- `CMSG_GOSSIP_HELLO` exposes the CMaNGOS "Train me." option (type 5) only when `Creature::IsTrainerOf` passes: matching class for class trainers, hunter for pet trainers, matching race for mount trainers and the required specialization spell for tradeskill trainers. `CMSG_TRAINER_LIST` works directly as well
+- `SMSG_TRAINER_LIST` uses the 3.3.5a 38-byte row layout (spell, green/red/gray state, cost, primary-profession flag, required level/skill/value and three required abilities), the CMaNGOS greeting text and the list-derived trainer type
+- `CMSG_TRAINER_BUY_SPELL` validates the row, state, level, skill, ability and rank-chain prerequisites, charges the listed copper cost, sends the trainer/player visual effects, `SMSG_LEARNED_SPELL`/`SMSG_SUPERCEDED_SPELL` and `SMSG_TRAINER_BUY_SUCCEEDED`. Profession and riding wrappers (`SPELL_EFFECT_LEARN_SPELL` plus `SPELL_EFFECT_SKILL_STEP`) learn the real spell and update the character's skill line (Apprentice 75 ... Grand Master 450), persisted in `character_skills` and included in the player skill array. Weapon/armour proficiency spells send and persist the merged mask (`character_proficiencies`), re-sent on every login
+- Not implemented yet: reputation price discounts, the two-primary-profession slot limit, GM trainer overrides, `condition_id` rows and pet-talent training (`TRAINER_TYPE_PETS` has no spell rows in CMaNGOS; the talent window is separate)
+- Upgrade an existing `world.db` with `python tools/import_wotlk_trainers.py`
 
 ### Game objects
 - `gameobject_templates` (19,555) and `gameobject_spawns` (100,337) imported from CMaNGOS `gameobject_template` / `gameobject`, with `gameobject_addon` start states and animation progress and `gameobject_spawn_entry` for spawns without a fixed entry
@@ -215,18 +247,18 @@ A real 3.3.5a client can now log in, pick a character and **enter the world**:
 - Quest-starting items (`item_template.startquest`, 385 items): `CMSG_USE_ITEM` opens the quest; the item is used up on accept unless the quest asks for it. Other item use (potions, food, hearthstone) is item spell casting (#11)
 - CMaNGOS `spawn_group` limits (`MaxCount`, groups without a `WorldState` condition) are imported as pools for both objects and creatures
 - Not usable yet: traps, spell casters, meeting stones, fishing, summoned objects
-- Upgrade an existing `world.db` with `python tools/import_wotlk_db.py --dump WoTLKDB.sql --gameobjects-only`
+- Upgrade an existing `world.db` with `python tools/import_wotlk_db.py --gameobjects-only`
 
 ### Creature pools
 - `pool_creature`, `pool_creature_template` and `spawn_group` (with `MaxCount`, no `WorldState`) limit how many spawns of a group exist at once: rare spawns such as Gruff Swiftbite or Fedfennel show at one of their spawn points instead of all of them (715 pooled creatures)
 - Pools are loaded once per server, off the event loop, and filter the creature visibility scans
-- Refresh with `python tools/import_wotlk_db.py --dump WoTLKDB.sql --pools-only` (creature and object pools)
-- Spawns stored with `id = 0` take their entry from `creature_spawn_entry` / `gameobject_spawn_entry` or, inside a spawn group, from `spawn_group_entry` (chosen once per guid at import, so it is reproducible): 5,650 creatures and 3,136 objects that used to be skipped. Add them to an existing `world.db` with `python tools/import_wotlk_db.py --dump WoTLKDB.sql --spawn-entries-only` (creatures; `--gameobjects-only` for objects)
+- Refresh with `python tools/import_wotlk_db.py --pools-only` (creature and object pools)
+- Spawns stored with `id = 0` take their entry from `creature_spawn_entry` / `gameobject_spawn_entry` or, inside a spawn group, from `spawn_group_entry` (chosen once per guid at import, so it is reproducible): 5,650 creatures and 3,136 objects that used to be skipped. Add them to an existing `world.db` with `python tools/import_wotlk_db.py --spawn-entries-only` (creatures; `--gameobjects-only` for objects)
 - Not handled yet: `spawn_group` world-state conditions (day/night RP groups keep spawning)
 
 ### World events
 - There is no event calendar yet, so the world is shown with no world event active: creatures and objects that only spawn during an event (`game_event_creature` / `game_event_gameobject` with a positive event: Darkmoon Faire, Midsummer, Hallow's End, Winter Veil, the Arena Tournament realm NPCs...) are hidden; spawns removed during an event (negative event) stay
-- The links are stored in `creature_events` / `gameobject_events`; refresh them with `python tools/import_wotlk_db.py --dump WoTLKDB.sql --events-only`
+- The links are stored in `creature_events` / `gameobject_events`; refresh them with `python tools/import_wotlk_db.py --events-only`
 
 ### Chat + emotes
 - `CMSG_MESSAGECHAT` / `SMSG_MESSAGECHAT`: `/say`, `/yell`, `/whisper`, `/me` (emote)
@@ -265,6 +297,21 @@ python run_servers.py --watchdog 0.25   # or pick the threshold
 
 Each stall is appended to `logs/stalls.log` with the stack of the loop thread at that moment (the line that is blocking, repeated every 2 s while it lasts) and its total duration once the loop answers again. The worldserver log gets a one-line warning per stall. `run_world.py` takes the same flag.
 
+Combat and movement hot paths avoid blocking SQLite on the loop thread: spell templates/durations, creature spell lists, cooldowns and targeting rows are cached (`spells.clear_caches()` drops them for tests or a data re-import), weapon stats and on-hit item procs are cached per session, and the client-cache version aggregate is computed once off-loop. Weapon stats, line-of-sight/terrain/VMap checks run on the dedicated geometry worker, `sight_blockers` is loaded once instead of statting the database per query, and the `asyncio` transport logger writes to the normal log file instead of `logging.lastResort` on the console.
+
+Ambient creature movement is spread over ticks: a rotating cursor lets each combat tick spend at most `IDLE_GEOMETRY_MOVES_PER_TICK` pathfinding/LOS lookups, so a crowd of wandering NPCs can no longer delay swings and chase updates. A failure in one creature's idle or combat tick is logged and isolated instead of aborting the rest of that tick. The respawn scan is one bulk query (run off-loop) per two-second interval instead of one query per visible creature, and load-testing all game-object spawns no longer converts every row to a dict up front.
+
+### Packet logs
+
+Every session writes a `logs/packets_<timestamp>.log` dump by default. Records are queued from the asyncio thread and written by a background thread, which flushes once per second; shutdown (including Ctrl+C and the `run_*.py` exit path) drains the queue and flushes, so a crash still leaves the useful tail of the log. Packet logging previously called `flush()` after every packet, which the stall watchdog caught blocking the loop for up to 6.7 s on slow Windows disks.
+
+Disable it when you do not need packet-level debugging:
+
+```yaml
+logging:
+  packet_log: false
+```
+
 ### Stopping the servers
 
 ```bash
@@ -274,12 +321,32 @@ python tools/stop_servers.py --force  # kill whatever owns the port
 
 ### Database initialization
 
+The repository ships **no** `.db` files. Three SQLite databases are built
+locally:
+
+| File | Contents | Created by |
+| --- | --- | --- |
+| `data/auth.db` | accounts and the realm list | `tools/init_db.py` |
+| `data/characters.db` | characters, inventory, spells and quest logs | `tools/init_db.py` / first worldserver start |
+| `data/world.db` | static world bank (creatures, items, quests, spells, loot) | `tools/import_wotlk_db.py` |
+
 ```bash
-# Create/upgrade data/auth.db and data/world.db
+# Create the auth/character schemas and an empty world schema
 python tools/init_db.py
+
+# Build the world bank from the pinned CMaNGOS dump
+python tools/import_wotlk_db.py
 ```
 
-The worldserver also creates and migrates the character, creature and spell tables when it starts, so a checkout made before a schema addition still works without re-running `init_db.py`.
+`data/world.db` is generated, not committed: it is reproducible because
+`tools/import_wotlk_db.py` downloads a specific `cmangos/wotlk-db` commit and
+verifies its SHA-256 before importing.  Characters are stored separately, so
+regenerating the world bank never touches player data.  A legacy combined
+`data/world.db` is migrated automatically on the first split startup: any
+characters, items, spells and quest logs it contains are copied into
+`data/characters.db`, and the old file is left untouched.
+
+The worldserver also creates and migrates the character, creature and spell tables when it starts, so a checkout made before a schema addition still works without re-running `init_db.py`.  The GitHub Actions test workflow caches the pinned dump and runs `python tools/import_wotlk_db.py --db data/world.db --combined`; the unit tests use that single-file layout, while a normal server still splits characters into `data/characters.db`.  Tests that need the generated world bank skip automatically when it is absent.
 
 ### Downloading terrain, VMaps and MMaps
 
@@ -298,17 +365,28 @@ The default mirror is a public 3.3.5a extract; `--source` accepts another mirror
 
 ### Importing the CMaNGOS 3.3.5a world database
 
-The world dump can be downloaded from the [cmangos/wotlk-db](https://github.com/cmangos/wotlk-db) repository (`Full_DB/WoTLKDB_*.sql`).
+`data/world.db` is not shipped.  The importer downloads the pinned
+[cmangos/wotlk-db](https://github.com/cmangos/wotlk-db) release itself, keeps
+it under `data/cache/` (gitignored), verifies the SHA-256 and only then imports,
+so every checkout generates the same world bank:
 
 ```bash
-# Stop the worldserver first; the import replaces the demo NPC population.
-python tools/import_wotlk_db.py --dump C:\path\to\WoTLKDB.sql
+# Stop the worldserver first.  The dump is downloaded and verified once.
+python tools/import_wotlk_db.py
 
 # Optional client DBCs that are not part of the SQL dump:
-python tools/import_wotlk_db.py --dump C:\path\to\WoTLKDB.sql \
+python tools/import_wotlk_db.py \
     --rune-cost-dbc "C:\path\to\client\DBFilesClient\SpellRuneCost.dbc" \
     --spell-duration-dbc "C:\path\to\client\DBFilesClient\SpellDuration.dbc"
+
+# Offline machine: download WoTLKDB_*.sql.gz yourself and pass it explicitly.
+python tools/import_wotlk_db.py --dump C:\path\to\WoTLKDB_1_9_14092.sql.gz
 ```
+
+The pinned commit/file/hash live at the top of `tools/import_wotlk_db.py`
+(`CMANGOS_COMMIT`, `CMANGOS_DUMP_FILE`, `CMANGOS_DUMP_SHA256`); bump all of
+them together when intentionally upgrading.  `--refresh-dump` re-downloads a
+cached copy, and `--cache-dir` picks another cache location.
 
 The importer reads the MySQL dump dependency-free and prints how many rows it loaded plus the number of visible spawns at every race's starting point.  `SpellDuration.dbc` fills the `spell_duration` table used by summoning (warlock pets are permanent via index 21); without it the server falls back to a small built-in duration table.
 

@@ -171,24 +171,34 @@ def import_spells(dump_path: str, db_path: str,
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--dump", required=True,
-                        help="CMaNGOS/TrinityCore world .sql dump")
+    parser.add_argument("--dump",
+                        help="CMaNGOS/TrinityCore world .sql (or .sql.gz) dump; "
+                             "defaults to the pinned download")
+    parser.add_argument("--cache-dir",
+                        help="where to cache the downloaded CMaNGOS dump")
+    parser.add_argument("--refresh-dump", action="store_true",
+                        help="re-download the pinned CMaNGOS dump")
     parser.add_argument("--db", help="target SQLite world database "
                                      "(default: config/config.yaml)")
     parser.add_argument("--rune-cost-dbc",
                         help="path to the client's SpellRuneCost.dbc")
     args = parser.parse_args()
 
-    db_path = args.db
-    if not db_path:
-        from src.common.config import Config
+    from src.common.config import Config
 
-        config_path = os.path.join(root, "config", "config.yaml")
-        if not os.path.exists(config_path):
-            config_path = os.path.join(root, "config", "config.example.yaml")
-        db_path = Config.load(config_path).database.world_path
+    config_path = os.path.join(root, "config", "config.yaml")
+    if not os.path.exists(config_path):
+        config_path = os.path.join(root, "config", "config.example.yaml")
+    config = Config.load(config_path)
+    config.resolve_database_paths(root)
+    db_path = args.db or config.database.world_path
 
-    import_spells(args.dump, db_path, rune_cost_dbc=args.rune_cost_dbc)
+    dump_path = args.dump
+    if not dump_path:
+        from import_wotlk_db import download_dump
+        dump_path = download_dump(args.cache_dir, args.refresh_dump)
+
+    import_spells(dump_path, db_path, rune_cost_dbc=args.rune_cost_dbc)
 
 
 if __name__ == "__main__":

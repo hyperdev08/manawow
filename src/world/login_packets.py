@@ -182,9 +182,15 @@ def build_login_set_time_speed(now: float | None = None) -> bytes:
 
 
 def build_force_run_speed(guid: int, speed: float) -> bytes:
-    """``SMSG_FORCE_RUN_SPEED_CHANGE``: packed guid, uint32 0, float speed."""
+    """``SMSG_FORCE_RUN_SPEED_CHANGE``.
+
+    CMaNGOS/3.3.5 writes packed guid, the movement order counter, a uint8
+    "track run speed" field (only for run speed) and then the speed as float.
+    Omitting the uint8 shifts the float by one byte; the client then reads a
+    garbage/zero run speed and stops sending movement.
+    """
     return (object_update.pack_guid(int(guid))
-            + struct.pack("<If", 0, float(speed)))
+            + struct.pack("<IBf", 0, 0, float(speed)))
 
 
 def build_force_move_root(guid: int) -> bytes:

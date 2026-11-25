@@ -3,12 +3,12 @@ from __future__ import annotations
 
 import math
 import random
-import sqlite3
 import struct
 import time
 
 from typing import List
 
+from src.common.db_io import execute_write, submit_db_write
 from src.protocol.opcodes import Opcodes
 from src.world import creature
 from src.world import spells
@@ -173,15 +173,11 @@ class CreatureAIMixin:
 
     def _set_creature_power(self, low_guid: int, power: int) -> None:
         """Persist a creature's current power (mana)."""
-        con = sqlite3.connect(self.config.database.world_path)
-        try:
-            con.execute(
-                "UPDATE creature_spawns SET current_power = ? WHERE guid = ?",
-                (max(0, int(power)), int(low_guid)),
-            )
-            con.commit()
-        finally:
-            con.close()
+        submit_db_write(
+            execute_write, self.config.database.world_path,
+            "UPDATE creature_spawns SET current_power = ? WHERE guid = ?",
+            (max(0, int(power)), int(low_guid)),
+        )
 
     async def _send_creature_power(self, low_guid: int, ai: dict) -> None:
         """Mirror a creature's mana in its update fields and ``SMSG_POWER_UPDATE``."""
@@ -315,7 +311,7 @@ class CreatureAIMixin:
                 entry, low_guid, spawn, ai, player_guid)
             if not ok:
                 continue
-            if target_guid and not self._creature_has_line_of_sight(
+            if target_guid and not await self._creature_has_line_of_sight(
                     low_guid, target_guid):
                 continue
             if target_guid and not self._creature_spell_in_range(
@@ -523,13 +519,13 @@ class CreatureAIMixin:
         return True
 
 
-    def _creature_has_line_of_sight(self, low_guid: int,
-                                    target_guid: int) -> bool:
+    async def _creature_has_line_of_sight(self, low_guid: int,
+                                          target_guid: int) -> bool:
         if not hasattr(self, "_has_line_of_sight"):
             return True
         caster = self._creature_object_guid(int(low_guid))
         try:
-            return self._has_line_of_sight(
+            return await self._has_line_of_sight(
                 self._unit_eye_position(caster),
                 self._unit_eye_position(int(target_guid)))
         except Exception:

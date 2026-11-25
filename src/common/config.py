@@ -33,12 +33,22 @@ class WorldConfig:
     # An empty value disables terrain/LOS/navmesh; run
     # tools/fetch_client_data.py to populate the default directory.
     client_data: str = "./data/client"
+    # Seconds a group may stay fully offline before it is disbanded.
+    # 3.3.5a keeps the party available for a short reconnect window.
+    # 0 disables the offline expiry.
+    group_offline_expiry: int = 300
+    # Copper granted to new characters (CMaNGOS StartPlayerMoney, default 0).
+    start_money: int = 0
 
 
 @dataclass
 class DBConfig:
     auth_path: str = "./data/auth.db"
     world_path: str = "./data/world.db"
+    # Empty means "characters live in world_path" (the combined layout used by
+    # tests and one-off tools).  Config.load() fills in a sibling
+    # characters.db for normal server runs.
+    character_path: str = ""
 
 
 @dataclass
@@ -46,6 +56,9 @@ class LogConfig:
     level: str = "INFO"
     log_dir: str = "./logs"
     console: bool = True
+    # Write logs/packets_*.log.  Buffered and flushed in the background; set
+    # false to disable packet dumps entirely.
+    packet_log: bool = True
 
 
 @dataclass
@@ -57,7 +70,7 @@ class Config:
 
     def resolve_database_paths(self, base_dir: str) -> None:
         """Make relative DB paths independent of the caller's CWD."""
-        for attribute in ("auth_path", "world_path"):
+        for attribute in ("auth_path", "world_path", "character_path"):
             value = getattr(self.database, attribute)
             if value and not os.path.isabs(value):
                 setattr(self.database, attribute,
@@ -98,14 +111,28 @@ class Config:
             motd=str(get(raw, "worldserver", "motd", default="ManaWoW")),
             client_data=("" if raw_client_data is None
                          else str(raw_client_data)),
+            group_offline_expiry=int(get(
+                raw, "worldserver", "group_offline_expiry", default=300)),
+            start_money=int(get(
+                raw, "worldserver", "start_money", default=0)),
         )
+        world_path = str(get(raw, "database", "world_path",
+                             default="./data/world.db"))
+        raw_character = get(raw, "database", "character_path", default=None)
+        if raw_character is None:
+            # Default to a sibling characters.db so an existing config.yaml
+            # (written before the split) automatically stops sharing one file.
+            raw_character = os.path.join(
+                os.path.dirname(world_path) or ".", "characters.db")
         db = DBConfig(
             auth_path=str(get(raw, "database", "auth_path", default="./data/auth.db")),
-            world_path=str(get(raw, "database", "world_path", default="./data/world.db")),
+            world_path=world_path,
+            character_path=str(raw_character or ""),
         )
         log = LogConfig(
             level=str(get(raw, "logging", "level", default="INFO")),
             log_dir=str(get(raw, "logging", "log_dir", default="./logs")),
             console=bool(get(raw, "logging", "console", default=True)),
+            packet_log=bool(get(raw, "logging", "packet_log", default=True)),
         )
         return cls(authserver=auth, worldserver=world, database=db, logging=log)

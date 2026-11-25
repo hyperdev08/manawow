@@ -7,20 +7,23 @@ from __future__ import annotations
 
 import math
 import os
+import sqlite3
 import struct
 import sys
 import types
 from pathlib import Path
+from unittest import mock
 
 import pytest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
-from src.world import geometry, object_update
-from src.world.client_data import ClientData, VMAP_COORD_OFFSET, grid_coord
+from src.world import geometry, los, object_update
+from src.world.client_data import ClientData, SIZE_OF_GRIDS, VMAP_COORD_OFFSET, grid_coord
 from src.world.movement import pack_guid
-from src.world.navmesh import DT_MESH_MAGIC, NavMeshMap, point_in_polygon
+from src.world.navmesh import (DT_MESH_MAGIC, NAV_GROUND_FLAGS, NAV_WATER,
+                               NavMeshMap, point_in_polygon)
 from src.world.terrain import TerrainMap, load_terrain_tile
 from src.world.vmap import VMapMap, load_vmap_tile
 
@@ -135,7 +138,6 @@ def _detour(world_point):
 
 
 def _write_navmesh(path: Path) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
     verts = [
         (0.0, 0.0, 0.0), (10.0, 0.0, 0.0), (10.0, 10.0, 0.0),
         (0.0, 10.0, 0.0), (20.0, 0.0, 0.0), (20.0, 10.0, 0.0),
@@ -146,23 +148,57 @@ def _write_navmesh(path: Path) -> None:
         ([1, 4, 5, 2], [0, 3, 0, 1]),
         ([4, 6, 7, 5], [0, 0, 0, 2]),
     ]
+    _write_navmesh_tile(path, verts, polygons, (0, 0, 0), (30, 10, 0))
+
+
+def _write_navmesh_tile(path: Path, verts, polygons,
+                        bmin=(0, 0, 0), bmax=(30, 10, 0),
+                        detail_by_poly=None, offmesh=()) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    detail_meshes = []
+    detail_verts = []
+    detail_tris = []
+    if detail_by_poly:
+        for item in detail_by_poly:
+            if not item:
+                detail_meshes.append((len(detail_verts), len(detail_tris), 0, 0))
+                continue
+            item_verts = list(item.get("verts") or [])
+            item_tris = list(item.get("tris") or [])
+            detail_meshes.append((len(detail_verts), len(detail_tris),
+                                  len(item_verts), len(item_tris)))
+            detail_verts.extend(item_verts)
+            detail_tris.extend(item_tris)
     payload = bytearray()
     payload += struct.pack(
         "<15i", DT_MESH_MAGIC, 7, 0, 0, 0, 0,
-        len(polygons), len(verts), 0, 0, 0, 0, 0, 0, len(polygons))
+        len(polygons), len(verts), 0, len(detail_meshes),
+        len(detail_verts), len(detail_tris), 0, len(offmesh), len(polygons))
     payload += struct.pack("<3f", 1.6, 0.5, 0.4)
-    payload += struct.pack("<3f", *_detour((0, 0, 0)))
-    payload += struct.pack("<3f", *_detour((30, 10, 0)))
+    payload += struct.pack("<3f", *_detour(bmin))
+    payload += struct.pack("<3f", *_detour(bmax))
     payload += struct.pack("<f", 1.0)
     for world_point in verts:
         payload += struct.pack("<3f", *_detour(world_point))
-    for verts_index, neighbours in polygons:
+    for verts_index, neighbours, *meta in polygons:
+        area = int(meta[0]) if len(meta) >= 1 else 1
+        flags = int(meta[1]) if len(meta) >= 2 else 0
         padded_verts = list(verts_index) + [0] * (6 - len(verts_index))
         padded_neis = list(neighbours) + [0] * (6 - len(neighbours))
         payload += struct.pack("<I", 0)
         payload += struct.pack("<6H", *padded_verts)
         payload += struct.pack("<6H", *padded_neis)
-        payload += struct.pack("<H2B", 0, len(verts_index), 1)
+        payload += struct.pack("<H2B", flags, len(verts_index), area & 0x3F)
+    for vert_base, tri_base, vert_count, tri_count in detail_meshes:
+        payload += struct.pack("<IIBB2x", vert_base, tri_base,
+                               vert_count, tri_count)
+    for world_point in detail_verts:
+        payload += struct.pack("<3f", *_detour(world_point))
+    for a, b, c, flags in detail_tris:
+        payload += struct.pack("<4B", a, b, c, flags)
+    for start, end, bidir, poly_index in offmesh:
+        payload += struct.pack("<7fHBBI", *_detour(start), *_detour(end),
+                               1.0, poly_index, 1 if bidir else 0, 0, 0)
     header = struct.pack("<IIIIB3x", 0x4D4D4150, 7, 15, len(payload), 1)
     path.write_bytes(header + payload)
 
@@ -241,6 +277,173 @@ def test_navmesh_parse_and_pathfinding(tmp_path: Path):
                              (30.0, 10.0, 0.0), (0.0, 10.0, 0.0)])
 
 
+def test_navmesh_spatial_index_matches_a_full_polygon_scan(tmp_path: Path):
+    """The 16-yard buckets must return exactly the polygon a scan would."""
+    verts = [
+        (0.0, 0.0, 0.0), (20.0, 0.0, 0.0),
+        (20.0, 20.0, 0.0), (0.0, 20.0, 0.0),
+        (200.0, 200.0, 0.0), (220.0, 200.0, 0.0),
+        (220.0, 220.0, 0.0), (200.0, 220.0, 0.0),
+    ]
+    _write_navmesh_tile(
+        tmp_path / "mmaps" / "0003131.mmtile", verts,
+        [([0, 1, 2, 3], [0, 0, 0, 0]),
+         ([4, 5, 6, 7], [0, 0, 0, 0])])
+    layer = NavMeshMap(ClientData(str(tmp_path)), 0)
+    # Load the tile through the normal lookup path.
+    assert layer.point_on_mesh((10.0, 10.0, 0.0)) is not None
+    tile = layer._tiles[(31, 31)]
+    assert tile.buckets and tile.bucket_complete
+
+    for point in ((10.0, 10.0, 0.0), (210.0, 210.0, 0.0),
+                  (50.0, 50.0, 0.0), (190.0, 190.0, 0.0)):
+        indexed = layer._nearest_poly(point, max_distance=100.0)
+        saved = tile.buckets
+        tile.buckets = {}
+        try:
+            scanned = layer._nearest_poly(point, max_distance=100.0)
+        finally:
+            tile.buckets = saved
+        assert indexed is not None and scanned is not None
+        assert indexed[0].key == scanned[0].key
+        assert all(abs(a - b) < 1e-6
+                   for a, b in zip(indexed[1], scanned[1]))
+
+
+def test_navmesh_path_loads_intermediate_tiles_across_a_corridor(tmp_path: Path):
+    size = SIZE_OF_GRIDS
+    for tile_x, x0, x1 in ((31, 0.0, size), (30, size, 2.0 * size),
+                           (29, 2.0 * size, 3.0 * size)):
+        verts = [(x0, 0.0, 0.0), (x1, 0.0, 0.0),
+                 (x1, 100.0, 0.0), (x0, 100.0, 0.0)]
+        _write_navmesh_tile(
+            tmp_path / "mmaps" / f"000{tile_x:02d}31.mmtile",
+            verts, [([0, 1, 2, 3], [0, 0, 0, 0])],
+            (x0, 0.0, 0.0), (x1, 100.0, 0.0))
+    layer = NavMeshMap(ClientData(str(tmp_path)), 0)
+    start = (5.0, 5.0, 0.0)
+    end = (2.0 * size + 5.0, 5.0, 0.0)
+    # The endpoint tiles (31,31) and (29,31) are not adjacent.  Before the
+    # corridor loader the graph had no tile 30 and A* failed.
+    path = layer.find_path(start, end)
+    assert path is not None and len(path) >= 2
+    assert math.dist(path[-1], end) < 1.0
+    assert (30, 31) in layer._tiles
+    world = geometry.WorldGeometry(ClientData(str(tmp_path)), None)
+    assert world.has_navmesh_at(0, start)
+    assert world.has_navmesh_at(0, end)
+    assert not world.has_navmesh_at(0, (5.0, 2000.0, 0.0))
+
+
+def test_navmesh_corridor_requests_intermediate_tiles(tmp_path: Path):
+    layer = NavMeshMap(ClientData(str(tmp_path)), 0)
+    requested = []
+
+    def fake_tile(tile_x, tile_y):
+        requested.append((tile_x, tile_y))
+        return None
+
+    layer._tile = fake_tile
+    size = SIZE_OF_GRIDS
+    assert layer._ensure_corridor((5.0, 5.0, 0.0),
+                                  (2.0 * size + 5.0, 5.0, 0.0))
+    assert (30, 31) in requested
+
+
+def test_navmesh_detail_mesh_gives_exact_height(tmp_path: Path):
+    verts = [(0.0, 0.0, 0.0), (10.0, 0.0, 0.0),
+             (10.0, 10.0, 0.0), (0.0, 10.0, 0.0)]
+    detail = {
+        "verts": [(5.0, 5.0, 5.0)],
+        "tris": [(0, 1, 4, 0), (1, 2, 4, 0),
+                 (2, 3, 4, 0), (3, 0, 4, 0)],
+    }
+    _write_navmesh_tile(
+        tmp_path / "mmaps" / "0003131.mmtile", verts,
+        [([0, 1, 2, 3], [0, 0, 0, 0])],
+        detail_by_poly=[detail])
+    layer = NavMeshMap(ClientData(str(tmp_path)), 0)
+    snapped = layer.point_on_mesh((5.0, 5.0, 0.0))
+    assert snapped is not None
+    assert abs(snapped[2] - 5.0) < 0.1
+
+
+def test_navmesh_offmesh_connection_is_used(tmp_path: Path):
+    verts = [
+        (0.0, 0.0, 0.0), (10.0, 0.0, 0.0),
+        (10.0, 10.0, 0.0), (0.0, 10.0, 0.0),
+        (100.0, 0.0, 0.0), (110.0, 0.0, 0.0),
+        (110.0, 10.0, 0.0), (100.0, 10.0, 0.0),
+    ]
+    _write_navmesh_tile(
+        tmp_path / "mmaps" / "0003131.mmtile", verts,
+        [([0, 1, 2, 3], [0, 0, 0, 0]),
+         ([4, 5, 6, 7], [0, 0, 0, 0])],
+        offmesh=[((10.0, 5.0, 0.0), (100.0, 5.0, 0.0), True, 2)])
+    layer = NavMeshMap(ClientData(str(tmp_path)), 0)
+    path = layer.find_path((5.0, 5.0, 0.0), (105.0, 5.0, 0.0))
+    assert path is not None
+    assert any(math.dist(point, (10.0, 5.0, 0.0)) < 0.1 for point in path)
+    assert any(math.dist(point, (100.0, 5.0, 0.0)) < 0.1 for point in path)
+
+
+def test_navmesh_water_polygons_are_excluded_from_ground_paths(tmp_path: Path):
+    verts = [
+        (0.0, 0.0, 0.0), (20.0, 0.0, 0.0),
+        (20.0, 10.0, 0.0), (0.0, 10.0, 0.0),
+        (100.0, 0.0, 0.0), (100.0, 10.0, 0.0),
+    ]
+    _write_navmesh_tile(
+        tmp_path / "mmaps" / "0003131.mmtile", verts,
+        [([0, 1, 2, 3], [0, 2, 0, 0], 11, 1),
+         ([1, 4, 5, 2], [0, 0, 0, 1], 9, 4)])
+    layer = NavMeshMap(ClientData(str(tmp_path)), 0)
+    assert layer.find_path((5.0, 5.0, 0.0), (80.0, 5.0, 0.0)) is None
+    path = layer.find_path((5.0, 5.0, 0.0), (80.0, 5.0, 0.0),
+                           include_flags=NAV_GROUND_FLAGS | NAV_WATER)
+    assert path is not None and len(path) >= 2
+
+
+def test_navmesh_chunked_path_for_a_corridor_longer_than_the_cache(tmp_path: Path):
+    size = SIZE_OF_GRIDS
+    tiles = list(range(31, 7, -1))          # 24 tiles, more than the cache
+    for position, tile_x in enumerate(tiles):
+        x0 = position * size
+        x1 = (position + 1) * size
+        verts = [(x0, 0.0, 0.0), (x1, 0.0, 0.0),
+                 (x1, 100.0, 0.0), (x0, 100.0, 0.0)]
+        _write_navmesh_tile(
+            tmp_path / "mmaps" / f"000{tile_x:02d}31.mmtile",
+            verts, [([0, 1, 2, 3], [0, 0, 0, 0])],
+            (x0, 0.0, 0.0), (x1, 100.0, 0.0))
+    layer = NavMeshMap(ClientData(str(tmp_path)), 0)
+    end_x = (len(tiles) - 1) * size + 5.0
+    path = layer.find_path((5.0, 5.0, 0.0), (end_x, 5.0, 0.0))
+    assert path is not None and len(path) >= 2
+    assert math.dist(path[-1], (end_x, 5.0, 0.0)) < 1.0
+    assert len(layer._tiles) <= layer.tile_cache_limit
+
+
+def test_navmesh_funnel_stays_inside_a_turn(tmp_path: Path):
+    p0 = [(0.0, 0.0, 0.0), (20.0, 0.0, 0.0),
+          (20.0, 10.0, 0.0), (0.0, 10.0, 0.0)]
+    p1 = [(20.0, 10.0, 0.0), (20.0, 20.0, 0.0),
+          (10.0, 20.0, 0.0), (10.0, 10.0, 0.0)]
+    _write_navmesh_tile(
+        tmp_path / "mmaps" / "0003131.mmtile", p0 + p1,
+        [([0, 1, 2, 3], [0, 0, 2, 0]),
+         ([4, 5, 6, 7], [0, 0, 0, 1])])
+    layer = NavMeshMap(ClientData(str(tmp_path)), 0)
+    path = layer.find_path((2.0, 5.0, 0.0), (18.0, 15.0, 0.0))
+    assert path is not None and len(path) >= 2
+    for a, b in zip(path, path[1:]):
+        for t in (0.1, 0.25, 0.5, 0.75, 0.9):
+            point = (a[0] + (b[0] - a[0]) * t,
+                     a[1] + (b[1] - a[1]) * t)
+            assert (point_in_polygon(point, p0)
+                    or point_in_polygon(point, p1))
+
+
 def test_world_geometry_combines_terrain_and_vmaps(tmp_path: Path):
     _write_vmtile(tmp_path / "vmaps" / "000_31_31.vmtile")
     _write_vmo(tmp_path / "vmaps" / "Testwall.wmo.vmo")
@@ -273,9 +476,43 @@ def test_real_starter_data_smoke():
                                    (-8940.0, -120.0, ground + 1.6))
     start = (-8955.26, -132.19, ground)
     end = (-8900.0, -120.0, world.ground_height(0, -8900.0, -120.0))
+    assert world.has_navmesh_at(0, start)
     path = world.find_path(0, start, end)
     assert path is not None and len(path) >= 2
     assert math.dist(path[-1], end) < 1.0
+
+
+def test_los_blockers_are_cached_without_per_query_filesystem_stats(tmp_path: Path):
+    path = tmp_path / "los.db"
+    con = sqlite3.connect(path)
+    try:
+        con.execute(
+            "CREATE TABLE sight_blockers(map INTEGER, min_x REAL, max_x REAL,"
+            " min_y REAL, max_y REAL, min_z REAL, max_z REAL)")
+        con.execute("INSERT INTO sight_blockers VALUES(0, 1, 2, 3, 4, 0, 5)")
+        con.commit()
+    finally:
+        con.close()
+    los.clear_cache()
+    try:
+        with mock.patch("os.path.getmtime",
+                        side_effect=AssertionError("must not stat per query")):
+            first = los.load_blockers(str(path))
+            second = los.load_blockers(str(path))
+        assert first is second and len(first) == 1
+    finally:
+        los.clear_cache()
+
+
+def test_los_missing_database_is_treated_as_open(tmp_path: Path):
+    los.clear_cache()
+    try:
+        missing = str(tmp_path / "missing.db")
+        assert los.load_blockers(missing) == []
+        # The empty result is cached, so the missing file is only statted once.
+        assert los.load_blockers(missing) == []
+    finally:
+        los.clear_cache()
 
 
 def test_monster_move_path_serializes_all_waypoints():

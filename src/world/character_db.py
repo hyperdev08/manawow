@@ -6,7 +6,10 @@ import re
 import sqlite3
 import struct
 import zlib
+from functools import lru_cache
 from typing import Dict, List, Optional, Tuple
+
+from src.world import databases
 
 CREATE_CHARACTERS_SQL = """
 CREATE TABLE IF NOT EXISTS characters(
@@ -39,7 +42,9 @@ CREATE TABLE IF NOT EXISTS characters(
   pet_family INTEGER NOT NULL DEFAULT 0,
   equipment TEXT NOT NULL DEFAULT '',
   bytes1 INTEGER NOT NULL DEFAULT 0,
-  bytes2 INTEGER NOT NULL DEFAULT 0
+  bytes2 INTEGER NOT NULL DEFAULT 0,
+  -- 0 alive, 1 dead (corpse not released), 2 ghost.
+  death_state INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_characters_account ON characters(account_id);
 
@@ -218,6 +223,53 @@ CREATE TABLE IF NOT EXISTS character_items(
 );
 CREATE INDEX IF NOT EXISTS idx_character_items_character ON character_items(character_guid);
 
+-- The player's corpse while dead/ghost.  One row per character.  A new death
+-- replaces the old corpse.  ``zone`` is kept for corpses in instances whose
+-- graveyard lives on another map.
+CREATE TABLE IF NOT EXISTS character_corpses(
+  character_guid INTEGER PRIMARY KEY,
+  map INTEGER NOT NULL DEFAULT 0,
+  zone INTEGER NOT NULL DEFAULT 0,
+  x REAL NOT NULL DEFAULT 0.0,
+  y REAL NOT NULL DEFAULT 0.0,
+  z REAL NOT NULL DEFAULT 0.0,
+  o REAL NOT NULL DEFAULT 0.0,
+  created INTEGER NOT NULL DEFAULT 0,
+  released INTEGER NOT NULL DEFAULT 0
+);
+
+-- Persistent party/raid groups.  Mirrors TrinityCore's `groups` and
+-- `group_member` tables: a group and its members survive logout/restart, so
+-- offline members are still listed when the group comes back online.
+CREATE TABLE IF NOT EXISTS groups(
+  guid INTEGER PRIMARY KEY,
+  leader_guid INTEGER NOT NULL,
+  raid INTEGER NOT NULL DEFAULT 0,
+  loot_method INTEGER NOT NULL DEFAULT 0,
+  master_looter_guid INTEGER NOT NULL DEFAULT 0,
+  loot_threshold INTEGER NOT NULL DEFAULT 2,
+  icon1 INTEGER NOT NULL DEFAULT 0,
+  icon2 INTEGER NOT NULL DEFAULT 0,
+  icon3 INTEGER NOT NULL DEFAULT 0,
+  icon4 INTEGER NOT NULL DEFAULT 0,
+  icon5 INTEGER NOT NULL DEFAULT 0,
+  icon6 INTEGER NOT NULL DEFAULT 0,
+  icon7 INTEGER NOT NULL DEFAULT 0,
+  icon8 INTEGER NOT NULL DEFAULT 0,
+  counter INTEGER NOT NULL DEFAULT 0,
+  -- Unix time when the last online member left (0 while anyone is online)
+  offline_since INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS group_members(
+  group_guid INTEGER NOT NULL,
+  character_guid INTEGER NOT NULL UNIQUE,
+  subgroup INTEGER NOT NULL DEFAULT 0,
+  member_flags INTEGER NOT NULL DEFAULT 0,
+  roles INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY(group_guid, character_guid)
+);
+CREATE INDEX IF NOT EXISTS idx_group_members_group ON group_members(group_guid);
+
 -- Character spells: one row per spell known by a character.
 CREATE TABLE IF NOT EXISTS character_spells(
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -228,6 +280,29 @@ CREATE TABLE IF NOT EXISTS character_spells(
   UNIQUE(character_guid, spell)
 );
 CREATE INDEX IF NOT EXISTS idx_character_spells_character ON character_spells(character_guid);
+
+-- Character skill lines (professions, weapon skills, riding).  The value/max
+-- pair uses PLAYER_SKILL_VALUE semantics and slot is the 0-based position in
+-- the client's PLAYER_SKILL_INFO array after the language skills.
+CREATE TABLE IF NOT EXISTS character_skills(
+  character_guid INTEGER NOT NULL,
+  skill INTEGER NOT NULL,
+  slot INTEGER NOT NULL DEFAULT 0,
+  value INTEGER NOT NULL DEFAULT 0,
+  max_value INTEGER NOT NULL DEFAULT 0,
+  step INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY(character_guid, skill)
+);
+CREATE INDEX IF NOT EXISTS idx_character_skills_character
+  ON character_skills(character_guid);
+
+-- Weapon/armour proficiency masks taught by trainers.
+CREATE TABLE IF NOT EXISTS character_proficiencies(
+  character_guid INTEGER NOT NULL,
+  item_class INTEGER NOT NULL,
+  subclass_mask INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY(character_guid, item_class)
+);
 
 -- Player per-class/per-level base HP/mana from CMaNGOS player_classlevelstats.
 -- Used for correct starting mana/HP and level-up calculations.
@@ -257,11 +332,285 @@ CREATE TABLE IF NOT EXISTS player_levelstats(
 CREATE INDEX IF NOT EXISTS idx_player_levelstats_race_class ON player_levelstats(race, class);
 """
 
+
+def _schema_subset(sql: str, tables: set[str]) -> str:
+    """Extract table/index statements for the named tables."""
+    statements = []
+    for statement in sql.split(";"):
+        text = statement.strip()
+        if not text:
+            continue
+        if re.search(r"\bINDEX\b", text[:80], re.I):
+            match = re.search(r"\bON\s+([A-Za-z_][A-Za-z0-9_]*)", text,
+                              re.I)
+            name = match.group(1) if match else ""
+        else:
+            match = re.search(
+                r"\bTABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?([A-Za-z_][A-Za-z0-9_]*)",
+                text, re.I)
+            name = match.group(1) if match else ""
+        if name.lower() in tables:
+            statements.append(text)
+    return ";\n".join(statements) + ";"
+
+
+# Character data is stored in its own SQLite file.  The combined schema is
+# retained for tests/tools that explicitly create a self-contained database.
+CREATE_CHARACTER_TABLES_SQL = _schema_subset(
+    CREATE_CHARACTERS_SQL, {"characters", "character_items",
+                            "character_spells", "character_skills",
+                            "character_proficiencies", "character_corpses",
+                            "character_taxi_nodes", "groups",
+                            "group_members"})
+CREATE_WORLD_TEMPLATE_SQL = _schema_subset(
+    CREATE_CHARACTERS_SQL, {"item_templates", "player_classlevelstats",
+                            "player_levelstats"})
+
+WORLD_VIEW_TABLES = databases.CHARACTER_WORLD_VIEWS
+
+
+_START_PLAYER_MONEY = 0
+
+
+def configure(world_path: str, character_path: Optional[str] = None,
+              start_money: int = 0) -> None:
+    """Route character-database calls and set the new-character balance."""
+    global _START_PLAYER_MONEY
+    _START_PLAYER_MONEY = max(0, int(start_money or 0))
+    databases.configure(world_path, character_path)
+
+
+def _same_path(first: str, second: str) -> bool:
+    return databases.same_path(first, second)
+
+
+def _connect(path: str) -> sqlite3.Connection:
+    """Open the database that owns characters, attaching the world bank."""
+    return databases.connect_character(path)
+
+
+def _to_signed_64(value: int) -> int:
+    """SQLite INTEGER is signed; store full 64-bit object guids two's-complement."""
+    value = int(value or 0) & 0xFFFFFFFFFFFFFFFF
+    return value - 0x10000000000000000 if value >= 0x8000000000000000 else value
+
+
+def _to_unsigned_64(value: int) -> int:
+    return int(value or 0) & 0xFFFFFFFFFFFFFFFF
+
+
+def _open_raw(path: str) -> sqlite3.Connection:
+    """Open ``path`` directly, bypassing the split-database routing."""
+    return sqlite3.connect(path)
+
+
+def _migrate_item_template_columns(con: sqlite3.Connection) -> None:
+    """Add item-template columns introduced after the first schema revision."""
+    columns = {row[1] for row in con.execute(
+        "PRAGMA table_info(item_templates)")}
+    for index in range(1, 6):
+        column = f"spell_ppm_rate{index}"
+        if column not in columns:
+            con.execute(
+                f"ALTER TABLE item_templates ADD COLUMN {column}"
+                " REAL NOT NULL DEFAULT 0.0")
+    if "start_quest" not in columns:
+        # item_template.startquest: using the item opens that quest.
+        con.execute(
+            "ALTER TABLE item_templates ADD COLUMN start_quest INTEGER"
+            " NOT NULL DEFAULT 0")
+    if "buy_count" not in columns:
+        # Vendors sell some items in fixed bundles (water x5, arrows x200).
+        con.execute(
+            "ALTER TABLE item_templates ADD COLUMN buy_count INTEGER"
+            " NOT NULL DEFAULT 1")
+
+
+def init_world_db(path: str) -> None:
+    """Create/upgrade the world-side template tables used by characters."""
+    client_cache_version.cache_clear()
+    con = _open_raw(path)  # world bank: never routed
+    try:
+        con.executescript(CREATE_WORLD_TEMPLATE_SQL)
+        _migrate_item_template_columns(con)
+        _seed_starter_items(con)
+        con.commit()
+    finally:
+        con.close()
+
+
+# Tables that move from the legacy combined world database into characters.db.
+CHARACTER_TABLES = (
+    "characters",
+    "character_items",
+    "character_spells",
+    "character_skills",
+    "character_proficiencies",
+    "character_corpses",
+    "character_taxi_nodes",
+    "character_quests",
+    "character_quests_rewarded",
+    "groups",
+    "group_members",
+)
+
+
+def _table_names(con: sqlite3.Connection, schema: str = "main") -> set[str]:
+    return {
+        str(row[0])
+        for row in con.execute(
+            f"SELECT name FROM {schema}.sqlite_master WHERE type = 'table'")
+    }
+
+
+def _migrate_character_columns(con: sqlite3.Connection) -> None:
+    """Add character columns introduced after the first schema revision."""
+    columns = {row[1] for row in con.execute("PRAGMA table_info(characters)")}
+    additions = {
+        "o": "REAL NOT NULL DEFAULT 0.0",
+        "bytes1": "INTEGER NOT NULL DEFAULT 0",
+        "bytes2": "INTEGER NOT NULL DEFAULT 0",
+        "xp": "INTEGER NOT NULL DEFAULT 0",
+        "money": "INTEGER NOT NULL DEFAULT 0",
+        "death_state": "INTEGER NOT NULL DEFAULT 0",
+    }
+    for name, declaration in additions.items():
+        if name not in columns:
+            con.execute(
+                f"ALTER TABLE characters ADD COLUMN {name} {declaration}")
+
+
+def _migrate_corpse_columns(con: sqlite3.Connection) -> None:
+    try:
+        columns = {row[1] for row in con.execute(
+            "PRAGMA table_info(character_corpses)")}
+    except sqlite3.Error:
+        return
+    if columns and "released" not in columns:
+        con.execute(
+            "ALTER TABLE character_corpses ADD COLUMN released INTEGER"
+            " NOT NULL DEFAULT 0")
+
+
+def _migrate_group_columns(con: sqlite3.Connection) -> None:
+    try:
+        columns = {row[1] for row in con.execute(
+            "PRAGMA table_info(groups)")}
+    except sqlite3.Error:
+        return
+    if columns and "offline_since" not in columns:
+        con.execute(
+            "ALTER TABLE groups ADD COLUMN offline_since INTEGER"
+            " NOT NULL DEFAULT 0")
+
+
+def init_character_store(path: str) -> None:
+    """Create/upgrade the per-character database schema."""
+    con = _open_raw(path)
+    try:
+        con.executescript(CREATE_CHARACTER_TABLES_SQL)
+        _migrate_character_columns(con)
+        _migrate_corpse_columns(con)
+        _migrate_group_columns(con)
+        _migrate_start_positions(con)
+        con.commit()
+    finally:
+        con.close()
+
+
+def _backfill_split_store(character_path: str, world_path: str) -> None:
+    """Grant missing starter spells using the attached world bank."""
+    con = _open_raw(character_path)
+    try:
+        con.execute("ATTACH DATABASE ? AS world", (world_path,))
+        con.execute(
+            "CREATE TEMP VIEW IF NOT EXISTS playercreateinfo_spell AS"
+            " SELECT * FROM world.playercreateinfo_spell")
+        _backfill_starter_spells(con, seed_world=False)
+        con.commit()
+    finally:
+        con.close()
+
+
+def migrate_legacy_characters(world_path: str,
+                              character_path: str) -> int:
+    """Copy character rows out of a pre-split combined ``world.db``.
+
+    The function only runs into an empty character store, so it is safe to call
+    on every startup: an existing ``characters.db`` is never merged with or
+    overwritten by stale copies left in an old world database.  Returns the
+    number of character rows copied.
+    """
+    world = _open_raw(world_path)
+    try:
+        if "characters" not in _table_names(world):
+            return 0
+        legacy_count = int(world.execute(
+            "SELECT COUNT(*) FROM characters").fetchone()[0] or 0)
+        if not legacy_count:
+            return 0
+    finally:
+        world.close()
+
+    con = _open_raw(character_path)
+    try:
+        if "characters" not in _table_names(con):
+            return 0
+        existing = int(con.execute(
+            "SELECT COUNT(*) FROM characters").fetchone()[0] or 0)
+        if existing:
+            return 0
+        con.execute("ATTACH DATABASE ? AS world", (world_path,))
+        copied = 0
+        for table in CHARACTER_TABLES:
+            if table not in _table_names(con) or table not in _table_names(
+                    con, "world"):
+                continue
+            main_columns = [row[1] for row in con.execute(
+                f"PRAGMA main.table_info({table})")]
+            world_columns = {row[1] for row in con.execute(
+                f"PRAGMA world.table_info({table})")}
+            columns = [name for name in main_columns if name in world_columns]
+            if not columns:
+                continue
+            column_list = ", ".join(f'"{name}"' for name in columns)
+            cur = con.execute(
+                f'INSERT OR IGNORE INTO main."{table}"({column_list})'
+                f' SELECT {column_list} FROM world."{table}"')
+            if table == "characters":
+                copied = max(0, int(cur.rowcount or 0))
+        con.commit()
+        if copied:
+            print(f"Migrated {copied} character(s) from the legacy world database")
+        return copied
+    finally:
+        con.close()
+
+
+def init_split_databases(world_path: str, character_path: str) -> None:
+    """Create/upgrade the world bank and the separate character store."""
+    init_world_db(world_path)
+    init_character_store(character_path)
+    # Character quest tables must exist before the legacy rows are copied.
+    from src.world import quests
+    quests.init_character_quest_db(character_path)
+    migrate_legacy_characters(world_path, character_path)
+    # Backfill after the migration so characters imported from the old
+    # combined database pick up any missing starter spells immediately.
+    _backfill_split_store(character_path, world_path)
+
+
 _NAME_RE = re.compile(r"^[A-Za-z]{2,12}$")
 # 3.3.5a writes INVENTORY_SLOT_BAG_END (23) entries: 19 equipment slots plus
 # the 4 bag slots.  Sending only 19 truncates every record and the client
 # silently discards the whole SMSG_CHAR_ENUM (empty character list).
 _EQUIPMENT_SLOTS = 23
+# Internal character flags and their ``SMSG_CHAR_ENUM`` wire values.  The
+# server stores the ghost marker as ``0x10``, but the 3.3.5 character-list
+# packet uses ``0x2000`` for the same state.
+CHARACTER_FLAG_GHOST = 0x00000010
+CHARACTER_FLAG_GHOST_CHAR_ENUM = 0x00002000
+CHARACTER_FLAG_GHOST_ENUM = CHARACTER_FLAG_GHOST_CHAR_ENUM
 
 # Player starting positions, copied row-for-row from the 3.3.5a world database
 # (``playercreateinfo``).  Keyed by (race, class) because death knights get the
@@ -388,42 +737,18 @@ def is_valid_race_class(race: int, char_class: int) -> bool:
 
 
 def init_character_db(path: str) -> None:
-    con = sqlite3.connect(path)
+    """Create the combined schema in one file (tests and one-off tools).
+
+    Production uses :func:`init_split_databases` so that characters live in
+    ``data/characters.db`` while the regenerated world bank stays read-only.
+    """
+    con = _open_raw(path)  # init: may be the combined test database
     try:
         con.executescript(CREATE_CHARACTERS_SQL)
-        # Older databases predate the orientation column used for login.
-        columns = {row[1] for row in con.execute("PRAGMA table_info(characters)")}
-        if "o" not in columns:
-            con.execute("ALTER TABLE characters ADD COLUMN o REAL NOT NULL DEFAULT 0.0")
-        if "bytes1" not in columns:
-            con.execute("ALTER TABLE characters ADD COLUMN bytes1 INTEGER NOT NULL DEFAULT 0")
-        if "bytes2" not in columns:
-            con.execute("ALTER TABLE characters ADD COLUMN bytes2 INTEGER NOT NULL DEFAULT 0")
-        if "xp" not in columns:
-            con.execute("ALTER TABLE characters ADD COLUMN xp INTEGER NOT NULL DEFAULT 0")
-        if "money" not in columns:
-            con.execute("ALTER TABLE characters ADD COLUMN money INTEGER NOT NULL DEFAULT 0")
-        # Item proc rates are imported from item_template.spellppmRate_*.  Older
-        # databases only have the spell ids/triggers.
-        item_columns = {
-            row[1] for row in con.execute("PRAGMA table_info(item_templates)")
-        }
-        for index in range(1, 6):
-            column = f"spell_ppm_rate{index}"
-            if column not in item_columns:
-                con.execute(
-                    f"ALTER TABLE item_templates ADD COLUMN {column}"
-                    " REAL NOT NULL DEFAULT 0.0")
-        if "start_quest" not in item_columns:
-            # item_template.startquest: using the item opens that quest.
-            con.execute(
-                "ALTER TABLE item_templates ADD COLUMN start_quest INTEGER NOT NULL DEFAULT 0"
-            )
-        if "buy_count" not in item_columns:
-            # Vendors sell some items in fixed bundles (water x5, arrows x200).
-            con.execute(
-                "ALTER TABLE item_templates ADD COLUMN buy_count INTEGER NOT NULL DEFAULT 1"
-            )
+        _migrate_character_columns(con)
+        _migrate_corpse_columns(con)
+        _migrate_group_columns(con)
+        _migrate_item_template_columns(con)
         _migrate_start_positions(con)
         _seed_starter_items(con)
         _backfill_starter_spells(con)
@@ -452,22 +777,20 @@ def _starter_spells_for(con: sqlite3.Connection, race: int,
     spells = [int(row[0]) for row in rows]
     if not spells:
         spells = list(_STARTER_SPELLS_BY_CLASS.get(int(char_class), []))
-    for spell_id in _EXTRA_STARTER_SPELLS_BY_CLASS.get(int(char_class), []):
-        if spell_id not in spells:
-            spells.append(spell_id)
     return spells
 
 
 def get_starter_spells(path: str, race: int, char_class: int) -> List[int]:
     """Public helper for callers that only have the database path."""
-    con = sqlite3.connect(path)
+    con = _connect(path)
     try:
         return _starter_spells_for(con, race, char_class)
     finally:
         con.close()
 
 
-def _backfill_starter_spells(con: sqlite3.Connection) -> None:
+def _backfill_starter_spells(con: sqlite3.Connection,
+                             seed_world: bool = True) -> None:
     """Grant any missing starter spells to every character.
 
     Characters created before the authentic ``playercreateinfo_spell`` data
@@ -476,15 +799,21 @@ def _backfill_starter_spells(con: sqlite3.Connection) -> None:
     the table does not exist yet (a tool opened the character database before
     ``init_creature_db``), the backfill is skipped rather than guessing with
     the class-only fallback.
+
+    ``seed_world`` seeds the hand-written starter item rows into the same file.
+    A split character database must pass ``False``: its world templates live in
+    the attached world bank.
     """
     try:
         if con.execute(
                 "SELECT 1 FROM playercreateinfo_spell LIMIT 1").fetchone() is None:
-            _seed_starter_items(con)
+            if seed_world:
+                _seed_starter_items(con)
             con.commit()
             return
     except sqlite3.Error:
-        _seed_starter_items(con)
+        if seed_world:
+            _seed_starter_items(con)
         con.commit()
         return
     rows = con.execute("SELECT guid, race, class FROM characters").fetchall()
@@ -500,8 +829,9 @@ def _backfill_starter_spells(con: sqlite3.Connection) -> None:
         con.commit()
         print(f"Backfilled {added} missing starter spell(s)")
 
-    _seed_starter_items(con)
-    con.commit()
+    if seed_world:
+        _seed_starter_items(con)
+        con.commit()
 
 
 def _migrate_start_positions(con: sqlite3.Connection) -> None:
@@ -541,7 +871,7 @@ def normalize_name(name: str) -> Optional[str]:
 
 
 def list_characters(path: str, account_id: int) -> List[sqlite3.Row]:
-    con = sqlite3.connect(path)
+    con = _connect(path)
     con.row_factory = sqlite3.Row
     try:
         return con.execute(
@@ -554,7 +884,7 @@ def list_characters(path: str, account_id: int) -> List[sqlite3.Row]:
 
 def get_character(path: str, account_id: int, guid: int) -> Optional[sqlite3.Row]:
     """Return the character row if it belongs to ``account_id``."""
-    con = sqlite3.connect(path)
+    con = _connect(path)
     con.row_factory = sqlite3.Row
     try:
         return con.execute(
@@ -578,7 +908,7 @@ def get_character_by_guid(path: str, guid: int) -> Optional[sqlite3.Row]:
     guid = int(guid)
     if not (0 < guid <= 0xFFFFFFFF):
         return None
-    con = sqlite3.connect(path)
+    con = _connect(path)
     con.row_factory = sqlite3.Row
     try:
         return con.execute(
@@ -599,7 +929,7 @@ def find_character_by_name(path: str, name: str) -> Optional[sqlite3.Row]:
     normalized = normalize_name(name)
     if normalized is None:
         return None
-    con = sqlite3.connect(path)
+    con = _connect(path)
     con.row_factory = sqlite3.Row
     try:
         return con.execute(
@@ -629,14 +959,16 @@ def create_character(path: str, account_id: int, name: str, race: int, char_clas
     """
     map_id, zone, x, y, z, o = start_position(race, char_class)
     level = start_level(char_class)
-    con = sqlite3.connect(path)
+    con = _connect(path)
     try:
         cur = con.execute(
             "INSERT INTO characters(account_id, name, race, class, gender, skin, face, "
-            "hair_style, hair_color, facial_style, level, map, zone, x, y, z, o) "
-            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "hair_style, hair_color, facial_style, level, map, zone, x, y, z, o,"
+            " money) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (account_id, name, race, char_class, gender, skin, face,
-             hair_style, hair_color, facial_style, level, map_id, zone, x, y, z, o),
+             hair_style, hair_color, facial_style, level, map_id, zone, x, y, z, o,
+             int(_START_PLAYER_MONEY)),
         )
         guid = int(cur.lastrowid)
         _grant_starter_spells(con, guid, race, char_class)
@@ -647,7 +979,7 @@ def create_character(path: str, account_id: int, name: str, race: int, char_clas
 
 
 def delete_character(path: str, account_id: int, guid: int) -> bool:
-    con = sqlite3.connect(path)
+    con = _connect(path)
     try:
         cur = con.execute(
             "DELETE FROM characters WHERE guid = ? AND account_id = ?",
@@ -656,6 +988,32 @@ def delete_character(path: str, account_id: int, guid: int) -> bool:
         if cur.rowcount > 0:
             from src.world import quests
             quests.delete_character_quests(con, guid)
+            for table in ("character_items", "character_spells",
+                          "character_skills", "character_proficiencies",
+                          "character_corpses"):
+                try:
+                    con.execute(
+                        f"DELETE FROM {table} WHERE character_guid = ?",
+                        (int(guid),))
+                except sqlite3.OperationalError:
+                    pass
+            try:
+                con.execute(
+                    "DELETE FROM group_members WHERE character_guid = ?",
+                    (int(guid),))
+                con.execute(
+                    "UPDATE groups SET leader_guid = ("
+                    " SELECT character_guid FROM group_members"
+                    " WHERE group_guid = groups.guid LIMIT 1)"
+                    " WHERE leader_guid = ?"
+                    " AND EXISTS (SELECT 1 FROM group_members"
+                    "  WHERE group_guid = groups.guid)",
+                    (int(guid),))
+                con.execute(
+                    "DELETE FROM groups WHERE guid NOT IN ("
+                    " SELECT group_guid FROM group_members)")
+            except sqlite3.OperationalError:
+                pass
         con.commit()
         return cur.rowcount > 0
     finally:
@@ -663,7 +1021,7 @@ def delete_character(path: str, account_id: int, guid: int) -> bool:
 
 
 def character_exists(path: str, account_id: int, guid: int) -> bool:
-    con = sqlite3.connect(path)
+    con = _connect(path)
     try:
         row = con.execute(
             "SELECT 1 FROM characters WHERE guid = ? AND account_id = ?",
@@ -693,12 +1051,244 @@ def update_character_position(path: str, guid: int, x: float, y: float, z: float
         params.append(int(zone))
     params.append(int(guid))
 
-    con = sqlite3.connect(path)
+    con = _connect(path)
     try:
         con.execute(
             f"UPDATE characters SET {', '.join(assignments)} WHERE guid = ?",
             params,
         )
+        con.commit()
+    finally:
+        con.close()
+
+
+def set_character_death_state(path: str, guid: int, state: int) -> None:
+    """Persist ``0`` alive, ``1`` dead or ``2`` ghost."""
+    con = _connect(path)
+    try:
+        con.execute("UPDATE characters SET death_state = ? WHERE guid = ?",
+                    (int(state), int(guid)))
+        con.commit()
+    finally:
+        con.close()
+
+
+def save_character_corpse(path: str, guid: int, map_id: int, zone: int,
+                          x: float, y: float, z: float, o: float) -> None:
+    import time as _time
+    con = _connect(path)
+    try:
+        con.execute(
+            "INSERT OR REPLACE INTO character_corpses("
+            "character_guid, map, zone, x, y, z, o, created)"
+            " VALUES(?,?,?,?,?,?,?,?)",
+            (int(guid), int(map_id), int(zone), float(x), float(y), float(z),
+             float(o), int(_time.time())),
+        )
+        con.commit()
+    finally:
+        con.close()
+
+
+def mark_character_corpse_released(path: str, guid: int,
+                                   released: int) -> None:
+    con = _connect(path)
+    try:
+        con.execute(
+            "UPDATE character_corpses SET released = ? "
+            "WHERE character_guid = ?",
+            (int(released), int(guid)))
+        con.commit()
+    finally:
+        con.close()
+
+
+def get_character_corpse(path: str, guid: int) -> Optional[Dict[str, object]]:
+    con = _connect(path)
+    con.row_factory = sqlite3.Row
+    try:
+        row = con.execute(
+            "SELECT * FROM character_corpses WHERE character_guid = ?",
+            (int(guid),),
+        ).fetchone()
+    except sqlite3.Error:
+        row = None
+    finally:
+        con.close()
+    return dict(row) if row is not None else None
+
+
+def get_equipment_entries(path: str, guid: int) -> List[int]:
+    """Return the 19 equipped items packed for ``CORPSE_FIELD_ITEM``.
+
+    The client expects ``displayId | inventoryType << 24`` in that field, not
+    the item entry.  Slots without an item (or with a missing template) stay 0.
+    """
+    result = [0] * 19
+    con = _connect(path)
+    try:
+        for slot, display_id, inventory_type in con.execute(
+                "SELECT ci.slot, it.display_id, it.inventory_type"
+                " FROM character_items ci"
+                " LEFT JOIN item_templates it ON ci.item_entry = it.entry"
+                " WHERE ci.character_guid = ? AND ci.slot BETWEEN 0 AND 18",
+                (int(guid),)):
+            if 0 <= int(slot) < 19:
+                display = int(display_id or 0) & 0x00FFFFFF
+                inv_type = int(inventory_type or 0) & 0xFF
+                result[int(slot)] = display | (inv_type << 24)
+    except sqlite3.Error:
+        pass
+    finally:
+        con.close()
+    return result
+
+
+def get_corpses_near(path: str, map_id: int, x: float, y: float, z: float,
+                     radius: float) -> List[Dict[str, object]]:
+    """Corpses on ``map_id`` within ``radius`` yards, with owner appearance."""
+    radius = max(0.0, float(radius))
+    if radius <= 0.0:
+        return []
+    x, y, z = float(x), float(y), float(z)
+    con = _connect(path)
+    con.row_factory = sqlite3.Row
+    try:
+        rows = con.execute(
+            "SELECT c.*, ch.race, ch.gender, ch.skin, ch.face,"
+            " ch.hair_style, ch.hair_color, ch.facial_style, ch.guild_id,"
+            " ch.char_flags"
+            " FROM character_corpses c"
+            " JOIN characters ch ON ch.guid = c.character_guid"
+            " WHERE c.map = ? AND c.x BETWEEN ? AND ?"
+            " AND c.y BETWEEN ? AND ?",
+            (int(map_id), x - radius, x + radius, y - radius, y + radius),
+        ).fetchall()
+        result = []
+        limit = radius * radius
+        for row in rows:
+            dx = float(row["x"]) - x
+            dy = float(row["y"]) - y
+            dz = float(row["z"]) - z
+            if dx * dx + dy * dy + dz * dz > limit:
+                continue
+            corpse = dict(row)
+            corpse["owner_guid"] = int(row["character_guid"])
+            corpse["items"] = get_equipment_entries(path, int(row["character_guid"]))
+            result.append(corpse)
+    except sqlite3.Error:
+        result = []
+    finally:
+        con.close()
+    return result
+
+
+def delete_character_corpse(path: str, guid: int) -> None:
+    con = _connect(path)
+    try:
+        con.execute("DELETE FROM character_corpses WHERE character_guid = ?",
+                    (int(guid),))
+        con.commit()
+    finally:
+        con.close()
+
+
+def load_groups(path: str) -> List[Dict[str, object]]:
+    """Return every persisted group, including offline members."""
+    con = _connect(path)
+    con.row_factory = sqlite3.Row
+    try:
+        group_rows = con.execute(
+            "SELECT * FROM groups ORDER BY guid").fetchall()
+        member_rows = con.execute(
+            "SELECT gm.group_guid, gm.character_guid, gm.subgroup,"
+            " gm.member_flags, gm.roles, ch.name"
+            " FROM group_members gm"
+            " LEFT JOIN characters ch ON ch.guid = gm.character_guid"
+            " ORDER BY gm.group_guid, gm.character_guid").fetchall()
+    except sqlite3.Error:
+        return []
+    finally:
+        con.close()
+    groups: Dict[int, Dict[str, object]] = {}
+    for row in group_rows:
+        group_id = int(row["guid"])
+        groups[group_id] = {
+            "id": group_id,
+            "leader_guid": _to_unsigned_64(row["leader_guid"]),
+            "raid": bool(row["raid"]),
+            "loot_method": int(row["loot_method"] or 0),
+            "master_looter_guid": _to_unsigned_64(
+                row["master_looter_guid"]),
+            "loot_threshold": int(row["loot_threshold"] or 2),
+            "target_icons": [_to_unsigned_64(row[f"icon{index}"])
+                             for index in range(1, 9)],
+            "counter": int(row["counter"] or 0),
+            "offline_since": (int(row["offline_since"] or 0)
+                              if "offline_since" in row.keys() else 0),
+            "members": [],
+        }
+    for row in member_rows:
+        group = groups.get(int(row["group_guid"]))
+        if group is None:
+            continue
+        guid = _to_unsigned_64(row["character_guid"])
+        if not guid:
+            continue
+        group["members"].append({
+            "guid": guid,
+            "name": str(row["name"] or f"Player-{guid}"),
+            "subgroup": int(row["subgroup"] or 0) & 7,
+            "member_flags": int(row["member_flags"] or 0) & 0xFF,
+            "roles": int(row["roles"] or 0) & 0xFF,
+        })
+    return [group for group in groups.values() if group["members"]]
+
+
+def save_group(path: str, group_dict: Dict[str, object]) -> None:
+    """Insert/replace one persisted group and all of its member rows."""
+    group_id = int(group_dict["id"])
+    icons = list(group_dict.get("target_icons") or [])
+    icons = [int(value or 0) for value in icons[:8]]
+    icons.extend([0] * (8 - len(icons)))
+    con = _connect(path)
+    try:
+        con.execute(
+            "INSERT OR REPLACE INTO groups("
+            "guid, leader_guid, raid, loot_method, master_looter_guid,"
+            " loot_threshold, icon1, icon2, icon3, icon4, icon5, icon6,"
+            " icon7, icon8, counter, offline_since)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (group_id, _to_signed_64(group_dict.get("leader_guid")),
+             1 if group_dict.get("raid") else 0,
+             int(group_dict.get("loot_method") or 0),
+             _to_signed_64(group_dict.get("master_looter_guid")),
+             int(group_dict.get("loot_threshold", 2) or 2),
+             *[_to_signed_64(value) for value in icons],
+             int(group_dict.get("counter") or 0),
+             int(group_dict.get("offline_since") or 0)))
+        con.execute("DELETE FROM group_members WHERE group_guid = ?",
+                    (group_id,))
+        for member in group_dict.get("members") or []:
+            con.execute(
+                "INSERT OR REPLACE INTO group_members("
+                "group_guid, character_guid, subgroup, member_flags, roles)"
+                " VALUES(?,?,?,?,?)",
+                (group_id, _to_signed_64(member["guid"]),
+                 int(member.get("subgroup") or 0) & 7,
+                 int(member.get("member_flags") or 0) & 0xFF,
+                 int(member.get("roles") or 0) & 0xFF))
+        con.commit()
+    finally:
+        con.close()
+
+
+def delete_group(path: str, group_id: int) -> None:
+    con = _connect(path)
+    try:
+        con.execute("DELETE FROM group_members WHERE group_guid = ?",
+                    (int(group_id),))
+        con.execute("DELETE FROM groups WHERE guid = ?", (int(group_id),))
         con.commit()
     finally:
         con.close()
@@ -732,12 +1322,19 @@ def build_char_enum_payload(characters: List[sqlite3.Row], equipment: Optional[D
         out += struct.pack("<I", int(char["map"]))
         out += struct.pack("<fff", float(char["x"]), float(char["y"]), float(char["z"]))
         out += struct.pack("<I", int(char["guild_id"]))
-        out += struct.pack("<I", int(char["char_flags"]))
+        death_state = (int(char["death_state"])
+                       if "death_state" in char.keys() else 0)
+        char_flags = int(char["char_flags"])
+        if death_state == 2:
+            char_flags |= CHARACTER_FLAG_GHOST_CHAR_ENUM
+        out += struct.pack("<I", char_flags)
         out += struct.pack("<I", int(char["customize_flags"]))
         out.append(1 if int(char["first_login"]) else 0)
-        out += struct.pack("<I", int(char["pet_display_id"]))
-        out += struct.pack("<I", int(char["pet_level"]))
-        out += struct.pack("<I", int(char["pet_family"]))
+        # A ghost has no active pet in the character list.
+        ghost = death_state == 2
+        out += struct.pack("<I", 0 if ghost else int(char["pet_display_id"]))
+        out += struct.pack("<I", 0 if ghost else int(char["pet_level"]))
+        out += struct.pack("<I", 0 if ghost else int(char["pet_family"]))
 
         # 23 equipment entries (19 equipment + 4 bags): display id, inventory
         # type, enchant visual.
@@ -1027,6 +1624,7 @@ def _seed_starter_items(con: sqlite3.Connection) -> None:
 CACHE_FORMAT_VERSION = 4
 
 
+@lru_cache(maxsize=8)
 def client_cache_version(path: str) -> int:
     """Return the value for ``SMSG_CLIENTCACHE_VERSION``.
 
@@ -1040,7 +1638,7 @@ def client_cache_version(path: str) -> int:
     derived from SQL aggregates over the fields the client actually caches
     instead of hashing every row in Python.
     """
-    con = sqlite3.connect(path)
+    con = _connect(path)
     try:
         row = con.execute(
             """SELECT COUNT(*),
@@ -1058,7 +1656,7 @@ def client_cache_version(path: str) -> int:
                       COALESCE(SUM(buy_price), 0),
                       COALESCE(SUM(LENGTH(name1)), 0),
                       COALESCE(SUM(LENGTH(description)), 0),
-                      COALESCE(MAX(rowid), 0)
+                      COALESCE(MAX(entry), 0)
                FROM item_templates"""
         ).fetchone()
     finally:
@@ -1070,7 +1668,7 @@ def client_cache_version(path: str) -> int:
 
 def get_item_template(path: str, entry: int) -> Optional[sqlite3.Row]:
     """Fetch an item template by entry."""
-    con = sqlite3.connect(path)
+    con = _connect(path)
     con.row_factory = sqlite3.Row
     try:
         return con.execute(
@@ -1083,15 +1681,17 @@ def get_item_template(path: str, entry: int) -> Optional[sqlite3.Row]:
 def get_character_inventory(path: str, character_guid: int) -> Dict[int, sqlite3.Row]:
     """Return {slot: item_row} for all items owned by a character.
 
-    Each row also carries ``display_id`` from ``item_templates`` (NULL when the
-    template is missing) so callers can build visual packets such as
-    ``SMSG_MIRRORIMAGE_DATA`` without a second query per item.
+    Each row also carries ``display_id`` and ``inventory_type`` from
+    ``item_templates`` (NULL when the template is missing) so callers can build
+    visual packets such as ``SMSG_MIRRORIMAGE_DATA`` and corpse item fields
+    without a second query per item.
     """
-    con = sqlite3.connect(path)
+    con = _connect(path)
     con.row_factory = sqlite3.Row
     try:
         rows = con.execute(
-            """SELECT ci.*, it.display_id AS display_id
+            """SELECT ci.*, it.display_id AS display_id,
+                      it.inventory_type AS inventory_type
                FROM character_items ci
                LEFT JOIN item_templates it ON ci.item_entry = it.entry
                WHERE ci.character_guid = ?""",
@@ -1164,7 +1764,7 @@ def get_equipped_item_totals(path: str, character_guid: int) -> Dict[str, int]:
     resistance_columns = ", ".join(
         f"it.{column}" for _key, column in _ITEM_RESISTANCES
     )
-    con = sqlite3.connect(path)
+    con = _connect(path)
     try:
         rows = con.execute(
             f"SELECT {resistance_columns}, {stat_columns},"
@@ -1238,7 +1838,7 @@ def get_equipment_for_char_enum(path: str, character_guid: int) -> List[Tuple[in
     
     Returns [(display_id, inv_type, enchant_visual), ...] for slots 0..22.
     """
-    con = sqlite3.connect(path)
+    con = _connect(path)
     con.row_factory = sqlite3.Row
     try:
         # Join items with templates to get display_id and inventory_type
@@ -1267,7 +1867,7 @@ def create_character_items(path: str, character_guid: int, items: List[Tuple[int
     ``items`` is a list of (item_entry, slot) tuples.
     Returns list of created items with their DB IDs and assigned slots.
     """
-    con = sqlite3.connect(path)
+    con = _connect(path)
     try:
         created_items = []
         for entry, slot in items:
@@ -1314,7 +1914,7 @@ def add_item_to_inventory(path: str, character_guid: int, entry: int,
     changed).  The whole move is atomic: when all of ``count`` cannot be
     stored, nothing is written and ``None`` is returned.
     """
-    con = sqlite3.connect(path)
+    con = _connect(path)
     try:
         template = con.execute(
             "SELECT stackable, max_durability FROM item_templates WHERE entry = ?",
@@ -1579,14 +2179,6 @@ _STARTER_SPELLS_BY_CLASS = {
     ],
 }
 
-# Abilities a level-1 class trainer would teach but ``playercreateinfo_spell``
-# does not grant.  This server has no trainers, so summoning would otherwise be
-# unreachable for a warlock; the exception is deliberately kept tiny.
-_EXTRA_STARTER_SPELLS_BY_CLASS = {
-    9: [688],   # Summon Imp (level-1 trainer spell)
-}
-
-
 def _grant_starter_spells(con: sqlite3.Connection, character_guid: int,
                           race: int, char_class: int) -> None:
     """Grant the authentic starter spellbook to a new character."""
@@ -1614,7 +2206,7 @@ def grant_starter_items(path: str, character_guid: int, race: int,
     created = create_character_items(path, character_guid, items)
 
     # Also grant starter spells
-    con = sqlite3.connect(path)
+    con = _connect(path)
     try:
         _grant_starter_spells(con, character_guid, race, char_class)
         con.commit()
@@ -1626,7 +2218,7 @@ def grant_starter_items(path: str, character_guid: int, race: int,
 
 def delete_character_item(path: str, character_guid: int, slot: int) -> bool:
     """Delete a single item from a character's inventory."""
-    con = sqlite3.connect(path)
+    con = _connect(path)
     try:
         cur = con.execute(
             "DELETE FROM character_items WHERE character_guid = ? AND slot = ?",
@@ -1643,7 +2235,7 @@ def swap_character_items(path: str, character_guid: int, slot_a: int, slot_b: in
     
     Returns True if both slots had items and were swapped, False if either was empty.
     """
-    con = sqlite3.connect(path)
+    con = _connect(path)
     try:
         row_a = con.execute(
             "SELECT * FROM character_items WHERE character_guid = ? AND slot = ?",
@@ -1681,13 +2273,190 @@ def swap_character_items(path: str, character_guid: int, slot_a: int, slot_b: in
 
 def get_character_spells(path: str, character_guid: int) -> List[sqlite3.Row]:
     """Fetch all active spells known by a character."""
-    con = sqlite3.connect(path)
+    con = _connect(path)
     con.row_factory = sqlite3.Row
     try:
         return con.execute(
             "SELECT spell FROM character_spells WHERE character_guid = ? AND active = 1",
             (character_guid,),
         ).fetchall()
+    finally:
+        con.close()
+
+
+def set_character_money(path: str, character_guid: int, money: int) -> None:
+    """Persist the copper amount to the character bank (split-aware)."""
+    con = _connect(path)
+    try:
+        con.execute(
+            "UPDATE characters SET money = ? WHERE guid = ?",
+            (max(0, int(money)), int(character_guid)),
+        )
+        con.commit()
+    finally:
+        con.close()
+
+
+def update_character_progress(path: str, character_guid: int, level: int,
+                              xp: int) -> None:
+    """Persist level/XP to the character bank (split-aware)."""
+    con = _connect(path)
+    try:
+        con.execute(
+            "UPDATE characters SET level = ?, xp = ? WHERE guid = ?",
+            (int(level), int(xp), int(character_guid)),
+        )
+        con.commit()
+    finally:
+        con.close()
+
+
+def update_character_bytes(path: str, character_guid: int, column: str,
+                           value: int) -> None:
+    """Persist one of the packed PLAYER_BYTES* fields."""
+    if column not in ("bytes1", "bytes2", "bytes3"):
+        raise ValueError(f"unsupported character bytes column {column!r}")
+    con = _connect(path)
+    try:
+        con.execute(
+            f"UPDATE characters SET {column} = ? WHERE guid = ?",
+            (int(value) & 0xFFFFFFFF, int(character_guid)),
+        )
+        con.commit()
+    finally:
+        con.close()
+
+
+def update_character_item_stack(path: str, character_guid: int, slot: int,
+                                count: int) -> None:
+    con = _connect(path)
+    try:
+        con.execute(
+            "UPDATE character_items SET stack_count = ?"
+            " WHERE character_guid = ? AND slot = ?",
+            (int(count), int(character_guid), int(slot)),
+        )
+        con.commit()
+    finally:
+        con.close()
+
+
+def update_character_item_enchant(path: str, character_guid: int, slot: int,
+                                  enchantment_2: int) -> None:
+    con = _connect(path)
+    try:
+        con.execute(
+            "UPDATE character_items SET enchantment_2 = ?"
+            " WHERE character_guid = ? AND slot = ?",
+            (int(enchantment_2), int(character_guid), int(slot)),
+        )
+        con.commit()
+    finally:
+        con.close()
+
+
+def update_item_durability(path: str, rows) -> None:
+    """Persist ``(durability, item_id)`` pairs to the character bank."""
+    con = _connect(path)
+    try:
+        con.executemany(
+            "UPDATE character_items SET durability = ? WHERE id = ?", rows)
+        con.commit()
+    finally:
+        con.close()
+
+
+def get_character_skills(path: str, character_guid: int) -> List[sqlite3.Row]:
+    """Fetch the character's persisted skill lines."""
+    con = _connect(path)
+    con.row_factory = sqlite3.Row
+    try:
+        return con.execute(
+            "SELECT skill, slot, value, max_value, step"
+            " FROM character_skills WHERE character_guid = ? ORDER BY slot",
+            (int(character_guid),),
+        ).fetchall()
+    finally:
+        con.close()
+
+
+def learn_character_spell(path: str, character_guid: int, spell: int,
+                          superseded=()) -> None:
+    """Persist one learned spell and remove the ranks it supersedes."""
+    con = _connect(path)
+    try:
+        for old_spell in superseded:
+            con.execute(
+                "DELETE FROM character_spells"
+                " WHERE character_guid = ? AND spell = ?",
+                (int(character_guid), int(old_spell)),
+            )
+        con.execute(
+            "INSERT OR IGNORE INTO character_spells"
+            "(character_guid, spell, active) VALUES(?,?,1)",
+            (int(character_guid), int(spell)),
+        )
+        con.commit()
+    finally:
+        con.close()
+
+
+def set_character_skill(path: str, character_guid: int, skill: int,
+                        slot: int, value: int, max_value: int,
+                        step: int) -> None:
+    """Insert or update one skill line."""
+    con = _connect(path)
+    try:
+        con.execute(
+            "INSERT INTO character_skills"
+            "(character_guid, skill, slot, value, max_value, step)"
+            " VALUES(?,?,?,?,?,?)"
+            " ON CONFLICT(character_guid, skill) DO UPDATE SET"
+            " slot = excluded.slot, value = excluded.value,"
+            " max_value = excluded.max_value, step = excluded.step",
+            (int(character_guid), int(skill), int(slot), int(value),
+             int(max_value), int(step)),
+        )
+        con.commit()
+    finally:
+        con.close()
+
+
+def get_character_proficiencies(path: str,
+                                character_guid: int) -> List[sqlite3.Row]:
+    """Fetch persisted weapon/armour proficiency masks."""
+    con = _connect(path)
+    con.row_factory = sqlite3.Row
+    try:
+        return con.execute(
+            "SELECT item_class, subclass_mask FROM character_proficiencies"
+            " WHERE character_guid = ? ORDER BY item_class",
+            (int(character_guid),),
+        ).fetchall()
+    finally:
+        con.close()
+
+
+def add_character_proficiency(path: str, character_guid: int,
+                              item_class: int, subclass_mask: int) -> None:
+    """Merge one subclass mask into the character's persisted proficiency."""
+    con = _connect(path)
+    try:
+        row = con.execute(
+            "SELECT subclass_mask FROM character_proficiencies"
+            " WHERE character_guid = ? AND item_class = ?",
+            (int(character_guid), int(item_class)),
+        ).fetchone()
+        mask = int(row[0] or 0) | int(subclass_mask or 0) if row else int(
+            subclass_mask or 0)
+        con.execute(
+            "INSERT INTO character_proficiencies"
+            "(character_guid, item_class, subclass_mask) VALUES(?,?,?)"
+            " ON CONFLICT(character_guid, item_class) DO UPDATE SET"
+            " subclass_mask = excluded.subclass_mask",
+            (int(character_guid), int(item_class), mask),
+        )
+        con.commit()
     finally:
         con.close()
 
@@ -1709,7 +2478,7 @@ def get_character_action_spells(path: str, character_guid: int) -> List[int]:
     Dodge or One-Handed Axes are still sent in ``SMSG_INITIAL_SPELLS`` (the
     spellbook shows them) but cannot be placed on an action button.
     """
-    con = sqlite3.connect(path)
+    con = _connect(path)
     con.row_factory = sqlite3.Row
     try:
         rows = con.execute(
@@ -1758,7 +2527,7 @@ def get_character_action_buttons(path: str, character_guid: int) -> dict:
     has no row for the character (an un-imported database), fall back to Attack
     plus every known non-passive spell in spell-id order.
     """
-    con = sqlite3.connect(path)
+    con = _connect(path)
     con.row_factory = sqlite3.Row
     try:
         char = con.execute(
