@@ -10,6 +10,9 @@ python tools/fetch_client_data.py --preset starter
 # A larger area or another map
 python tools/fetch_client_data.py --map 0 --around -8955,-132 --radius 4
 python tools/fetch_client_data.py --map 1 --tile 42,25
+
+# Only the client DBCs (every run above fetches them as well)
+python tools/fetch_client_data.py --dbc-only
 ```
 
 The server reads the directory from `worldserver.client_data` in
@@ -26,6 +29,7 @@ Layout expected by the runtime readers:
 | `vmaps/003_yy_xx.vmtile` | WMO/M2 placements (note swapped tile order) |
 | `vmaps/<model>.vmo` | Per-model collision groups |
 | `mmaps/003xxyy.mmtile` | Recast/Detour navigation mesh |
+| `dbc/TaxiNodes.dbc`, `dbc/TaxiPath.dbc`, `dbc/TaxiPathNode.dbc` | Flight paths (nodes, routes, prices); without them flight masters do nothing |
 
 The default mirror is `Torrer/TrinityCore-3.3.5-data`, a public 3.3.5a
 (12340) extract.  Use `--source` to point at a different mirror with the same
