@@ -405,3 +405,55 @@ def test_disconnect_in_the_air_saves_the_destination():
         assert session.saved == [(200, 0, 5)]
         assert task.cancelled()
     asyncio.run(run())
+
+
+# ----------------------------------------------------------------------
+# No spells, swings or items on a gryphon
+# ----------------------------------------------------------------------
+class _ActionBase:
+    def __init__(self):
+        self.handled = []
+        self.packets = []
+        self.failed = []
+
+    async def handle_cast_spell(self, data):
+        self.handled.append("cast")
+
+    async def handle_attack_swing(self, data):
+        self.handled.append("swing")
+
+    async def handle_use_item(self, data):
+        self.handled.append("item")
+
+    async def send_packet(self, opcode, payload):
+        self.packets.append(opcode)
+
+    async def _cast_failed(self, cast_id, spell_id, reason):
+        self.failed.append((cast_id, spell_id, reason))
+
+
+class _ActionSession(TaxiMixin, _ActionBase):
+    pass
+
+
+def test_actions_are_refused_while_flying():
+    from src.world.worldsocket.constants import SPELL_FAILED_NOT_ON_TAXI
+
+    async def run():
+        session = _ActionSession()
+        cast = bytes([3]) + struct.pack("<I", 21084) + b"\x00" + struct.pack("<I", 0)
+        task = await _airborne(session)
+        await session.handle_cast_spell(cast)
+        await session.handle_attack_swing(struct.pack("<Q", 1))
+        await session.handle_use_item(b"\x00" * 15)
+        assert session.handled == []
+        assert session.failed == [(3, 21084, SPELL_FAILED_NOT_ON_TAXI)]
+        assert session.packets == [Opcodes.SMSG_ATTACKSWING_CANT_ATTACK]
+        task.cancel()
+
+        session._taxi_flight = None                  # landed
+        await session.handle_cast_spell(cast)
+        await session.handle_attack_swing(struct.pack("<Q", 1))
+        await session.handle_use_item(b"\x00" * 15)
+        assert session.handled == ["cast", "swing", "item"]
+    asyncio.run(run())

@@ -14,6 +14,7 @@ from src.world import geometry
 from src.world import object_update
 from src.world import taxi
 from src.world import update_fields as F
+from src.world.worldsocket.constants import SPELL_FAILED_NOT_ON_TAXI
 
 # How often the server moves its copy of a flying player (visibility updates).
 FLIGHT_TICK_SECONDS = 1.0
@@ -147,6 +148,28 @@ class TaxiMixin:
                 await self._send_taxi_menu(guid)
                 return
         await super().handle_gossip_select_option(data)
+
+    # ------------------------------------------------------------------
+    # Nothing to do on a gryphon (Spell::CheckCast: SPELL_FAILED_NOT_ON_TAXI)
+    # ------------------------------------------------------------------
+    async def handle_cast_spell(self, data: bytes):
+        if self._in_flight() and len(data) >= 5:
+            cast_id = data[0]
+            spell_id = struct.unpack_from("<I", data, 1)[0]
+            await self._cast_failed(cast_id, spell_id, SPELL_FAILED_NOT_ON_TAXI)
+            return
+        await super().handle_cast_spell(data)
+
+    async def handle_attack_swing(self, data: bytes):
+        if self._in_flight():
+            await self.send_packet(Opcodes.SMSG_ATTACKSWING_CANT_ATTACK, b"")
+            return
+        await super().handle_attack_swing(data)
+
+    async def handle_use_item(self, data: bytes):
+        if self._in_flight():
+            return
+        await super().handle_use_item(data)
 
     async def handle_activate_taxi(self, data: bytes):
         parsed = taxi.parse_activate_taxi(data)
