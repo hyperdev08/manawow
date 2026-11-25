@@ -1489,6 +1489,13 @@ class SpellsMixin:
                          spells.SPELL_EFFECT_TELEPORT_UNITS_SET_FACING):
                 await self._spell_teleport(template)
                 continue
+            if etype in (spells.SPELL_EFFECT_APPLY_AREA_AURA_PARTY,
+                         spells.SPELL_EFFECT_APPLY_AREA_AURA_RAID,
+                         spells.SPELL_EFFECT_APPLY_AREA_AURA_OWNER):
+                await self._apply_group_area_aura(
+                    cast, template, index, effect, caster_level,
+                    combo_points, etype)
+                continue
             if etype == spells.SPELL_EFFECT_OPEN_LOCK:
                 if target_guid and gameobject.is_gameobject_guid(target_guid):
                     await self._open_lock(target_guid, int(template.id))
@@ -1907,6 +1914,66 @@ class SpellsMixin:
         amount += (int(self.character.get("attack_power", 0) or 0) / 14.0
                    * float(weapon.get("delay", 2.0) or 2.0))
         return max(1, int(amount))
+
+    def _group_area_sessions(self, raid: bool):
+        """Sessions that receive an ``APPLY_AREA_AURA_PARTY/RAID`` effect."""
+        manager = (self._group_manager()
+                   if hasattr(self, "_group_manager") else None)
+        if manager is None or not self.player_guid:
+            return [self]
+        group = manager.group_for(int(self.player_guid))
+        if group is None:
+            return [self]
+        map_id = int((self.character or {}).get("map", 0) or 0)
+        sessions = list(manager.member_sessions(group, map_id))
+        if group.raid and not raid:
+            member = group.members.get(int(self.player_guid))
+            subgroup = int(getattr(member, "subgroup", 0) or 0)
+            sessions = [
+                session for session in sessions
+                if int(getattr(
+                    group.members.get(int(session.player_guid)), "subgroup",
+                    subgroup) or 0) == subgroup
+            ]
+        if self not in sessions:
+            sessions.append(self)
+        return sessions
+
+    async def _apply_group_area_aura(self, cast, template, index: int,
+                                     effect: dict, caster_level: int,
+                                     combo_points: int,
+                                     etype: int) -> None:
+        """Apply one party/raid area aura to eligible group members."""
+        if etype == spells.SPELL_EFFECT_APPLY_AREA_AURA_OWNER:
+            sessions = [self]
+        else:
+            sessions = self._group_area_sessions(
+                etype == spells.SPELL_EFFECT_APPLY_AREA_AURA_RAID)
+        radius = template.effect_radius(index)
+        if radius <= 0.0:
+            radius = 100.0
+        center = self._area_center(template, index, cast, 0)
+        for session in sessions:
+            target_guid = int(getattr(session, "player_guid", 0) or 0)
+            if not target_guid:
+                continue
+            if session is not self:
+                character = getattr(session, "character", None)
+                if not character:
+                    continue
+                pos = (float(character.get("x", 0.0) or 0.0),
+                       float(character.get("y", 0.0) or 0.0),
+                       float(character.get("z", 0.0) or 0.0))
+                if self._distance(center, pos) > radius + 0.5:
+                    continue
+            if hasattr(session, "_apply_periodic_aura"):
+                session._apply_periodic_aura(
+                    template, effect, index, caster_level, target_guid,
+                    combo_points)
+            if hasattr(session, "_apply_aura_from_effect"):
+                await session._apply_aura_from_effect(
+                    template, effect, index, self.player_guid, target_guid,
+                    caster_level, combo_points, target_kind="player")
 
     def _area_center(self, template, index: int, cast, target_guid: int):
         """Reference position for an area/cone effect."""

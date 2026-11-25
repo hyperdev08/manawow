@@ -3,10 +3,12 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
+import types
 
 from src.common.config import AuthConfig, Config, DBConfig, LogConfig, WorldConfig
 from src.protocol.opcodes import Opcodes
 from src.world import character_db, creature, gameobject, spells
+from src.world.groups import Group, GroupMember
 from src.world.realmsocket import WorldSocket
 
 
@@ -115,6 +117,18 @@ def _socket(tmp_path):
             "INSERT OR REPLACE INTO spell_templates"
             "(id, name, effect1, effect_trigger_spell1)"
             " VALUES(409, 'Force Cast Test', 140, 200)")
+        con.execute(
+            "INSERT OR REPLACE INTO spell_templates"
+            "(id, name, effect1, effect_apply_aura_name1,"
+            " effect_base_points1, effect_implicit_target_a1,"
+            " effect_radius_index1, duration_index)"
+            " VALUES(410, 'Party Aura Test', 35, 99, 10, 1, 12, 1)")
+        con.execute(
+            "INSERT OR REPLACE INTO spell_templates"
+            "(id, name, effect1, effect_apply_aura_name1,"
+            " effect_base_points1, effect_implicit_target_a1,"
+            " effect_radius_index1, duration_index)"
+            " VALUES(411, 'Raid Aura Test', 65, 99, 10, 1, 12, 1)")
         con.execute(
             "INSERT OR REPLACE INTO gameobject_templates"
             "(entry, type, display_id, name, size, faction, flags)"
@@ -227,6 +241,51 @@ def test_spell_modifier_force_cast_and_glyph_effects(tmp_path):
         await socket._apply_spell_effects(
             None, spells.get_spell_template(db, 409), 0)
         assert triggered[-1] == (200, socket.player_guid)
+
+    asyncio.run(flow())
+
+
+def test_party_and_raid_area_auras_respect_subgroups_and_radius(tmp_path):
+    async def flow():
+        socket, db, _sent, _delivered = _socket(tmp_path)
+        group = Group(None, 1, 1, "Self")
+        group.raid = True
+        positions = {1: (0.0, 0.0, 0.0, 0), 2: (5.0, 0.0, 0.0, 0),
+                     3: (5.0, 0.0, 0.0, 1), 4: (200.0, 0.0, 0.0, 0)}
+        sessions = [socket]
+        for guid in (2, 3, 4):
+            x, y, z, subgroup = positions[guid]
+            group.members[guid] = GroupMember(guid, str(guid), subgroup)
+            peer = types.SimpleNamespace(
+                player_guid=guid,
+                character={"guid": guid, "map": 0, "x": x, "y": y, "z": z},
+            )
+            sessions.append(peer)
+        group.members[1] = GroupMember(1, "Self", 0)
+        manager = types.SimpleNamespace(
+            group_for=lambda _guid: group,
+            member_sessions=lambda _group, _map_id: sessions)
+        socket._group_manager = lambda: manager
+
+        applied = []
+
+        async def apply_aura(template, effect, index, caster_guid,
+                             target_guid, caster_level, combo_points=0,
+                             target_kind=None):
+            applied.append(int(target_guid))
+
+        for session in sessions:
+            session._apply_periodic_aura = lambda *args, **kwargs: None
+            session._apply_aura_from_effect = apply_aura
+
+        await socket._apply_spell_effects(
+            None, spells.get_spell_template(db, 410), 0)
+        assert applied == [1, 2]
+
+        applied.clear()
+        await socket._apply_spell_effects(
+            None, spells.get_spell_template(db, 411), 0)
+        assert applied == [1, 2, 3]
 
     asyncio.run(flow())
 

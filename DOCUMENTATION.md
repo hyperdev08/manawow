@@ -66,7 +66,8 @@ A real 3.3.5a client can now log in, pick a character and **enter the world**:
 - Reactive `SPELL_AURA_PROC_TRIGGER_SPELL`, `SPELL_AURA_MOD_RATING` and `SPELL_AURA_MELEE_SLOW` are applied; rating auras feed the hit/crit/haste/dodge/parry/block/defense tables, and reactive procs use the attacker as the trigger target
 - Spell-modifier auras 107/108 apply flat/percentage talents to matching spell-family masks for effect values, cast time, cost, range, cooldowns/GCD, critical chance and duration
 - Force-cast effects 140/141/160 route their trigger spell to the selected target, and glyph effect 74 resolves `GlyphProperties.dbc` rows bundled in `src/world/glyph_properties.sql` and casts the glyph spell
-- `python tools/spell_coverage.py` audits every imported spell against the implemented effect/aura families and prints unsupported families with example spells; the current dataset has 50,889 templates and 29,730 fully covered spells
+- Party/raid area-aura effects 35/65 share the aura with same-map group members inside the spell radius; party auras in a raid stay in the caster's subgroup, raid auras cover the whole raid, and owner-only auras 143 stay on the caster
+- `python tools/spell_coverage.py` audits every imported spell against the implemented effect/aura families and prints unsupported families with example spells; the current dataset has 50,889 templates and 30,038 fully covered spells
 - Melee auto-attack, weapon damage/delay, creature aggro + chase + leash AI (a creature evades when its victim is more than 60 yards from the spawn, `Creature::CanCreatureAttack`; its own position does not count, so low-health humanoids can flee without resetting), creature melee, death, respawn, XP and level-up
 - `SMSG_SPELL_START` / `SMSG_SPELL_GO` / `SMSG_CAST_FAILED` with miss/crit flags
 - `SMSG_SPELLHEALLOG`, `SMSG_SPELLENERGIZELOG`, `SMSG_LOG_XPGAIN` and `SMSG_LEVELUP_INFO`
