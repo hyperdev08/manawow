@@ -44,10 +44,14 @@ DBC_FILES = ("TaxiNodes.dbc", "TaxiPath.dbc", "TaxiPathNode.dbc")
 NPC_FLAG_FLIGHTMASTER = 0x00002000
 GOSSIP_OPTION_TAXIVENDOR = 4
 
-# UNIT_FIELD_FLAGS set for the whole flight (TrinityCore 3.3.5).
+# UNIT_FIELD_FLAGS set for the whole flight (TrinityCore 3.3.5).  The mount
+# flag comes from Unit::Mount: without it the client animates the rider as
+# unmounted (lying flat, "swimming") as soon as any other animation plays.
 UNIT_FLAG_REMOVE_CLIENT_CONTROL = 0x00000004
 UNIT_FLAG_TAXI_FLIGHT = 0x00000100
-FLIGHT_UNIT_FLAGS = UNIT_FLAG_REMOVE_CLIENT_CONTROL | UNIT_FLAG_TAXI_FLIGHT
+UNIT_FLAG_MOUNT = 0x08000000
+FLIGHT_UNIT_FLAGS = (UNIT_FLAG_REMOVE_CLIENT_CONTROL | UNIT_FLAG_TAXI_FLIGHT
+                     | UNIT_FLAG_MOUNT)
 
 # PLAYER_FLIGHT_SPEED in TrinityCore.
 FLIGHT_SPEED = 32.0

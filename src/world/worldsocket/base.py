@@ -277,6 +277,8 @@ class SocketBase:
                 await self.handle_activate_taxi(data)
             elif opcode == Opcodes.CMSG_ACTIVATETAXIEXPRESS:
                 await self.handle_activate_taxi_express(data)
+            elif opcode == Opcodes.CMSG_CANCEL_MOUNT_AURA:
+                await self.handle_cancel_mount_aura(data)
             elif opcode == Opcodes.CMSG_NPC_TEXT_QUERY:
                 await self.handle_npc_text_query(data)
             elif opcode == Opcodes.CMSG_QUESTGIVER_STATUS_QUERY:

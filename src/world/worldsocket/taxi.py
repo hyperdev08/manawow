@@ -171,6 +171,22 @@ class TaxiMixin:
             return
         await super().handle_use_item(data)
 
+    async def handle_cancel_mount_aura(self, data: bytes):
+        """``CMSG_CANCEL_MOUNT_AURA``: the client dismounts itself on a cast.
+
+        Pressing a spell while mounted makes the 3.3.5 client drop the rider
+        from the mount locally and ask the server to cancel it, even on a
+        gryphon.  The server keeps the flight, so it puts the rider back:
+        clearing and re-sending the mount display re-applies the mounted pose
+        (otherwise the rider "swims" for the rest of the flight).
+        """
+        flight = getattr(self, "_taxi_flight", None)
+        if flight is None:
+            return
+        display = int(flight.get("display") or 0)
+        await self._set_flight_fields(0, True)
+        await self._set_flight_fields(display, True)
+
     async def handle_activate_taxi(self, data: bytes):
         parsed = taxi.parse_activate_taxi(data)
         if parsed is not None:
@@ -248,7 +264,7 @@ class TaxiMixin:
         duration_ms = taxi.flight_duration_ms(start, route.points)
         track = taxi.FlightTrack(start, route.points, duration_ms)
         self._taxi_flight = {"track": track, "started": time.monotonic(),
-                             "route": route}
+                             "route": route, "display": int(display)}
         await self._set_flight_fields(display, True)
         packet = taxi.build_flight_move(int(self.player_guid), start, route.points,
                                         duration_ms, move_id=self._next_move_id())

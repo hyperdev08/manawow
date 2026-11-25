@@ -457,3 +457,24 @@ def test_actions_are_refused_while_flying():
         await session.handle_use_item(b"\x00" * 15)
         assert session.handled == ["cast", "swing", "item"]
     asyncio.run(run())
+
+
+def test_cancel_mount_in_flight_puts_the_rider_back():
+    class _MountSession(TaxiMixin, _ActionBase):
+        def __init__(self):
+            super().__init__()
+            self.mounts = []
+
+        async def _set_flight_fields(self, display, flying):
+            self.mounts.append((display, flying))
+
+    async def run():
+        session = _MountSession()
+        await session.handle_cancel_mount_aura(b"")       # on the ground: ignored
+        assert session.mounts == []
+        task = await _airborne(session)
+        session._taxi_flight["display"] = 6852
+        await session.handle_cancel_mount_aura(b"")
+        assert session.mounts == [(0, True), (6852, True)]
+        task.cancel()
+    asyncio.run(run())
