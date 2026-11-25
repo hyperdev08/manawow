@@ -22,6 +22,7 @@ Usage::
     python tools/import_wotlk_db.py --pools-only
     python tools/import_wotlk_db.py --spawn-entries-only
     python tools/import_wotlk_db.py --graveyards-only
+    python tools/import_wotlk_db.py --npc-text-only
 
 The world bank is separate from ``data/characters.db``; character rows are
 never written to it.  ``--quests-only`` refreshes just the quest tables
@@ -839,6 +840,92 @@ def _choose_npc_text(row: dict) -> tuple[str, str, int, int, list[tuple[int, int
     return "", "", 0, 1, [(0, 0), (0, 0), (0, 0)]
 
 
+def build_npc_text_rows(raw_npc_text, raw_npc_text_broadcast=(),
+                        raw_broadcast_text=()) -> list[tuple]:
+    """Rows for the ``npc_text`` table from both CMaNGOS text sources.
+
+    Most gossip texts live in ``npc_text``, but newer CMaNGOS dumps moved
+    some (e.g. 7778, Ariena Stormfeather's flight master greeting) to
+    ``npc_text_broadcast_text``, which only points at ``broadcast_text``
+    ids.  An id found in ``npc_text`` wins; for the others the first variant
+    whose broadcast text is non-empty is used.
+    """
+    rows: list[tuple] = []
+    seen: set[int] = set()
+    for row in raw_npc_text:
+        text_id = int(row.get("ID") or 0)
+        if not text_id:
+            continue
+        male, female, language, probability, emotes = _choose_npc_text(row)
+        if not male and not female:
+            continue
+        seen.add(text_id)
+        rows.append((
+            text_id, male, female, language, probability,
+            emotes[0][1], emotes[0][0],
+            emotes[1][1], emotes[1][0],
+            emotes[2][1], emotes[2][0],
+        ))
+
+    broadcast = {int(row.get("Id") or 0): row for row in raw_broadcast_text}
+    for row in raw_npc_text_broadcast:
+        text_id = int(row.get("Id") or 0)
+        if not text_id or text_id in seen:
+            continue
+        for index in range(8):
+            text = broadcast.get(int(row.get(f"BroadcastTextId{index}") or 0))
+            if text is None:
+                continue
+            male = _text_or_empty(text.get("Text"))
+            female = _text_or_empty(text.get("Text1"))
+            if not male and not female:
+                continue
+            seen.add(text_id)
+            rows.append((
+                text_id, male or female, female or male,
+                int(text.get("LanguageID") or 0), 1,
+                int(text.get("EmoteID1") or 0), int(text.get("EmoteDelay1") or 0),
+                int(text.get("EmoteID2") or 0), int(text.get("EmoteDelay2") or 0),
+                int(text.get("EmoteID3") or 0), int(text.get("EmoteDelay3") or 0),
+            ))
+            break
+    return rows
+
+
+NPC_TEXT_INSERT_SQL = (
+    "INSERT OR REPLACE INTO npc_text("
+    "id, text, female_text, language, probability, emote1, emote_delay1, "
+    "emote2, emote_delay2, emote3, emote_delay3) "
+    "VALUES(?,?,?,?,?,?,?,?,?,?,?)"
+)
+
+
+def import_npc_text(dump_path: str, db_path: str) -> int:
+    """``--npc-text-only``: refresh the gossip texts of an existing database."""
+    import sqlite3
+
+    text = wotlk_dump.read_dump(dump_path)
+    rows = build_npc_text_rows(
+        wotlk_dump.rows(text, "npc_text")[1],
+        wotlk_dump.rows(text, "npc_text_broadcast_text")[1],
+        wotlk_dump.rows(text, "broadcast_text")[1],
+    )
+    del text
+    con = sqlite3.connect(db_path)
+    try:
+        con.execute("DELETE FROM npc_text")
+        con.executemany(NPC_TEXT_INSERT_SQL, rows)
+        con.commit()
+        missing = con.execute(
+            "SELECT COUNT(*) FROM gossip_menus g LEFT JOIN npc_text n"
+            " ON n.id = g.text_id WHERE g.text_id <> 0 AND n.id IS NULL"
+        ).fetchone()[0]
+    finally:
+        con.close()
+    print(f"npc_text: {len(rows):,} texts; gossip menus without text: {missing}")
+    return len(rows)
+
+
 def _template_row(template: dict) -> tuple:
     entry = int(template["Entry"])
     unit_class = int(template.get("UnitClass") or 1)
@@ -1085,6 +1172,8 @@ def import_world(dump_path: str, db_path: str, clear: bool = True,
     _, raw_menus = wotlk_dump.rows(text, "gossip_menu")
     _, raw_options = wotlk_dump.rows(text, "gossip_menu_option")
     _, raw_npc_text = wotlk_dump.rows(text, "npc_text")
+    _, raw_npc_text_broadcast = wotlk_dump.rows(text, "npc_text_broadcast_text")
+    _, raw_broadcast_text = wotlk_dump.rows(text, "broadcast_text")
     _, raw_spell_template = wotlk_dump.rows(text, "spell_template")
     _, raw_creature_template_spells = wotlk_dump.rows(text, "creature_template_spells")
     _, raw_creature_spell_list = wotlk_dump.rows(text, "creature_spell_list")
@@ -1188,20 +1277,8 @@ def import_world(dump_path: str, db_path: str, clear: bool = True,
             0,
         ))
 
-    npc_text_rows = []
-    for row in raw_npc_text:
-        text_id = int(row.get("ID") or 0)
-        if not text_id:
-            continue
-        male, female, language, probability, emotes = _choose_npc_text(row)
-        if not male and not female:
-            continue
-        npc_text_rows.append((
-            text_id, male, female, language, probability,
-            emotes[0][1], emotes[0][0],
-            emotes[1][1], emotes[1][0],
-            emotes[2][1], emotes[2][0],
-        ))
+    npc_text_rows = build_npc_text_rows(
+        raw_npc_text, raw_npc_text_broadcast, raw_broadcast_text)
 
     # The worldserver's schema lives in src/world/creature.py.  Drop the spell
     # tables first so a changed spell_tables.sql is applied to existing data
@@ -1261,13 +1338,7 @@ def import_world(dump_path: str, db_path: str, clear: bool = True,
             "box_text, action_menu_id, action_text_id) VALUES(?,?,?,?,?,?,?,?,?,?)",
             option_rows,
         )
-        con.executemany(
-            "INSERT OR REPLACE INTO npc_text("
-            "id, text, female_text, language, probability, emote1, emote_delay1, "
-            "emote2, emote_delay2, emote3, emote_delay3) "
-            "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-            npc_text_rows,
-        )
+        con.executemany(NPC_TEXT_INSERT_SQL, npc_text_rows)
         con.executemany(spawn_sql, spawn_rows)
         con.executemany(
             "INSERT OR REPLACE INTO creature_movement("
@@ -2219,6 +2290,9 @@ def main() -> None:
                              "to world events")
     parser.add_argument("--graveyards-only", action="store_true",
                         help="only refresh world_safe_locs and graveyard links")
+    parser.add_argument("--npc-text-only", action="store_true",
+                        help="only refresh the gossip texts (npc_text and "
+                             "npc_text_broadcast_text)")
     args = parser.parse_args()
 
     from src.common.config import Config
@@ -2263,6 +2337,9 @@ def main() -> None:
         return
     if args.spawn_entries_only:
         import_spawn_entries(dump_path, db_path)
+        return
+    if args.npc_text_only:
+        import_npc_text(dump_path, db_path)
         return
 
     import_world(dump_path, db_path, clear=not args.keep_existing,
