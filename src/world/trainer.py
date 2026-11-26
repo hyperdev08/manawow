@@ -44,6 +44,8 @@ TRAINER_FAIL_NOT_ENOUGH_SKILL = 2
 
 # Gossip option type that opens the trainer list.
 GOSSIP_OPTION_TRAINER = 5
+# Gossip option type that starts the talent-reset confirmation.
+GOSSIP_OPTION_UNLEARNTALENTS = 16
 
 TRAINER_INTERACT_DISTANCE = 15.0
 
@@ -348,6 +350,22 @@ def is_trainer_of(path: str, spawn: Mapping, char: Mapping,
         required = int(spawn["trainer_spell"] or 0)
         return not required or required in known_spells
     return False
+
+
+def can_reset_talents(path: str, spawn: Mapping, char: Mapping) -> bool:
+    """CMaNGOS ``Creature::CanTrainAndResetTalentsOf``.
+
+    Only a level-10+ character standing at their own class trainer may respec.
+    """
+    if not int(spawn["npc_flags"] or 0) & NPC_FLAG_TRAINER:
+        return False
+    if int(char.get("level", 1) or 1) < 10:
+        return False
+    trainer_type = int(spawn["trainer_type"] if "trainer_type" in spawn.keys()
+                       else 0)
+    return (trainer_type == TRAINER_TYPE_CLASS
+            and int(char.get("class", 0) or 0)
+            == int(spawn["trainer_class"] or 0))
 
 
 def can_offer_trainer(path: str, spawn: Mapping, char: Mapping,

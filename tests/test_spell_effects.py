@@ -364,8 +364,10 @@ def _socket(tmp_path):
         con.execute(
             "INSERT OR REPLACE INTO spell_templates"
             "(id, name, attributes, effect1, effect_apply_aura_name1,"
-            " effect_base_points1, effect_misc_value1)"
-            " VALUES(11069, 'Improved Fireball', 262608, 6, 107, -101, 10)")
+            " effect_base_points1, effect_misc_value1, effect2,"
+            " effect_trigger_spell2)"
+            " VALUES(11069, 'Improved Fireball', 262608, 6, 107, -101, 10,"
+            " 36, 200)")
         con.execute(
             "INSERT OR REPLACE INTO spell_templates"
             "(id, name, effect1, effect_trigger_spell1)"
@@ -1094,10 +1096,48 @@ def test_pet_spell_sanctuary_honor_and_unlearn_effects(tmp_path):
     asyncio.run(flow())
 
 
+def test_talent_points_level_ranges():
+    from src.world import talents as talent_data
+
+    # Every non-DK class starts earning points at level 10.
+    assert talent_data.talent_points_for_level(9, 0, 1) == 0
+    assert talent_data.talent_points_for_level(10, 0, 1) == 1
+    assert talent_data.talent_points_for_level(80, 0, 1) == 71
+    # Death knights start at 55 and can use quest bonus points on top.
+    assert talent_data.talent_points_for_level(55, 0, 6) == 0
+    assert talent_data.talent_points_for_level(56, 0, 6) == 1
+    assert talent_data.talent_points_for_level(80, 0, 6) == 25
+    assert talent_data.talent_points_for_level(80, 2, 6) == 27
+
+
+def test_talent_load_validation_and_point_overflow(tmp_path):
+    async def flow():
+        socket, db, _sent, _delivered = _socket(tmp_path)
+        socket.character.update({"level": 12, "class": 8, "talents": {}})
+        socket.known_spell_ids = set()
+
+        character_db.set_character_talent(db, 1, 26, 0)
+        character_db.set_character_talent(db, 1, 999999, 0)
+        character_db.set_character_talent(db, 1, 29, 0)
+        await socket._load_talents()
+        assert socket.character["talents"] == {26: 0, 29: 0}
+        assert 11069 in socket.known_spell_ids
+        assert character_db.get_character_talents(db, 1) == {26: 0, 29: 0}
+
+        # Level 12 grants three points; six spent points force a free reset.
+        character_db.set_character_talent(db, 1, 26, 4)
+        await socket._load_talents()
+        assert socket.character["talents"] == {}
+        assert character_db.get_character_talents(db, 1) == {}
+        assert 11069 not in socket.known_spell_ids
+
+    asyncio.run(flow())
+
+
 def test_talent_learning_points_and_reset(tmp_path):
     async def flow():
         socket, db, sent, _delivered = _socket(tmp_path)
-        socket.character.update({"level": 10, "class": 8, "talents": {}})
+        socket.character.update({"level": 12, "class": 8, "talents": {}})
         socket.known_spell_ids = set()
 
         assert await socket._learn_talent(26, 0)
@@ -1107,15 +1147,85 @@ def test_talent_learning_points_and_reset(tmp_path):
             opcode for opcode, _payload in sent]
         assert any(int(aura["spell_id"]) == 11069
                    for aura in socket._get_combat_state()["auras"])
+        # ``SPELL_EFFECT_LEARN_SPELL`` from the talent taught spell 200 too.
+        assert 200 in socket.known_spell_ids
 
-        # Tier 2 needs 10 points in the tree; one point is not enough.
+        # Rank 2 replaces rank 1 and stays within the same talent tab.
+        assert await socket._learn_talent(26, 1)
+        assert 11069 not in socket.known_spell_ids
+        assert 12338 in socket.known_spell_ids
+        assert socket.character["talents"] == {26: 1}
+        assert int(Opcodes.SMSG_SUPERCEDED_SPELL) in [
+            opcode for opcode, _payload in sent]
+        assert character_db.get_character_talents(db, 1) == {26: 1}
+
+        # Tier 2 needs 10 points in the tree; two points are not enough.
         assert not await socket._learn_talent(29, 0)
 
-        await socket._reset_talents()
+        # The first respec costs 1 gold and is persisted.
+        socket.character["money"] = 10000
+        assert await socket._reset_talents()
+        assert socket.character["money"] == 0
+        assert socket.character["reset_talents_cost"] == 10000
+        assert int(socket.character["reset_talents_time"]) > 0
         assert socket.character["talents"] == {}
-        assert 11069 not in socket.known_spell_ids
+        assert character_db.get_character_talents(db, 1) == {}
+        assert 12338 not in socket.known_spell_ids
+        assert 200 not in socket.known_spell_ids
         assert not any(int(aura["spell_id"]) == 11069
                        for aura in socket._get_combat_state()["auras"])
+
+        # The next respec costs 5 gold; without money it is rejected.
+        assert await socket._learn_talent(26, 0)
+        assert not await socket._reset_talents()
+        assert socket.character["talents"] == {26: 0}
+        assert any(opcode == int(Opcodes.SMSG_BUY_FAILED)
+                   for opcode, _payload in sent)
+
+        socket.character["money"] = 50000
+        assert await socket._reset_talents()
+        assert socket.character["money"] == 0
+        assert socket.character["reset_talents_cost"] == 50000
+
+        # An empty tree always resets for free.
+        assert await socket._reset_talents()
+        assert socket.character["money"] == 0
+
+    asyncio.run(flow())
+
+
+def test_talent_preview_learning_and_trainer_confirm(tmp_path):
+    async def flow():
+        socket, db, sent, _delivered = _socket(tmp_path)
+        socket.character.update({"level": 12, "class": 8, "talents": {},
+                                 "money": 10000})
+        socket.known_spell_ids = set()
+
+        preview = struct.pack("<I", 2) + struct.pack("<II", 26, 0)
+        preview += struct.pack("<II", 26, 1)
+        await socket.handle_learn_preview_talents(preview)
+        assert socket.character["talents"] == {26: 1}
+        assert 12338 in socket.known_spell_ids
+        # One talents packet after the whole preview build, not one per rank.
+        assert sum(opcode == int(Opcodes.SMSG_TALENTS_INFO)
+                   for opcode, _payload in sent) == 1
+
+        # The confirmation packet mirrors MSG_TALENT_WIPE_CONFIRM.
+        packet = socket._talent_wipe_confirm_packet(77, 10000)
+        assert struct.unpack_from("<QI", packet, 0) == (77, 10000)
+
+        # The first respec via the trainer confirm flow charges the cost and
+        # triggers the "Untalent Visual Effect" spell.
+        spawn = {
+            "npc_flags": 0x10,
+            "trainer_type": 0,
+            "trainer_class": 8,
+        }
+        socket._trainer_spawn = lambda _guid: spawn
+        socket._trainer_in_range = lambda _guid: True
+        await socket.handle_talent_wipe_confirm(struct.pack("<Q", 77))
+        assert socket.character["talents"] == {}
+        assert socket.character["money"] == 0
 
     asyncio.run(flow())
 

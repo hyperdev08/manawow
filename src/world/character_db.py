@@ -27,6 +27,9 @@ CREATE TABLE IF NOT EXISTS characters(
   level INTEGER NOT NULL DEFAULT 1,
   xp INTEGER NOT NULL DEFAULT 0,
   money INTEGER NOT NULL DEFAULT 0,
+  bonus_talents INTEGER NOT NULL DEFAULT 0,
+  reset_talents_cost INTEGER NOT NULL DEFAULT 0,
+  reset_talents_time INTEGER NOT NULL DEFAULT 0,
   zone INTEGER NOT NULL DEFAULT 12,
   map INTEGER NOT NULL DEFAULT 0,
   x REAL NOT NULL DEFAULT -8949.95,
@@ -494,6 +497,9 @@ def _migrate_character_columns(con: sqlite3.Connection) -> None:
         "xp": "INTEGER NOT NULL DEFAULT 0",
         "money": "INTEGER NOT NULL DEFAULT 0",
         "death_state": "INTEGER NOT NULL DEFAULT 0",
+        "bonus_talents": "INTEGER NOT NULL DEFAULT 0",
+        "reset_talents_cost": "INTEGER NOT NULL DEFAULT 0",
+        "reset_talents_time": "INTEGER NOT NULL DEFAULT 0",
     }
     for name, declaration in additions.items():
         if name not in columns:
@@ -2359,6 +2365,45 @@ def set_character_talent(path: str, character_guid: int, talent_id: int,
             "INSERT OR REPLACE INTO character_talents"
             "(character_guid, talent_id, rank) VALUES(?,?,?)",
             (int(character_guid), int(talent_id), int(rank)))
+        con.commit()
+    finally:
+        con.close()
+
+
+def delete_character_talent(path: str, character_guid: int,
+                            talent_id: int) -> None:
+    """Drop one invalid talent row (``Player::_LoadTalents`` cleanup)."""
+    con = _connect(path)
+    try:
+        con.execute(
+            "DELETE FROM character_talents WHERE character_guid = ?"
+            " AND talent_id = ?",
+            (int(character_guid), int(talent_id)))
+        con.commit()
+    finally:
+        con.close()
+
+
+def add_bonus_talents(path: str, character_guid: int, amount: int) -> None:
+    con = _connect(path)
+    try:
+        con.execute(
+            "UPDATE characters SET bonus_talents ="
+            " MAX(0, COALESCE(bonus_talents, 0) + ?) WHERE guid = ?",
+            (int(amount), int(character_guid)))
+        con.commit()
+    finally:
+        con.close()
+
+
+def set_reset_talents(path: str, character_guid: int, cost: int,
+                      when: int) -> None:
+    con = _connect(path)
+    try:
+        con.execute(
+            "UPDATE characters SET reset_talents_cost = ?,"
+            " reset_talents_time = ? WHERE guid = ?",
+            (int(cost), int(when), int(character_guid)))
         con.commit()
     finally:
         con.close()

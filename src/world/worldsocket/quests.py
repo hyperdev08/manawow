@@ -537,6 +537,16 @@ class QuestsMixin:
         )
         if xp:
             await self._award_xp(xp, 0)
+        bonus_talents = int(quest.get("bonus_talents") or 0)
+        if bonus_talents:
+            self.character["bonus_talents"] = max(
+                0, int(self.character.get("bonus_talents", 0) or 0)
+                + bonus_talents)
+            await run_db_write(
+                character_db.add_bonus_talents, path,
+                int(self.player_guid), bonus_talents)
+            if hasattr(self, "_send_talents_info"):
+                await self._send_talents_info()
         if int(quest.get("rew_spell_cast") or 0) or int(quest.get("rew_spell") or 0):
             self.log.debug(f"Quest {quest_id} reward spell not applied (not supported)")
         self.log.info(f"'{self.character.get('name')}' completed quest {quest_id} "

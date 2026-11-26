@@ -3,9 +3,12 @@ from __future__ import annotations
 
 from functools import lru_cache
 import sqlite3
+import struct
 from typing import Dict, List, Optional
 
 MAX_TALENT_RANK = 5
+MAX_GLYPH_SLOT_INDEX = 6
+CLASS_DEATH_KNIGHT = 6
 
 
 def class_mask(char_class: int) -> int:
@@ -91,9 +94,16 @@ def talent_tabs_for_class(path: str, char_class: int) -> List[dict]:
         path, class_mask(int(char_class)))]
 
 
-def talent_points_for_level(level: int) -> int:
-    """One point per level from 10 to 80 (``level - 9``)."""
-    return max(0, int(level) - 9)
+def talent_points_for_level(level: int, bonus: int = 0,
+                            char_class: int = 0) -> int:
+    """``Player::CalculateTalentsPoints`` for the 3.3.5a level ranges.
+
+    Death knights start earning points after level 55; every other class
+    starts at level 10.  Quest ``RewardBonusTalents`` are added on top.
+    """
+    base_level = 55 if int(char_class or 0) == CLASS_DEATH_KNIGHT else 9
+    base = max(0, int(level) - base_level)
+    return base + max(0, int(bonus or 0))
 
 
 def talent_rank_spells(talent) -> List[int]:
@@ -125,11 +135,11 @@ def used_talent_points(talents: Dict[int, int]) -> int:
 
 def build_talents_info_payload(character, talents: Dict[int, int]) -> bytes:
     """``SMSG_TALENTS_INFO`` for the player's single talent group."""
-    import struct
-
     level = int(character.get("level", 1) or 1)
-    free = max(0, talent_points_for_level(level)
-               - used_talent_points(talents))
+    free = max(0, talent_points_for_level(
+        level, int(character.get("bonus_talents", 0) or 0),
+        int(character.get("class", 0) or 0))
+        - used_talent_points(talents))
     out = bytearray()
     out += struct.pack("<B", 0)          # 0 = player talents
     out += struct.pack("<I", free)
@@ -141,11 +151,18 @@ def build_talents_info_payload(character, talents: Dict[int, int]) -> bytes:
     glyphs = character.get("glyphs") or {}
     glyph_ids = [int(glyph) for glyph in glyphs] if isinstance(
         glyphs, dict) else []
-    glyph_ids = (glyph_ids + [0] * 6)[:6]
-    out += struct.pack("<B", 6)
+    glyph_ids = (glyph_ids + [0] * MAX_GLYPH_SLOT_INDEX)[
+        :MAX_GLYPH_SLOT_INDEX]
+    out += struct.pack("<B", MAX_GLYPH_SLOT_INDEX)
     for glyph_id in glyph_ids:
         out += struct.pack("<H", glyph_id & 0xFFFF)
     return bytes(out)
+
+
+def build_talent_wipe_confirm(guid: int, cost: int) -> bytes:
+    """``MSG_TALENT_WIPE_CONFIRM``: trainer guid and respec cost in copper."""
+    return struct.pack("<QI", int(guid) & 0xFFFFFFFFFFFFFFFF,
+                       int(cost) & 0xFFFFFFFF)
 
 
 def clear_caches() -> None:

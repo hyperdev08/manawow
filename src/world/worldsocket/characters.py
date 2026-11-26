@@ -343,6 +343,13 @@ class CharactersMixin:
         if int(option["option_type"]) == vendor.GOSSIP_OPTION_VENDOR:
             await self._open_vendor_from_gossip(guid)
             return
+        if int(option["option_type"]) == trainer.GOSSIP_OPTION_UNLEARNTALENTS:
+            # ``Player::OnGossipSelect``: close gossip, then offer the respec
+            # confirmation with its current cost.
+            await self.send_packet(Opcodes.SMSG_GOSSIP_COMPLETE, b"")
+            if hasattr(self, "_send_talent_wipe_confirm"):
+                await self._send_talent_wipe_confirm(int(guid))
+            return
         if int(option["option_type"]) == 6:      # GOSSIP_OPTION_SPIRITHEALER
             await self.send_packet(Opcodes.SMSG_GOSSIP_COMPLETE, b"")
             if hasattr(self, "handle_spirit_healer_activate"):

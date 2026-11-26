@@ -71,6 +71,10 @@ def test_trainer_list_states_and_requirements(tmp_path):
     warrior = {"class": 1, "race": 1, "level": 5}
     assert trainer.is_trainer_of(db, spawn, mage, ())
     assert not trainer.is_trainer_of(db, spawn, warrior, ())
+    # ``CanTrainAndResetTalentsOf``: class trainer, level 10 or higher.
+    assert trainer.can_reset_talents(db, spawn, {**mage, "level": 10})
+    assert not trainer.can_reset_talents(db, spawn, {**mage, "level": 9})
+    assert not trainer.can_reset_talents(db, spawn, {**warrior, "level": 40})
 
     entries = trainer.get_trainer_spells(db, 198)
     assert [entry.spell for entry in entries] == [116, 133, 143]
