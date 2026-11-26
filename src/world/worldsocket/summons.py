@@ -342,7 +342,10 @@ class SummonsMixin:
         # In melee: stand still on the pet's own swing timer.
         state["moving_until"] = 0.0
         state["target"] = int(target_guid)
-        if now - float(state.get("last_swing") or 0.0) < SUMMON_PET_SWING_INTERVAL:
+        interval = SUMMON_PET_SWING_INTERVAL
+        if hasattr(self, "_creature_melee_interval"):
+            interval = self._creature_melee_interval(int(low_guid))
+        if now - float(state.get("last_swing") or 0.0) < interval:
             return
         state["last_swing"] = now
         pet_guid = self._creature_object_guid(low_guid, int(spawn["entry"]))

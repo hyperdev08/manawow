@@ -414,6 +414,12 @@ class SocketBase:
                 await self.handle_learn_talent(data)
             elif opcode == Opcodes.CMSG_LEARN_PREVIEW_TALENTS:
                 await self.handle_learn_preview_talents(data)
+            elif opcode == Opcodes.CMSG_PET_LEARN_TALENT:
+                await self.handle_pet_learn_talent(data)
+            elif opcode == Opcodes.CMSG_LEARN_PREVIEW_TALENTS_PET:
+                await self.handle_learn_preview_talents_pet(data)
+            elif opcode == Opcodes.CMSG_PET_UNLEARN:
+                await self.handle_pet_unlearn(data)
             elif opcode == Opcodes.MSG_TALENT_WIPE_CONFIRM:
                 await self.handle_talent_wipe_confirm(data)
             elif opcode == Opcodes.CMSG_UNLEARN_TALENTS:

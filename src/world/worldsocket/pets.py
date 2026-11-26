@@ -180,8 +180,12 @@ class PetsMixin:
         state["pet_spells"] = spell_ids
         state["pet_spell_states"] = states
         state["pet_autocast"] = set()
+        if hasattr(self, "_load_pet_talents"):
+            await self._load_pet_talents(low_guid, spawn, state)
         state["pet_action_bar"] = self._pet_build_default_bar(state)
         await self._send_pet_spells(low_guid)
+        if hasattr(self, "_send_pet_talents_info"):
+            await self._send_pet_talents_info(low_guid)
 
     def _pet_spells_payload(self, spawn, state: dict) -> bytes:
         bar = list(state.get("pet_action_bar") or ())
@@ -315,7 +319,10 @@ class PetsMixin:
             elif action == COMMAND_STAY:
                 self._pet_command_stay(spawn, state)
             elif action == COMMAND_ABANDON:
-                await self._dismiss_summon(low_guid)
+                if hasattr(self, "_abandon_pet"):
+                    await self._abandon_pet(low_guid)
+                else:
+                    await self._dismiss_summon(low_guid)
             return
         if kind == ACT_REACTION:
             await self._pet_command_reaction(low_guid, state, action)
@@ -376,7 +383,7 @@ class PetsMixin:
         pet = self._pet_for_guid(guid)
         if pet is None:
             return
-        await self._dismiss_summon(pet[0])
+        await self._abandon_pet(pet[0])
 
     async def handle_pet_stop_attack(self, data: bytes) -> None:
         if not self.in_world or not self.character or len(data) < 8:

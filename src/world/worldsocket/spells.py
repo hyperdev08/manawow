@@ -2146,6 +2146,18 @@ class SpellsMixin:
                 unlearn = int(effect.get("trigger_spell") or 0)
                 if unlearn and hasattr(self, "_unlearn_spell"):
                     await self._unlearn_spell(unlearn)
+            elif etype == spells.SPELL_EFFECT_TALENT_SPEC_COUNT:
+                if hasattr(self, "_update_spec_count"):
+                    count = self._spell_effect_value(
+                        template, index, effect, caster_level,
+                        combo_points)
+                    await self._update_spec_count(max(1, int(count)))
+            elif etype == spells.SPELL_EFFECT_TALENT_SPEC_SELECT:
+                if hasattr(self, "_activate_talent_group"):
+                    spec = self._spell_effect_value(
+                        template, index, effect, caster_level,
+                        combo_points) - 1
+                    await self._activate_talent_group(max(0, int(spec)))
             elif etype == spells.SPELL_EFFECT_SEND_EVENT:
                 event_id = int(effect.get("misc_value") or 0)
                 if event_id:

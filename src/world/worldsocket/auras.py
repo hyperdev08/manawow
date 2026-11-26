@@ -616,6 +616,25 @@ class AurasMixin:
         if changed:
             await self._refresh_player_auras()
 
+    async def _remove_creature_aura_spell(self, low_guid: int,
+                                          spell_id: int) -> None:
+        """Remove every aura one spell applied to a creature from this session."""
+        low = int(low_guid)
+        entries = self._get_combat_state().get(
+            "creature_auras", {}).get(low, [])
+        removed = [aura for aura in entries
+                   if int(aura.get("spell_id") or 0) == int(spell_id)]
+        if not removed:
+            return
+        for aura in removed:
+            entries.remove(aura)
+            self._remove_dots_for_aura(
+                "creature", low, int(spell_id))
+            await self._send_aura_update("creature", low, aura, remove=True)
+        self._normalise_aura_slots(entries)
+        if hasattr(self, "_sync_creature_flags"):
+            await self._sync_creature_flags(low)
+
     async def _remove_player_aura_spell(self, spell_id: int) -> None:
         """Remove every aura on the player created by one spell."""
         entries = self._get_combat_state().get("auras", [])
@@ -747,6 +766,7 @@ class AurasMixin:
             "health_regen_pct": 0.0,
             "health_regen": 0.0,
             "health_regen_combat": 0.0,
+            "pet_talent_points": 0,
             "power_regen": {},
             "scale_mult": 1.0,
             "base_resistances_pct": {
@@ -865,6 +885,8 @@ class AurasMixin:
                             mods["resistances_pct"][school] += amount
                 elif aura_type == spells.SPELL_AURA_MOD_ATTACK_POWER:
                     mods["attack_power"] += amount
+                elif aura_type == spells.SPELL_AURA_MOD_PET_TALENT_POINTS:
+                    mods["pet_talent_points"] += amount
                 elif aura_type == spells.SPELL_AURA_MOD_RATING:
                     field = _RATING_AURA_FIELDS.get(misc)
                     if field:

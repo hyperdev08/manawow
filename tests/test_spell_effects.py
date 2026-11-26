@@ -1391,3 +1391,153 @@ def test_learn_spell_effect_updates_spellbook_and_store(tmp_path):
         assert row == (200,)
 
     asyncio.run(flow())
+
+def _add_wolf_and_pet_talents(db):
+    con = sqlite3.connect(db)
+    try:
+        con.execute(
+            "INSERT OR REPLACE INTO creature_templates"
+            "(entry, name, min_level, max_level, family, display_id1,"
+            " base_health, unit_class, type)"
+            " VALUES(9999, 'Test Wolf', 20, 20, 1, 100, 500, 1, 1)")
+        con.execute(
+            "INSERT OR REPLACE INTO creature_family(id, pet_talent_type)"
+            " VALUES(1, 0)")
+        con.execute(
+            "INSERT OR REPLACE INTO spell_templates"
+            "(id, name, attributes, effect1, effect_apply_aura_name1,"
+            " effect_base_points1, duration_index)"
+            " VALUES(61682, 'Pet Talent AP', 64, 6, 99, 50, 0)")
+        con.execute(
+            "INSERT OR REPLACE INTO spell_templates"
+            "(id, name, attributes, effect1, effect_apply_aura_name1,"
+            " effect_base_points1, duration_index)"
+            " VALUES(61683, 'Pet Talent AP 2', 64, 6, 99, 100, 0)")
+        con.commit()
+    finally:
+        con.close()
+
+
+def test_dual_specialization_switching_and_persistence(tmp_path):
+    async def flow():
+        socket, db, sent, _delivered = _socket(tmp_path)
+        socket.character.update({
+            "level": 20, "class": 8, "specs_count": 1,
+            "active_talent_group": 0, "talent_groups": {0: {}},
+            "talents": {}, "money": 10000000})
+        socket.known_spell_ids = set()
+
+        assert await socket._purchase_dual_specialization(10000000)
+        assert socket.character["specs_count"] == 2
+        assert socket.character["money"] == 0
+        assert {63624, 63644, 63645, 63651} <= socket.known_spell_ids
+
+        assert await socket._learn_talent(26, 0)
+        assert socket.character["talents"] == {26: 0}
+        assert await socket._activate_talent_group(1)
+        assert socket.character["active_talent_group"] == 1
+        assert socket.character["talents"] == {}
+        assert 11069 not in socket.known_spell_ids
+
+        assert await socket._learn_talent(26, 0)
+        assert await socket._activate_talent_group(0)
+        assert socket.character["talents"] == {26: 0}
+        assert 11069 in socket.known_spell_ids
+        assert character_db.get_all_character_talents(db, 1) == {
+            0: {26: 0}, 1: {26: 0}}
+
+        payload = [payload for opcode, payload in sent
+                   if opcode == int(Opcodes.SMSG_TALENTS_INFO)][-1]
+        assert payload[0] == 0
+        assert payload[5] == 2          # two talent groups
+        assert payload[6] == 0          # primary group active
+
+        # Reloading restores both groups and the stored active group.
+        socket.character.update({
+            "active_talent_group": 1, "talent_groups": {}, "talents": {}})
+        socket.known_spell_ids = set()
+        await socket._load_talents()
+        assert socket.character["talents"] == {26: 0}
+        assert socket.character["active_talent_group"] == 1
+        assert 11069 in socket.known_spell_ids
+
+        # Reverting to one spec deletes the secondary group.
+        await socket._update_spec_count(1)
+        assert socket.character["specs_count"] == 1
+        assert socket.character["active_talent_group"] == 0
+        assert character_db.get_all_character_talents(db, 1) == {0: {26: 0}}
+
+    asyncio.run(flow())
+
+
+def test_pet_talents_learning_reset_and_persistence(tmp_path):
+    async def flow():
+        socket, db, sent, _delivered = _socket(tmp_path)
+        socket.character.update({
+            "level": 20, "class": 3, "specs_count": 1,
+            "active_talent_group": 0, "talent_groups": {0: {}},
+            "talents": {}, "money": 1000,
+            "x": 0.0, "y": 0.0, "z": 0.0, "o": 0.0})
+        socket.known_spell_ids = set()
+        _add_wolf_and_pet_talents(db)
+
+        low = await socket._summon_creature(9999, -1, is_pet=True)
+        assert low is not None
+        spawn = socket._summon_spawns()[low]
+        state = socket._summon_state(low)
+        assert socket._pet_talent_type(spawn) == 0
+        assert socket._pet_max_talent_points(spawn) == 1
+        guid = creature.creature_guid(low, 9999)
+
+        await socket._send_pet_unlearn_confirm(low)
+        confirm = [payload for opcode, payload in sent
+                   if opcode == int(Opcodes.SMSG_PET_UNLEARN_CONFIRM)][-1]
+        assert struct.unpack_from("<QI", confirm, 0) == (guid, 1000)
+
+        await socket.handle_pet_learn_talent(
+            struct.pack("<QII", guid, 2107, 0))
+        assert state["pet_talents"] == {2107: 0}
+        assert 61682 in state["pet_spells"]
+        assert character_db.get_character_pet_talents(db, 1, 9999) == {
+            2107: 0}
+        assert socket._creature_aura_mods(low)["attack_power"] == 51
+
+        pet_payload = [payload for opcode, payload in sent
+                       if opcode == int(Opcodes.SMSG_TALENTS_INFO)][-1]
+        assert pet_payload[0] == 1
+        assert struct.unpack_from("<I", pet_payload, 1)[0] == 0
+        assert pet_payload[5] == 1
+
+        await socket.handle_pet_unlearn(struct.pack("<Q", guid))
+        assert state["pet_talents"] == {}
+        assert 61682 not in state["pet_spells"]
+        assert character_db.get_character_pet_talents(db, 1, 9999) == {}
+        assert socket._creature_aura_mods(low)["attack_power"] == 0
+        assert socket.character["money"] == 0      # first reset: 10 silver
+
+    asyncio.run(flow())
+
+
+def test_respec_dismisses_hunter_pet(tmp_path):
+    async def flow():
+        socket, db, _sent, _delivered = _socket(tmp_path)
+        socket.character.update({
+            "level": 20, "class": 3, "specs_count": 1,
+            "active_talent_group": 0, "talent_groups": {0: {}},
+            "talents": {}, "money": 10000,
+            "x": 0.0, "y": 0.0, "z": 0.0, "o": 0.0})
+        socket.known_spell_ids = set()
+        _add_wolf_and_pet_talents(db)
+
+        low = await socket._summon_creature(9999, -1, is_pet=True)
+        assert low is not None
+        assert socket._active_pet() is not None
+        # Hunter talent 1341 (Improved Aspect of the Hawk).
+        assert await socket._learn_talent(1341, 0)
+
+        assert await socket._reset_talents()
+        assert socket.character["talents"] == {}
+        assert socket._active_pet() is None
+        assert socket.character["money"] == 0
+
+    asyncio.run(flow())

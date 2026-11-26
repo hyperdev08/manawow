@@ -46,6 +46,8 @@ TRAINER_FAIL_NOT_ENOUGH_SKILL = 2
 GOSSIP_OPTION_TRAINER = 5
 # Gossip option type that starts the talent-reset confirmation.
 GOSSIP_OPTION_UNLEARNTALENTS = 16
+# Gossip option type that starts the pet talent-reset confirmation.
+GOSSIP_OPTION_UNLEARNPETSKILLS = 17
 
 TRAINER_INTERACT_DISTANCE = 15.0
 

@@ -30,6 +30,8 @@ CREATE TABLE IF NOT EXISTS characters(
   bonus_talents INTEGER NOT NULL DEFAULT 0,
   reset_talents_cost INTEGER NOT NULL DEFAULT 0,
   reset_talents_time INTEGER NOT NULL DEFAULT 0,
+  specs_count INTEGER NOT NULL DEFAULT 1,
+  active_talent_group INTEGER NOT NULL DEFAULT 0,
   zone INTEGER NOT NULL DEFAULT 12,
   map INTEGER NOT NULL DEFAULT 0,
   x REAL NOT NULL DEFAULT -8949.95,
@@ -291,12 +293,35 @@ CREATE TABLE IF NOT EXISTS character_spells(
 );
 CREATE INDEX IF NOT EXISTS idx_character_spells_character ON character_spells(character_guid);
 
--- Character talents: the highest rank index (0-based) learned in each talent.
+-- Character talents: the highest rank index (0-based) learned in each talent
+-- and talent group (0 = primary, 1 = secondary specialization).
 CREATE TABLE IF NOT EXISTS character_talents(
   character_guid INTEGER NOT NULL,
+  spec INTEGER NOT NULL DEFAULT 0,
   talent_id INTEGER NOT NULL,
   rank INTEGER NOT NULL DEFAULT 0,
-  PRIMARY KEY(character_guid, talent_id)
+  PRIMARY KEY(character_guid, spec, talent_id)
+);
+
+-- Hunter pet talents.  Pets are session-local summons today, so the pet entry
+-- identifies the persisted talent set for the character's tamed pet.
+CREATE TABLE IF NOT EXISTS character_pet_talents(
+  character_guid INTEGER NOT NULL,
+  pet_entry INTEGER NOT NULL,
+  talent_id INTEGER NOT NULL,
+  rank INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY(character_guid, pet_entry, talent_id)
+);
+CREATE INDEX IF NOT EXISTS idx_character_pet_talents_character
+  ON character_pet_talents(character_guid);
+
+-- Per-hunter-pet reset cost/time (the pet itself is still session-local).
+CREATE TABLE IF NOT EXISTS character_pet_state(
+  character_guid INTEGER NOT NULL,
+  pet_entry INTEGER NOT NULL,
+  reset_cost INTEGER NOT NULL DEFAULT 0,
+  reset_time INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY(character_guid, pet_entry)
 );
 
 -- Character skill lines (professions, weapon skills, riding).  The value/max
@@ -381,6 +406,7 @@ def _schema_subset(sql: str, tables: set[str]) -> str:
 CREATE_CHARACTER_TABLES_SQL = _schema_subset(
     CREATE_CHARACTERS_SQL, {"characters", "character_items",
                             "character_spells", "character_talents",
+                            "character_pet_talents", "character_pet_state",
                             "character_skills",
                             "character_proficiencies", "character_corpses",
                             "character_taxi_nodes", "groups",
@@ -468,6 +494,8 @@ CHARACTER_TABLES = (
     "character_items",
     "character_spells",
     "character_talents",
+    "character_pet_talents",
+    "character_pet_state",
     "character_skills",
     "character_proficiencies",
     "character_corpses",
@@ -500,6 +528,8 @@ def _migrate_character_columns(con: sqlite3.Connection) -> None:
         "bonus_talents": "INTEGER NOT NULL DEFAULT 0",
         "reset_talents_cost": "INTEGER NOT NULL DEFAULT 0",
         "reset_talents_time": "INTEGER NOT NULL DEFAULT 0",
+        "specs_count": "INTEGER NOT NULL DEFAULT 1",
+        "active_talent_group": "INTEGER NOT NULL DEFAULT 0",
     }
     for name, declaration in additions.items():
         if name not in columns:
@@ -517,6 +547,32 @@ def _migrate_corpse_columns(con: sqlite3.Connection) -> None:
         con.execute(
             "ALTER TABLE character_corpses ADD COLUMN released INTEGER"
             " NOT NULL DEFAULT 0")
+
+
+def _migrate_talent_columns(con: sqlite3.Connection) -> None:
+    """Give pre-dual-spec ``character_talents`` tables their ``spec`` column."""
+    try:
+        columns = {row[1] for row in con.execute(
+            "PRAGMA table_info(character_talents)")}
+    except sqlite3.Error:
+        return
+    if not columns or "spec" in columns:
+        return
+    con.execute(
+        "ALTER TABLE character_talents RENAME TO character_talents_old")
+    con.execute(
+        "CREATE TABLE character_talents("
+        "character_guid INTEGER NOT NULL,"
+        "spec INTEGER NOT NULL DEFAULT 0,"
+        "talent_id INTEGER NOT NULL,"
+        "rank INTEGER NOT NULL DEFAULT 0,"
+        "PRIMARY KEY(character_guid, spec, talent_id))")
+    con.execute(
+        "INSERT OR IGNORE INTO character_talents"
+        "(character_guid, spec, talent_id, rank)"
+        " SELECT character_guid, 0, talent_id, rank"
+        " FROM character_talents_old")
+    con.execute("DROP TABLE character_talents_old")
 
 
 def _migrate_group_columns(con: sqlite3.Connection) -> None:
@@ -538,6 +594,7 @@ def init_character_store(path: str) -> None:
         con.executescript(CREATE_CHARACTER_TABLES_SQL)
         _migrate_character_columns(con)
         _migrate_corpse_columns(con)
+        _migrate_talent_columns(con)
         _migrate_group_columns(con)
         _migrate_start_positions(con)
         con.commit()
@@ -1016,7 +1073,8 @@ def delete_character(path: str, account_id: int, guid: int) -> bool:
             from src.world import quests
             quests.delete_character_quests(con, guid)
             for table in ("character_items", "character_spells",
-                          "character_talents", "character_skills",
+                          "character_talents", "character_pet_talents",
+                          "character_pet_state", "character_skills",
                           "character_proficiencies", "character_corpses"):
                 try:
                     con.execute(
@@ -2345,40 +2403,59 @@ def swap_character_items(path: str, character_guid: int, slot_a: int, slot_b: in
         con.close()
 
 
-def get_character_talents(path: str, character_guid: int) -> Dict[int, int]:
-    """Return ``{talent_id: highest_rank_index}`` for one character."""
+def get_character_talents(path: str, character_guid: int,
+                          spec: int = 0) -> Dict[int, int]:
+    """Return ``{talent_id: highest_rank_index}`` for one talent group."""
     con = _connect(path)
     try:
         rows = con.execute(
             "SELECT talent_id, rank FROM character_talents"
-            " WHERE character_guid = ?", (int(character_guid),)).fetchall()
+            " WHERE character_guid = ? AND spec = ?",
+            (int(character_guid), int(spec))).fetchall()
         return {int(row[0]): int(row[1]) for row in rows}
     finally:
         con.close()
 
 
+def get_all_character_talents(path: str,
+                              character_guid: int) -> Dict[int, Dict[int, int]]:
+    """Return ``{spec: {talent_id: rank}}`` for every talent group."""
+    con = _connect(path)
+    try:
+        rows = con.execute(
+            "SELECT spec, talent_id, rank FROM character_talents"
+            " WHERE character_guid = ? ORDER BY spec, talent_id",
+            (int(character_guid),)).fetchall()
+    finally:
+        con.close()
+    groups: Dict[int, Dict[int, int]] = {}
+    for spec, talent_id, rank in rows:
+        groups.setdefault(int(spec), {})[int(talent_id)] = int(rank)
+    return groups
+
+
 def set_character_talent(path: str, character_guid: int, talent_id: int,
-                         rank: int) -> None:
+                         rank: int, spec: int = 0) -> None:
     con = _connect(path)
     try:
         con.execute(
             "INSERT OR REPLACE INTO character_talents"
-            "(character_guid, talent_id, rank) VALUES(?,?,?)",
-            (int(character_guid), int(talent_id), int(rank)))
+            "(character_guid, spec, talent_id, rank) VALUES(?,?,?,?)",
+            (int(character_guid), int(spec), int(talent_id), int(rank)))
         con.commit()
     finally:
         con.close()
 
 
-def delete_character_talent(path: str, character_guid: int,
-                            talent_id: int) -> None:
+def delete_character_talent(path: str, character_guid: int, talent_id: int,
+                            spec: int = 0) -> None:
     """Drop one invalid talent row (``Player::_LoadTalents`` cleanup)."""
     con = _connect(path)
     try:
         con.execute(
             "DELETE FROM character_talents WHERE character_guid = ?"
-            " AND talent_id = ?",
-            (int(character_guid), int(talent_id)))
+            " AND spec = ? AND talent_id = ?",
+            (int(character_guid), int(spec), int(talent_id)))
         con.commit()
     finally:
         con.close()
@@ -2409,12 +2486,133 @@ def set_reset_talents(path: str, character_guid: int, cost: int,
         con.close()
 
 
-def clear_character_talents(path: str, character_guid: int) -> None:
+def clear_character_talents(path: str, character_guid: int,
+                            spec: Optional[int] = None) -> None:
+    con = _connect(path)
+    try:
+        if spec is None:
+            con.execute(
+                "DELETE FROM character_talents WHERE character_guid = ?",
+                (int(character_guid),))
+        else:
+            con.execute(
+                "DELETE FROM character_talents WHERE character_guid = ?"
+                " AND spec = ?", (int(character_guid), int(spec)))
+        con.commit()
+    finally:
+        con.close()
+
+
+def set_specs_count(path: str, character_guid: int, count: int) -> None:
     con = _connect(path)
     try:
         con.execute(
-            "DELETE FROM character_talents WHERE character_guid = ?",
-            (int(character_guid),))
+            "UPDATE characters SET specs_count = ? WHERE guid = ?",
+            (max(1, min(2, int(count))), int(character_guid)))
+        con.commit()
+    finally:
+        con.close()
+
+
+def set_active_talent_group(path: str, character_guid: int,
+                            group: int) -> None:
+    con = _connect(path)
+    try:
+        con.execute(
+            "UPDATE characters SET active_talent_group = ? WHERE guid = ?",
+            (int(group), int(character_guid)))
+        con.commit()
+    finally:
+        con.close()
+
+
+def get_character_pet_talents(path: str, character_guid: int,
+                              pet_entry: int) -> Dict[int, int]:
+    """Return ``{talent_id: rank}`` for one hunter pet entry."""
+    con = _connect(path)
+    try:
+        rows = con.execute(
+            "SELECT talent_id, rank FROM character_pet_talents"
+            " WHERE character_guid = ? AND pet_entry = ?",
+            (int(character_guid), int(pet_entry))).fetchall()
+        return {int(row[0]): int(row[1]) for row in rows}
+    finally:
+        con.close()
+
+
+def set_character_pet_talent(path: str, character_guid: int, pet_entry: int,
+                             talent_id: int, rank: int) -> None:
+    con = _connect(path)
+    try:
+        con.execute(
+            "INSERT OR REPLACE INTO character_pet_talents"
+            "(character_guid, pet_entry, talent_id, rank) VALUES(?,?,?,?)",
+            (int(character_guid), int(pet_entry), int(talent_id), int(rank)))
+        con.commit()
+    finally:
+        con.close()
+
+
+def clear_character_pet_talents(path: str, character_guid: int,
+                                pet_entry: int) -> None:
+    con = _connect(path)
+    try:
+        con.execute(
+            "DELETE FROM character_pet_talents WHERE character_guid = ?"
+            " AND pet_entry = ?", (int(character_guid), int(pet_entry)))
+        con.commit()
+    finally:
+        con.close()
+
+
+def delete_character_pet_talent(path: str, character_guid: int,
+                                pet_entry: int, talent_id: int) -> None:
+    con = _connect(path)
+    try:
+        con.execute(
+            "DELETE FROM character_pet_talents WHERE character_guid = ?"
+            " AND pet_entry = ? AND talent_id = ?",
+            (int(character_guid), int(pet_entry), int(talent_id)))
+        con.commit()
+    finally:
+        con.close()
+
+
+def get_character_pet_state(path: str, character_guid: int,
+                            pet_entry: int):
+    con = _connect(path)
+    try:
+        return con.execute(
+            "SELECT reset_cost, reset_time FROM character_pet_state"
+            " WHERE character_guid = ? AND pet_entry = ?",
+            (int(character_guid), int(pet_entry))).fetchone()
+    finally:
+        con.close()
+
+
+def set_character_pet_reset(path: str, character_guid: int, pet_entry: int,
+                            cost: int, when: int) -> None:
+    con = _connect(path)
+    try:
+        con.execute(
+            "INSERT INTO character_pet_state"
+            "(character_guid, pet_entry, reset_cost, reset_time)"
+            " VALUES(?,?,?,?) ON CONFLICT(character_guid, pet_entry)"
+            " DO UPDATE SET reset_cost = excluded.reset_cost,"
+            " reset_time = excluded.reset_time",
+            (int(character_guid), int(pet_entry), int(cost), int(when)))
+        con.commit()
+    finally:
+        con.close()
+
+
+def clear_character_pet_state(path: str, character_guid: int,
+                              pet_entry: int) -> None:
+    con = _connect(path)
+    try:
+        con.execute(
+            "DELETE FROM character_pet_state WHERE character_guid = ?"
+            " AND pet_entry = ?", (int(character_guid), int(pet_entry)))
         con.commit()
     finally:
         con.close()

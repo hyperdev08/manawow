@@ -350,6 +350,21 @@ class CharactersMixin:
             if hasattr(self, "_send_talent_wipe_confirm"):
                 await self._send_talent_wipe_confirm(int(guid))
             return
+        if int(option["option_type"]) == trainer.GOSSIP_OPTION_UNLEARNPETSKILLS:
+            await self.send_packet(Opcodes.SMSG_GOSSIP_COMPLETE, b"")
+            if hasattr(self, "_send_pet_unlearn_confirm"):
+                await self._send_pet_unlearn_confirm()
+            return
+        # The 3.3.5 dual-specialization gossip option carries its 1000g price
+        # in ``box_money`` and is implemented by a DB gossip script in CMaNGOS.
+        box_money = int(option["box_money"] or 0)
+        option_text = str(option["text"] or "").lower()
+        if (box_money > 0 and "dual" in option_text
+                and "specialization" in option_text
+                and hasattr(self, "_purchase_dual_specialization")):
+            await self._purchase_dual_specialization(box_money)
+            await self.send_packet(Opcodes.SMSG_GOSSIP_COMPLETE, b"")
+            return
         if int(option["option_type"]) == 6:      # GOSSIP_OPTION_SPIRITHEALER
             await self.send_packet(Opcodes.SMSG_GOSSIP_COMPLETE, b"")
             if hasattr(self, "handle_spirit_healer_activate"):

@@ -1323,8 +1323,10 @@ async def rune_and_creature_ai_checks(temp_dir: str, world_db: str) -> None:
         assert create_packets, "summon sends a create object"
         assert peer_sent and peer_sent[-1][0] == create_packets[-1][0], \
             "summon create block is relayed to peers"
-        assert sent and sent[-1][0] == int(Opcodes.SMSG_PET_SPELLS), \
-            "summon sends the pet action bar"
+        assert any(packet[0] == int(Opcodes.SMSG_PET_SPELLS)
+                   for packet in sent), "summon sends the pet action bar"
+        assert any(packet[0] == int(Opcodes.SMSG_TALENTS_INFO)
+                   for packet in sent), "summon sends pet talent info"
 
         # Assist: the pet attacks the owner's current target.
         pet._combat_state.update({

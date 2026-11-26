@@ -534,6 +534,13 @@ CREATE TABLE IF NOT EXISTS talents(
   prereq_rank INTEGER NOT NULL DEFAULT 0
 );
 
+-- CreatureFamily.dbc: pet_talent_type is -1 for non-hunter-pet families,
+-- otherwise 0/1/2 for Ferocity/Tenacity/Cunning.
+CREATE TABLE IF NOT EXISTS creature_family(
+  id INTEGER PRIMARY KEY,
+  pet_talent_type INTEGER NOT NULL DEFAULT -1
+);
+
 CREATE TABLE IF NOT EXISTS glyph_properties(
   id INTEGER PRIMARY KEY,
   spell_id INTEGER NOT NULL DEFAULT 0,
@@ -897,6 +904,8 @@ _TOTEM_CATEGORIES_SQL = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "totem_categories.sql")
 _TALENTS_SQL = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "talents.sql")
+_CREATURE_FAMILY_SQL = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "creature_family.sql")
 
 
 def _seed_spell_item_enchantment(con: sqlite3.Connection) -> None:
@@ -966,6 +975,18 @@ def _seed_talents(con: sqlite3.Connection) -> None:
     con.commit()
 
 
+def _seed_creature_family(con: sqlite3.Connection) -> None:
+    """Load bundled CreatureFamily.dbc pet-talent types."""
+    count = con.execute("SELECT COUNT(*) FROM creature_family").fetchone()[0]
+    if count:
+        return
+    if not os.path.exists(_CREATURE_FAMILY_SQL):
+        return
+    with open(_CREATURE_FAMILY_SQL, encoding="utf-8") as handle:
+        con.executescript(handle.read())
+    con.commit()
+
+
 def _seed_playercreateinfo(con: sqlite3.Connection) -> None:
     """Load the bundled 3.3.5a starter spell/action tables once.
 
@@ -1027,6 +1048,7 @@ def init_creature_db(path: str) -> None:
         _seed_skill_line_ability(con)
         _seed_totem_categories(con)
         _seed_talents(con)
+        _seed_creature_family(con)
         if con.execute("SELECT COUNT(*) FROM creature_spawns").fetchone()[0]:
             con.commit()
             return
