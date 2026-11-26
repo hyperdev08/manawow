@@ -503,6 +503,11 @@ def build_superceded_spell(old_spell: int, new_spell: int) -> bytes:
     return struct.pack("<II", int(old_spell), int(new_spell))
 
 
+def build_removed_spell(spell_id: int) -> bytes:
+    """``SMSG_REMOVED_SPELL``: uint32 spell id."""
+    return struct.pack("<I", int(spell_id))
+
+
 def build_play_spell_visual(guid: int, visual_id: int) -> bytes:
     return struct.pack("<QI", int(guid), int(visual_id))
 

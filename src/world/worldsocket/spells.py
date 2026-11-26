@@ -1980,6 +1980,8 @@ class SpellsMixin:
                         manager.modify_threat_percent(
                             creature.creature_low_guid(target_guid),
                             player_guid, percent)
+            elif etype == spells.SPELL_EFFECT_SANCTUARY:
+                await self._spell_sanctuary()
             elif etype == spells.SPELL_EFFECT_ATTACK_ME:
                 if target_guid and not self._is_player_guid(target_guid):
                     manager = (self._creature_combat_manager()
@@ -2106,6 +2108,10 @@ class SpellsMixin:
                 learned = int(effect.get("trigger_spell") or 0)
                 if learned and hasattr(self, "_learn_spell"):
                     await self._learn_spell(learned)
+            elif etype == spells.SPELL_EFFECT_LEARN_PET_SPELL:
+                learned = int(effect.get("trigger_spell") or 0)
+                if learned:
+                    await self._learn_pet_spell(learned, target_guid)
             elif etype == spells.SPELL_EFFECT_SKILL_STEP:
                 if hasattr(self, "_apply_trainer_skill"):
                     await self._apply_trainer_skill(template)
@@ -2130,6 +2136,16 @@ class SpellsMixin:
                             peer._modify_reputation(faction, amount)
                     elif kind == "player":
                         self._modify_reputation(faction, amount)
+            elif etype == spells.SPELL_EFFECT_ADD_HONOR:
+                amount = self._spell_effect_value(
+                    template, index, effect, caster_level, combo_points)
+                if amount:
+                    self.character["honor"] = max(
+                        0, int(self.character.get("honor", 0) or 0) + amount)
+            elif etype == spells.SPELL_EFFECT_UNLEARN_SPECIALIZATION:
+                unlearn = int(effect.get("trigger_spell") or 0)
+                if unlearn and hasattr(self, "_unlearn_spell"):
+                    await self._unlearn_spell(unlearn)
             elif etype == spells.SPELL_EFFECT_SEND_EVENT:
                 event_id = int(effect.get("misc_value") or 0)
                 if event_id:
@@ -2218,6 +2234,11 @@ class SpellsMixin:
                         entry, x, y, z,
                         float(self.character.get("o", 0.0) or 0.0),
                         duration)
+            elif etype == spells.SPELL_EFFECT_CREATE_TAMED_PET:
+                entry = int(effect.get("misc_value") or 0)
+                if entry:
+                    await self._summon_creature(
+                        entry, -1, is_pet=True, stationary=False)
             elif etype in (spells.SPELL_EFFECT_SUMMON,
                            spells.SPELL_EFFECT_SUMMON_PET):
                 entry = int(effect.get("misc_value") or 0)
@@ -2682,6 +2703,60 @@ class SpellsMixin:
         await self._send_spell_heal_log(
             target_guid, player_guid, template.id, max(0, healed),
             max(0, amount - healed), critical=critical)
+
+    async def _learn_pet_spell(self, spell_id: int,
+                               target_guid: int = 0) -> None:
+        """``SPELL_EFFECT_LEARN_PET_SPELL``: add a spell to the pet's bar."""
+        if not hasattr(self, "_pet_for_guid"):
+            return
+        pet = (self._pet_for_guid(int(target_guid))
+               if target_guid else None)
+        if pet is None and hasattr(self, "_active_pet"):
+            pet = self._active_pet()
+        if pet is None:
+            return
+        low, spawn, state = pet
+        spell_id = int(spell_id)
+        pet_spells = state.setdefault("pet_spells", [])
+        if spell_id not in pet_spells:
+            pet_spells.append(spell_id)
+        states = state.setdefault("pet_spell_states", {})
+        states.setdefault(spell_id, 0x01)     # ACT_PASSIVE
+        if int(spell_id):
+            await self.send_packet(
+                Opcodes.SMSG_PET_LEARNED_SPELL, struct.pack("<I", spell_id))
+        if hasattr(self, "_pet_build_default_bar"):
+            state["pet_action_bar"] = self._pet_build_default_bar(state)
+        if hasattr(self, "_send_pet_spells"):
+            await self._send_pet_spells(int(low))
+
+    async def _spell_sanctuary(self) -> None:
+        """``SPELL_EFFECT_SANCTUARY``: leave combat and drop all threat."""
+        combat = self._get_combat_state()
+        if combat["auto_attacking"] or combat["ranged_attacking"]:
+            await self.handle_attack_stop(b"")
+        player_guid = int(self.player_guid or 0)
+        manager = (self._creature_combat_manager()
+                   if hasattr(self, "_creature_combat_manager") else None)
+        for low in list(combat.get("aggro", {})):
+            state = combat["aggro"].get(int(low))
+            if state is not None:
+                state.get("threat_table", {}).pop(player_guid, None)
+                if int(state.get("taunt_target") or 0) == player_guid:
+                    state["taunt_target"] = 0
+                    state["taunt_until"] = 0.0
+                if not state.get("threat_table"):
+                    combat["aggro"].pop(int(low), None)
+                    if manager is not None:
+                        manager.forget(int(low))
+                    continue
+            if manager is not None:
+                manager.select_target(state)
+        combat["target_guid"] = 0
+        combat["auto_attacking"] = False
+        combat["ranged_attacking"] = False
+        combat["in_combat"] = False
+        await self._update_player_aiface()
 
     async def _charge_target(self, target_guid: int) -> None:
         """``SPELL_EFFECT_CHARGE``: move next to the target and attack it."""

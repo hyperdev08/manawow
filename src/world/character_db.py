@@ -2325,6 +2325,20 @@ def swap_character_items(path: str, character_guid: int, slot_a: int, slot_b: in
         con.close()
 
 
+def forget_character_spell(path: str, character_guid: int,
+                           spell: int) -> None:
+    """Remove one learned spell from the spellbook."""
+    con = _connect(path)
+    try:
+        con.execute(
+            "DELETE FROM character_spells"
+            " WHERE character_guid = ? AND spell = ?",
+            (int(character_guid), int(spell)))
+        con.commit()
+    finally:
+        con.close()
+
+
 def get_character_spells(path: str, character_guid: int) -> List[sqlite3.Row]:
     """Fetch all active spells known by a character."""
     con = _connect(path)

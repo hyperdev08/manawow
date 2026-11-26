@@ -98,6 +98,18 @@ class TrainersMixin:
         )
         return True
 
+    async def _unlearn_spell(self, spell_id: int) -> None:
+        """``SPELL_EFFECT_UNLEARN_SPECIALIZATION``: forget one spell."""
+        spell_id = int(spell_id)
+        if spell_id not in self.known_spell_ids:
+            return
+        self.known_spell_ids.discard(spell_id)
+        await self.send_packet(
+            Opcodes.SMSG_REMOVED_SPELL, trainer.build_removed_spell(spell_id))
+        await run_db_write(
+            character_db.forget_character_spell,
+            self.config.database.world_path, int(self.player_guid), spell_id)
+
     async def _apply_trainer_skill(self, template) -> None:
         """Apply ``SPELL_EFFECT_SKILL_STEP`` from a profession/riding wrapper."""
         skill_id, step = trainer.skill_step_from_template(template)

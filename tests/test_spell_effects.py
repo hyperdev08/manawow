@@ -362,6 +362,25 @@ def _socket(tmp_path):
             " VALUES(459, 'Target Trigger Aura Test', 6, 109, 99, 200, 3,"
             " 1, 1)")
         con.execute(
+            "INSERT OR REPLACE INTO spell_templates"
+            "(id, name, effect1, effect_trigger_spell1)"
+            " VALUES(460, 'Learn Pet Spell Test', 57, 200)")
+        con.execute(
+            "INSERT OR REPLACE INTO spell_templates"
+            "(id, name, effect1) VALUES(461, 'Sanctuary Test', 79)")
+        con.execute(
+            "INSERT OR REPLACE INTO spell_templates"
+            "(id, name, effect1, effect_misc_value1)"
+            " VALUES(462, 'Create Tamed Pet Test', 153, 284)")
+        con.execute(
+            "INSERT OR REPLACE INTO spell_templates"
+            "(id, name, effect1, effect_base_points1)"
+            " VALUES(463, 'Add Honor Test', 45, 99)")
+        con.execute(
+            "INSERT OR REPLACE INTO spell_templates"
+            "(id, name, effect1, effect_trigger_spell1)"
+            " VALUES(464, 'Unlearn Spec Test', 133, 200)")
+        con.execute(
             "INSERT OR REPLACE INTO creature_templates"
             "(entry, name, display_id1, scale, min_level, max_level, visible)"
             " VALUES(284, 'Brown Horse', 2404, 1.0, 1, 1, 1)")
@@ -1025,6 +1044,47 @@ def test_taunt_proc_damage_and_target_trigger_auras(tmp_path):
         await socket._apply_spell_effects(
             None, spells.get_spell_template(db, 407), guid)
         assert (200, int(guid)) in triggered
+
+    asyncio.run(flow())
+
+
+def test_pet_spell_sanctuary_honor_and_unlearn_effects(tmp_path):
+    async def flow():
+        socket, db, sent, _delivered = _socket(tmp_path)
+        await socket._apply_spell_effects(
+            None, spells.get_spell_template(db, 462), socket.player_guid)
+        pet = socket._active_pet()
+        assert pet is not None
+        low, spawn, state = pet
+        pet_guid = socket._creature_object_guid(low, int(spawn["entry"]))
+        await socket._apply_spell_effects(
+            None, spells.get_spell_template(db, 460), pet_guid)
+        assert 200 in state["pet_spells"]
+
+        await socket._apply_spell_effects(
+            None, spells.get_spell_template(db, 463), socket.player_guid)
+        assert socket.character["honor"] == 100
+
+        combat = socket._get_combat_state()
+        combat["aggro"] = {5000: {
+            "guid": 5000, "threat_table": {1: 10.0},
+            "taunt_target": 1, "taunt_until": time.monotonic() + 5.0,
+            "target_guid": 1,
+        }}
+        combat["target_guid"] = 1
+        combat["auto_attacking"] = True
+        await socket._apply_spell_effects(
+            None, spells.get_spell_template(db, 461), socket.player_guid)
+        assert 5000 not in combat["aggro"]
+        assert not combat["auto_attacking"]
+
+        socket.known_spell_ids = {200}
+        sent.clear()
+        await socket._apply_spell_effects(
+            None, spells.get_spell_template(db, 464), socket.player_guid)
+        assert 200 not in socket.known_spell_ids
+        assert int(Opcodes.SMSG_REMOVED_SPELL) in [
+            opcode for opcode, _payload in sent]
 
     asyncio.run(flow())
 
