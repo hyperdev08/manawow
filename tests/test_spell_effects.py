@@ -292,6 +292,80 @@ def _socket(tmp_path):
             " effect_misc_value1, effect_implicit_target_a1, duration_index)"
             " VALUES(444, 'Agility Aura Test', 6, 29, 9, 1, 1, 1)")
         con.execute(
+            "INSERT OR REPLACE INTO spell_templates"
+            "(id, name, effect1, effect_misc_value1, effect_base_points1,"
+            " effect_multiple_value1)"
+            " VALUES(445, 'Power Drain Test', 8, 0, 9, 0.5)")
+        con.execute(
+            "INSERT OR REPLACE INTO spell_templates"
+            "(id, name, effect1, effect_misc_value1, effect_base_points1,"
+            " effect_implicit_target_a1)"
+            " VALUES(446, 'Energize Percent Test', 137, 0, 2, 1)")
+        con.execute(
+            "INSERT OR REPLACE INTO spell_templates"
+            "(id, name, effect1, effect_misc_value1, effect_base_points1)"
+            " VALUES(447, 'Reputation Test', 103, 529, 49)")
+        con.execute(
+            "INSERT OR REPLACE INTO spell_templates"
+            "(id, name, effect1) VALUES(448, 'Leap Test', 29)")
+        con.execute(
+            "INSERT OR REPLACE INTO spell_templates"
+            "(id, name, effect1) VALUES(449, 'Jump Test', 41)")
+        con.execute(
+            "INSERT OR REPLACE INTO spell_templates"
+            "(id, name, effect1) VALUES(450, 'Pull Test', 124)")
+        con.execute(
+            "INSERT OR REPLACE INTO spell_templates"
+            "(id, name, effect1, effect_apply_aura_name1, effect_misc_value1,"
+            " effect_base_points1, effect_implicit_target_a1, duration_index)"
+            " VALUES(451, 'Mount Aura Test', 6, 78, 284, 0, 1, 1)")
+        con.execute(
+            "INSERT OR REPLACE INTO spell_templates"
+            "(id, name, effect1, effect_apply_aura_name1, effect_base_points1,"
+            " effect_implicit_target_a1, duration_index)"
+            " VALUES(452, 'Mount Speed Test', 6, 32, 59, 1, 1)")
+        con.execute(
+            "INSERT OR REPLACE INTO spell_templates"
+            "(id, name, effect1, effect_apply_aura_name1, effect_base_points1,"
+            " effect_implicit_target_a1, duration_index)"
+            " VALUES(453, 'Disarm Aura Test', 6, 67, -1, 1, 1)")
+        con.execute(
+            "INSERT OR REPLACE INTO spell_templates"
+            "(id, name, effect1, effect_apply_aura_name1, effect_base_points1,"
+            " effect_implicit_target_a1, duration_index)"
+            " VALUES(454, 'Taunt Aura Test', 6, 11, -1, 6, 1)")
+        con.execute(
+            "INSERT OR REPLACE INTO spell_templates"
+            "(id, name, effect1, effect_apply_aura_name1, effect_base_points1,"
+            " effect_implicit_target_a1, duration_index)"
+            " VALUES(455, 'Proc Damage Aura Test', 6, 43, 5, 1, 1)")
+        con.execute(
+            "INSERT OR REPLACE INTO spell_templates"
+            "(id, name, effect1, effect_apply_aura_name1, effect_misc_value1,"
+            " effect_base_points1, effect_implicit_target_a1, duration_index)"
+            " VALUES(456, 'Invisibility Aura Test', 6, 18, 0, 10, 1, 1)")
+        con.execute(
+            "INSERT OR REPLACE INTO spell_templates"
+            "(id, name, effect1, effect_apply_aura_name1, effect_misc_value1,"
+            " effect_base_points1, effect_implicit_target_a1, duration_index)"
+            " VALUES(457, 'Invisibility Detect Test', 6, 19, 0, 10, 1, 1)")
+        con.execute(
+            "INSERT OR REPLACE INTO spell_templates"
+            "(id, name, effect1, effect_apply_aura_name1, effect_misc_value1,"
+            " effect_base_points1, effect_implicit_target_a1, duration_index)"
+            " VALUES(458, 'Force Reaction Test', 6, 139, 529, 3, 1, 1)")
+        con.execute(
+            "INSERT OR REPLACE INTO spell_templates"
+            "(id, name, effect1, effect_apply_aura_name1, effect_base_points1,"
+            " effect_trigger_spell1, spell_family_name,"
+            " effect_implicit_target_a1, duration_index)"
+            " VALUES(459, 'Target Trigger Aura Test', 6, 109, 99, 200, 3,"
+            " 1, 1)")
+        con.execute(
+            "INSERT OR REPLACE INTO creature_templates"
+            "(entry, name, display_id1, scale, min_level, max_level, visible)"
+            " VALUES(284, 'Brown Horse', 2404, 1.0, 1, 1, 1)")
+        con.execute(
             "INSERT OR REPLACE INTO gameobject_templates"
             "(entry, type, display_id, name, size, faction, flags)"
             " VALUES(5000, 6, 100, 'Trap', 1.0, 0, 0)")
@@ -821,6 +895,136 @@ def test_transmitted_activate_and_damage_gameobjects(tmp_path):
         assert runtime.current_health(wall_low, wall_spawn) == 4000
         assert int(Opcodes.SMSG_DESTRUCTIBLE_BUILDING_DAMAGE) in [
             opcode for opcode, _payload in sent]
+
+    asyncio.run(flow())
+
+
+def test_mount_disarm_invisibility_and_force_reaction_auras(tmp_path):
+    async def flow():
+        socket, db, sent, _delivered = _socket(tmp_path)
+        await socket._apply_spell_effects(
+            None, spells.get_spell_template(db, 451), socket.player_guid)
+        await socket._apply_spell_effects(
+            None, spells.get_spell_template(db, 452), socket.player_guid)
+        state = socket._get_combat_state()["aura_state"]
+        assert state["mount_display"] == 2404
+        assert state["speed"] > 11.0
+
+        mods = socket._player_aura_mods()
+        assert mods["mounted"] == 284
+        assert mods["mounted_speed"] == 60
+
+        await socket._apply_spell_effects(
+            None, spells.get_spell_template(db, 453), socket.player_guid)
+        assert socket._player_aura_mods()["disarmed"]
+
+        await socket._apply_spell_effects(
+            None, spells.get_spell_template(db, 456), socket.player_guid)
+        await socket._apply_spell_effects(
+            None, spells.get_spell_template(db, 457), socket.player_guid)
+        mods = socket._player_aura_mods()
+        assert mods["invisibility"].get(0) == 11
+        assert mods["invisibility_detect"].get(0) == 11
+
+        await socket._apply_spell_effects(
+            None, spells.get_spell_template(db, 458), socket.player_guid)
+        assert socket._get_combat_state()["aura_state"][
+            "forced_reactions"] == [(529, 4)]
+        assert int(Opcodes.SMSG_SET_FORCED_REACTIONS) in [
+            opcode for opcode, _payload in sent]
+
+    asyncio.run(flow())
+
+
+def test_power_drain_energize_reputation_and_jump_effects(tmp_path):
+    async def flow():
+        socket, db, _sent, _delivered = _socket(tmp_path)
+        socket.character["power"] = 100
+        await socket._apply_spell_effects(
+            None, spells.get_spell_template(db, 445), socket.player_guid)
+        assert socket.character["power"] == 90
+
+        socket.character["power"] = 50
+        await socket._apply_spell_effects(
+            None, spells.get_spell_template(db, 446), socket.player_guid)
+        assert socket.character["power"] == 53
+
+        await socket._apply_spell_effects(
+            None, spells.get_spell_template(db, 447), socket.player_guid)
+        assert socket.character["reputation"][529] == 50
+
+        cast = types.SimpleNamespace(has_dest=True, x=7.0, y=8.0, z=0.0,
+                                     item_guid=0)
+        await socket._apply_spell_effects(
+            cast, spells.get_spell_template(db, 448), 0)
+        assert (socket.character["x"], socket.character["y"]) == (7.0, 8.0)
+
+        spawn = {"guid": 5000, "entry": 5000, "x": 10.0, "y": 0.0,
+                 "z": 0.0, "dead_since": 0, "npc_flags": 0,
+                 "unit_flags": 0, "min_level": 1, "max_level": 1,
+                 "current_health": 100, "max_health": 100,
+                 "combat_reach": 0.0, "bounding_radius": 0.5,
+                 "faction": 0, "name": "Dummy", "scale": 1.0}
+        socket._summoned_creatures = {5000: spawn}
+        socket._get_creature_spawn = lambda low: (
+            spawn if int(low) == 5000 else None)
+        guid = socket._creature_object_guid(5000, 5000)
+        await socket._apply_spell_effects(
+            None, spells.get_spell_template(db, 449), guid)
+        assert socket.character["x"] != 10.0
+        sent_before = len(_sent)
+        await socket._apply_spell_effects(
+            None, spells.get_spell_template(db, 450), guid)
+        assert len(_sent) > sent_before
+
+    asyncio.run(flow())
+
+
+def test_taunt_proc_damage_and_target_trigger_auras(tmp_path):
+    async def flow():
+        socket, db, _sent, _delivered = _socket(tmp_path)
+        spawn = {"guid": 5000, "entry": 5000, "x": 10.0, "y": 0.0,
+                 "z": 0.0, "dead_since": 0, "npc_flags": 0,
+                 "unit_flags": 0, "min_level": 1, "max_level": 1,
+                 "current_health": 100, "max_health": 100,
+                 "combat_reach": 0.0, "bounding_radius": 0.5,
+                 "faction": 0, "name": "Dummy", "scale": 1.0}
+        socket._summoned_creatures = {}
+        socket._get_creature_spawn = lambda low: (
+            spawn if int(low) == 5000 else None)
+        guid = socket._creature_object_guid(5000, 5000)
+
+        await socket._apply_spell_effects(
+            None, spells.get_spell_template(db, 454), guid)
+        state = socket._get_combat_state()["aggro"].get(5000)
+        assert state is not None
+        assert int(state["taunt_target"]) == int(socket.player_guid)
+        socket._fade_taunt_auras(5000, [
+            aura for aura in socket._get_combat_state()["creature_auras"][5000]
+            if int(aura["spell_id"]) == 454])
+        assert not int(state["taunt_target"])
+
+        await socket._apply_spell_effects(
+            None, spells.get_spell_template(db, 455), socket.player_guid)
+        damage = []
+
+        async def record_damage(target, amount, school, template, caster,
+                                **kwargs):
+            damage.append((int(target), int(amount)))
+        socket._deal_spell_damage = record_damage
+        await socket._proc_trigger_auras(1234)
+        assert damage and damage[0] == (1234, 6)
+
+        await socket._apply_spell_effects(
+            None, spells.get_spell_template(db, 459), socket.player_guid)
+        triggered = []
+
+        async def record_trigger(spell_id, target_guid):
+            triggered.append((int(spell_id), int(target_guid)))
+        socket._cast_triggered = record_trigger
+        await socket._apply_spell_effects(
+            None, spells.get_spell_template(db, 407), guid)
+        assert (200, int(guid)) in triggered
 
     asyncio.run(flow())
 

@@ -402,6 +402,9 @@ class CombatMixin:
         return result
 
     def _equipped_weapon_stats(self, slot: int, fallback: bool):
+        if int(slot) in (15, 16) and hasattr(self, "_player_aura_mods") \
+                and self._player_aura_mods().get("disarmed"):
+            return dict(self._BARE_HAND) if fallback else None
         cache = getattr(self, "_weapon_stats_cache", None)
         if cache is None:
             cache = {}

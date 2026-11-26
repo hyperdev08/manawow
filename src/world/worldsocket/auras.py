@@ -23,6 +23,7 @@ import struct
 import time
 
 from src.protocol.opcodes import Opcodes
+from src.world import creature
 from src.world import login_packets
 from src.world import object_update
 from src.world import spells
@@ -80,6 +81,18 @@ SUPPORTED_AURA_TYPES = frozenset((
     spells.SPELL_AURA_MOD_BASE_RESISTANCE_PCT,
     spells.SPELL_AURA_MOD_SHIELD_BLOCKVALUE,
     spells.SPELL_AURA_MOD_SKILL,
+    spells.SPELL_AURA_MOD_TAUNT,
+    spells.SPELL_AURA_MOD_STEALTH,
+    spells.SPELL_AURA_MOD_DETECT,
+    spells.SPELL_AURA_MOD_INVISIBILITY,
+    spells.SPELL_AURA_MOD_INVISIBILITY_DETECT,
+    spells.SPELL_AURA_PROC_TRIGGER_DAMAGE,
+    spells.SPELL_AURA_MOD_DISARM,
+    spells.SPELL_AURA_MOUNTED,
+    spells.SPELL_AURA_MOD_INCREASE_MOUNTED_SPEED,
+    spells.SPELL_AURA_MOD_INCREASE_MOUNTED_FLIGHT_SPEED,
+    spells.SPELL_AURA_ADD_TARGET_TRIGGER,
+    spells.SPELL_AURA_FORCE_REACTION,
     spells.SPELL_AURA_MOD_ATTACKSPEED,
     spells.SPELL_AURA_MOD_STUN,
     spells.SPELL_AURA_MOD_DAMAGE_DONE,
@@ -286,7 +299,10 @@ class AurasMixin:
                                  spells.SPELL_AURA_DAMAGE_SHIELD,
                                  spells.SPELL_AURA_REFLECT_SPELLS,
                                  spells.SPELL_AURA_MOD_REGEN,
-                                 spells.SPELL_AURA_MOD_POWER_REGEN) \
+                                 spells.SPELL_AURA_MOD_POWER_REGEN,
+                                 spells.SPELL_AURA_MOD_DISARM,
+                                 spells.SPELL_AURA_MOD_TAUNT,
+                                 spells.SPELL_AURA_MOUNTED) \
                     and amount == 0:
                 return None
         return {
@@ -463,6 +479,25 @@ class AurasMixin:
             entries.append(entry)
         self._normalise_aura_slots(entries)
 
+        if target_kind == "creature":
+            for component in components:
+                if component["type"] != spells.SPELL_AURA_MOD_TAUNT:
+                    continue
+                low = self._creature_low(target_guid)
+                if hasattr(self, "_aggro_creature"):
+                    self._aggro_creature(int(low))
+                manager = (self._creature_combat_manager()
+                           if hasattr(self, "_creature_combat_manager")
+                           else None)
+                duration = max(0.1, duration_ms / 1000.0)
+                if manager is not None:
+                    manager.taunt(int(low), int(caster_guid), duration)
+                else:
+                    state = self._get_combat_state()["aggro"].get(int(low))
+                    if state is not None:
+                        state["taunt_target"] = int(caster_guid)
+                        state["taunt_until"] = time.monotonic() + duration
+
         if target_kind == "player":
             await self._refresh_player_auras()
         else:
@@ -516,6 +551,7 @@ class AurasMixin:
             (UNIT_FLAG_CONFUSED, "confused"),
             (UNIT_FLAG_SILENCED, "silenced"),
             (UNIT_FLAG_PACIFIED, "pacified"),
+            (UNIT_FLAG_DISARMED, "disarmed"),
         ):
             if mods[key]:
                 flags |= bit
@@ -571,12 +607,32 @@ class AurasMixin:
             elif entries:
                 entries.clear()
                 await self._sync_creature_flags(low)
+            if removed:
+                self._fade_taunt_auras(low, removed)
             for aura in removed:
                 self._remove_dots_for_aura(
                     "creature", low, int(aura["spell_id"]))
                 await self._send_aura_update("creature", low, aura, remove=True)
         if changed:
             await self._refresh_player_auras()
+
+    def _fade_taunt_auras(self, low_guid: int, removed: list) -> None:
+        manager = (self._creature_combat_manager()
+                   if hasattr(self, "_creature_combat_manager") else None)
+        for aura in removed:
+            if not any(int(component.get("type") or 0) ==
+                       spells.SPELL_AURA_MOD_TAUNT
+                       for component in aura.get("components", ())):
+                continue
+            caster_guid = int(aura.get("caster_guid") or 0)
+            if manager is not None:
+                manager.taunt_fade(int(low_guid), caster_guid)
+            else:
+                state = self._get_combat_state()["aggro"].get(int(low_guid))
+                if state is not None and int(
+                        state.get("taunt_target") or 0) == caster_guid:
+                    state["taunt_target"] = 0
+                    state["taunt_until"] = 0.0
 
     def _remove_dots_for_aura(self, target_kind: str, target_guid: int,
                               spell_id: int) -> None:
@@ -684,6 +740,15 @@ class AurasMixin:
             },
             "block_value": 0,
             "skills": {},
+            "disarmed": False,
+            "mounted": 0,
+            "mounted_speed": 0.0,
+            "flight_speed": 0.0,
+            "stealth": 0,
+            "stealth_detect": 0,
+            "invisibility": {},
+            "invisibility_detect": {},
+            "force_reactions": {},
             "absorb": [],
             "school_immune": 0,
             "damage_immune": 0,
@@ -884,6 +949,27 @@ class AurasMixin:
                 elif aura_type == spells.SPELL_AURA_MOD_SKILL:
                     mods["skills"][misc] = (
                         mods["skills"].get(misc, 0) + amount)
+                elif aura_type == spells.SPELL_AURA_MOD_DISARM:
+                    mods["disarmed"] = True
+                elif aura_type == spells.SPELL_AURA_MOUNTED:
+                    mods["mounted"] = misc
+                elif aura_type == spells.SPELL_AURA_MOD_INCREASE_MOUNTED_SPEED:
+                    mods["mounted_speed"] += amount
+                elif aura_type == \
+                        spells.SPELL_AURA_MOD_INCREASE_MOUNTED_FLIGHT_SPEED:
+                    mods["flight_speed"] += amount
+                elif aura_type == spells.SPELL_AURA_MOD_STEALTH:
+                    mods["stealth"] += amount
+                elif aura_type == spells.SPELL_AURA_MOD_DETECT:
+                    mods["stealth_detect"] += amount
+                elif aura_type == spells.SPELL_AURA_MOD_INVISIBILITY:
+                    mods["invisibility"][misc] = max(
+                        mods["invisibility"].get(misc, 0), amount)
+                elif aura_type == spells.SPELL_AURA_MOD_INVISIBILITY_DETECT:
+                    mods["invisibility_detect"][misc] = max(
+                        mods["invisibility_detect"].get(misc, 0), amount)
+                elif aura_type == spells.SPELL_AURA_FORCE_REACTION:
+                    mods["force_reactions"][misc] = amount
                 elif aura_type == spells.SPELL_AURA_SCHOOL_ABSORB:
                     mods["absorb"].append(aura)
                 elif aura_type == spells.SPELL_AURA_SCHOOL_IMMUNITY:
@@ -918,17 +1004,59 @@ class AurasMixin:
         if not hasattr(self, "_cast_triggered"):
             return
         target = int(attacker_guid or self.player_guid or 0)
+        path = self.config.database.world_path
+        for aura in list(self._get_combat_state().get("auras", ())):
+            for component in aura.get("components", ()):
+                component_type = int(component.get("type") or 0)
+                if component_type == spells.SPELL_AURA_PROC_TRIGGER_SPELL:
+                    chance = int(component.get("amount") or 0)
+                    if chance <= 0 or random.uniform(0.0, 100.0) >= chance:
+                        continue
+                    triggered = int(component.get("trigger_spell") or 0)
+                    if triggered:
+                        await self._cast_triggered(triggered, target)
+                elif component_type == spells.SPELL_AURA_PROC_TRIGGER_DAMAGE:
+                    amount = int(component.get("amount") or 0)
+                    if amount <= 0:
+                        continue
+                    template = spells.get_spell_template(
+                        path, int(aura.get("spell_id") or 0))
+                    if template is not None and hasattr(
+                            self, "_deal_spell_damage"):
+                        await self._deal_spell_damage(
+                            target, amount, int(template.school) or 1,
+                            template, int(self.player_guid))
+
+    async def _do_target_trigger_auras(self, template,
+                                       target_guid: int) -> None:
+        """``SPELL_AURA_ADD_TARGET_TRIGGER`` on a spell hit."""
+        if not hasattr(self, "_cast_triggered"):
+            return
+        family = int(getattr(template, "spell_family", 0) or 0)
+        flags = tuple(getattr(template, "spell_family_flags", (0, 0, 0))
+                      or (0, 0, 0))
         for aura in list(self._get_combat_state().get("auras", ())):
             for component in aura.get("components", ()):
                 if int(component.get("type") or 0) != \
-                        spells.SPELL_AURA_PROC_TRIGGER_SPELL:
+                        spells.SPELL_AURA_ADD_TARGET_TRIGGER:
                     continue
+                component_family = int(component.get("family") or 0)
+                if component_family and family and \
+                        component_family != family:
+                    continue
+                mask = tuple(component.get("class_mask") or (0, 0, 0))
+                if any(mask):
+                    matched = any(
+                        int(mask[i]) & int(flags[i])
+                        for i in range(min(3, len(mask), len(flags))))
+                    if not matched:
+                        continue
                 chance = int(component.get("amount") or 0)
                 if chance <= 0 or random.uniform(0.0, 100.0) >= chance:
                     continue
                 triggered = int(component.get("trigger_spell") or 0)
                 if triggered:
-                    await self._cast_triggered(triggered, target)
+                    await self._cast_triggered(triggered, target_guid)
 
     def _creature_aura_mods(self, low_guid: int) -> dict:
         entries = self._get_combat_state().get(
@@ -1123,6 +1251,8 @@ class AurasMixin:
             flags |= UNIT_FLAG_SILENCED
         if mods["pacified"]:
             flags |= UNIT_FLAG_PACIFIED
+        if mods["disarmed"]:
+            flags |= UNIT_FLAG_DISARMED
         # Kept from the current flags: UNIT_FLAG_LOOTING and the taxi-flight
         # flags (REMOVE_CLIENT_CONTROL | TAXI_FLIGHT | MOUNT), which auras do
         # not own.
@@ -1143,13 +1273,52 @@ class AurasMixin:
             )
         state["stunned"] = bool(mods["stunned"])
 
-        speed = round(PLAYER_RUN_SPEED * mods["speed_mult"], 3)
+        mount_display = 0
+        if mods["mounted"]:
+            template = creature.get_creature_template(
+                self.config.database.world_path, int(mods["mounted"]))
+            if template is not None:
+                for column in ("display_id", "display_id1"):
+                    if column in template.keys():
+                        mount_display = int(template[column] or 0)
+                        if mount_display:
+                            break
+        if mount_display != int(state.get("mount_display", 0) or 0):
+            state["mount_display"] = mount_display
+            await self._send_player_fields({
+                F.UNIT_FIELD_MOUNTDISPLAYID: mount_display})
+
+        speed_mult = float(mods["speed_mult"])
+        if mods["mounted"]:
+            speed_mult *= 1.0 + float(mods["mounted_speed"]) / 100.0
+        speed = round(PLAYER_RUN_SPEED * speed_mult, 3)
         if abs(speed - float(state.get("speed", PLAYER_RUN_SPEED))) > 0.01:
             state["speed"] = speed
             await self.send_packet(
                 Opcodes.SMSG_FORCE_RUN_SPEED_CHANGE,
                 login_packets.build_force_run_speed(self.player_guid, speed),
             )
+
+        flight_speed = round(
+            7.0 * (1.0 + float(mods["flight_speed"]) / 100.0), 3)
+        if abs(flight_speed - float(state.get("flight_speed", 7.0))) > 0.01:
+            state["flight_speed"] = flight_speed
+            await self.send_packet(
+                Opcodes.SMSG_FORCE_FLIGHT_SPEED_CHANGE,
+                spells.pack_guid(int(self.player_guid))
+                + struct.pack("<If", 0, flight_speed),
+            )
+
+        forced = sorted(
+            (int(faction), int(rank))
+            for faction, rank in (mods["force_reactions"] or {}).items())
+        if forced != state.get("forced_reactions", []):
+            state["forced_reactions"] = forced
+            payload = struct.pack("<I", len(forced))
+            for faction, rank in forced:
+                payload += struct.pack("<Ii", faction, rank)
+            await self.send_packet(
+                Opcodes.SMSG_SET_FORCED_REACTIONS, payload)
 
     def _aura_packet_flags(self, entry: dict, target_guid: int) -> int:
         flags = 0

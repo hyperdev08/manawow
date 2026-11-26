@@ -969,6 +969,8 @@ class SpellsMixin:
                 spells.SPELL_EFFECT_DISPEL,
                 spells.SPELL_EFFECT_STEAL_BENEFICIAL,
                 spells.SPELL_EFFECT_POWER_BURN,
+                spells.SPELL_EFFECT_POWER_DRAIN,
+                spells.SPELL_EFFECT_PULL_TOWARDS,
                 spells.SPELL_EFFECT_CHARGE):
             return True
         aura = int(effect.get("apply_aura") or 0)
@@ -1518,6 +1520,8 @@ class SpellsMixin:
             low = creature.creature_low_guid(target_guid)
             if hasattr(self, "_sync_creature_flags"):
                 await self._sync_creature_flags(low)
+            if removed and hasattr(self, "_fade_taunt_auras"):
+                self._fade_taunt_auras(low, removed)
 
     async def _send_dispel_log(self, target_guid: int, removed: list) -> None:
         payload = bytearray()
@@ -1691,6 +1695,12 @@ class SpellsMixin:
             etype = int(effect["effect"])
             if not etype:
                 continue
+            if etype == spells.SPELL_EFFECT_LEAP:
+                if cast is not None and getattr(cast, "has_dest", False):
+                    await self._teleport_nearby(
+                        float(cast.x), float(cast.y), float(cast.z),
+                        float(self.character.get("o", 0.0) or 0.0))
+                continue
             if etype in (spells.SPELL_EFFECT_TELEPORT_UNITS,
                          spells.SPELL_EFFECT_TELEPORT_UNITS_FACE_CASTER,
                          spells.SPELL_EFFECT_TELEPORT_UNITS_SET_FACING):
@@ -1719,6 +1729,14 @@ class SpellsMixin:
             if etype == spells.SPELL_EFFECT_CHARGE:
                 if target_guid:
                     await self._charge_target(target_guid)
+                continue
+            if etype == spells.SPELL_EFFECT_JUMP:
+                if target_guid:
+                    await self._jump_to_target(target_guid)
+                elif cast is not None and getattr(cast, "has_dest", False):
+                    await self._teleport_nearby(
+                        float(cast.x), float(cast.y), float(cast.z),
+                        float(self.character.get("o", 0.0) or 0.0))
                 continue
             if etype == spells.SPELL_EFFECT_SPAWN:
                 # ``SPELL_EFFECT_SPAWN`` is client-side only (TrinityCore
@@ -1877,6 +1895,36 @@ class SpellsMixin:
                 await self._send_spell_heal_log(
                     player_guid, player_guid, template.id, healed, 0
                 )
+            elif etype == spells.SPELL_EFFECT_POWER_DRAIN:
+                if target_guid:
+                    await self._drain_target_power(
+                        target_guid, template, index, effect, caster_level,
+                        combo_points)
+            elif etype == spells.SPELL_EFFECT_ENERGIZE_PCT:
+                target = int(target_guid or self.player_guid)
+                power_type = int(effect.get("misc_value") or 0)
+                maximum = 0
+                kind = self._spell_target_kind(target)
+                if kind == "player" and int(self._power_type()) == power_type:
+                    maximum = int(self._max_power())
+                elif kind == "peer":
+                    peer = self._peer_session_for_guid(target)
+                    if peer is not None and \
+                            int(peer._power_type()) == power_type:
+                        maximum = int(peer._max_power())
+                elif kind == "creature":
+                    low = creature.creature_low_guid(target)
+                    _ai, _current, maximum, creature_type = \
+                        self._creature_power_state(low)
+                    if creature_type != power_type:
+                        maximum = 0
+                if maximum <= 0:
+                    continue
+                percent = max(0, self._spell_effect_value(
+                    template, index, effect, caster_level, combo_points))
+                await self._give_target_power(
+                    target, power_type, int(maximum * percent / 100.0),
+                    template)
             elif etype == spells.SPELL_EFFECT_HEAL_PCT:
                 target = int(target_guid or self.player_guid)
                 maximum = self._target_max_health(target)
@@ -1966,6 +2014,9 @@ class SpellsMixin:
                         target_guid, int(template.effect_value(
                             index, caster_level) or 20),
                         template.school or 1)
+            elif etype == spells.SPELL_EFFECT_PULL_TOWARDS:
+                if target_guid:
+                    await self._pull_target_to_caster(target_guid)
             elif etype == spells.SPELL_EFFECT_INTERRUPT_CAST:
                 if target_guid:
                     await self._interrupt_target_cast(
@@ -2065,6 +2116,20 @@ class SpellsMixin:
                 quest_id = int(effect.get("misc_value") or 0)
                 if quest_id and hasattr(self, "_spell_complete_quest"):
                     await self._spell_complete_quest(quest_id)
+            elif etype == spells.SPELL_EFFECT_REPUTATION:
+                faction = int(effect.get("misc_value") or 0)
+                amount = self._spell_effect_value(
+                    template, index, effect, caster_level, combo_points)
+                if faction and amount:
+                    target = int(target_guid or self.player_guid)
+                    kind = self._spell_target_kind(target)
+                    if kind == "peer":
+                        peer = self._peer_session_for_guid(target)
+                        if peer is not None and hasattr(
+                                peer, "_modify_reputation"):
+                            peer._modify_reputation(faction, amount)
+                    elif kind == "player":
+                        self._modify_reputation(faction, amount)
             elif etype == spells.SPELL_EFFECT_SEND_EVENT:
                 event_id = int(effect.get("misc_value") or 0)
                 if event_id:
@@ -2199,6 +2264,9 @@ class SpellsMixin:
                         await self._apply_aura_from_effect(
                             template, effect, index, player_guid, aura_target,
                             caster_level, combo_points, target_kind=target_kind)
+        if target_guid and int(target_guid) != player_guid \
+                and hasattr(self, "_do_target_trigger_auras"):
+            await self._do_target_trigger_auras(template, int(target_guid))
         if crafted and hasattr(self, "_advance_craft_skill"):
             await self._advance_craft_skill(template)
         # Poison/item procs are checked once per weapon ability, not once per
@@ -2445,6 +2513,134 @@ class SpellsMixin:
             multiplier = 1.0
         return int(burn * multiplier)
 
+    async def _drain_target_power(self, target_guid: int, template,
+                                  index: int, effect: dict,
+                                  caster_level: int,
+                                  combo_points: int) -> int:
+        """``SPELL_EFFECT_POWER_DRAIN``: remove power and return its amount."""
+        power_type = int(effect.get("misc_value") or 0)
+        kind = self._spell_target_kind(target_guid)
+        if kind in ("player", "peer"):
+            owner = self if kind == "player" else \
+                self._peer_session_for_guid(target_guid)
+            if owner is None or not owner.character:
+                return 0
+            if int(owner._power_type()) != power_type:
+                return 0
+            current = int(owner.character.get("power", 0))
+        else:
+            low = creature.creature_low_guid(int(target_guid))
+            ai, current, _maximum, creature_type = self._creature_power_state(
+                low)
+            if ai is None or creature_type != power_type:
+                return 0
+        drain = max(0, int(self._spell_effect_value(
+            template, index, effect, caster_level, combo_points)))
+        drain += max(0, self._spell_power_bonus(effect))
+        drained = min(current, drain)
+        if drained <= 0:
+            return 0
+        if kind == "player":
+            await self._set_player_power(current - drained)
+        elif kind == "peer":
+            await self._peer_session_for_guid(target_guid)._set_player_power(
+                current - drained)
+        else:
+            ai["mana"] = current - drained
+            self._set_creature_power(low, ai["mana"])
+            await self._send_creature_power(low, ai)
+        gain = int(drained * float(effect.get("multiple_value") or 0.0))
+        if (gain > 0 and int(target_guid) != int(self.player_guid or 0)
+                and int(self._power_type()) == power_type):
+            current = int(self.character.get("power", 0))
+            await self._set_player_power(min(self._max_power(),
+                                             current + gain))
+            await self._send_spell_energize_log(
+                self.player_guid, self.player_guid, template.id, power_type,
+                gain)
+        return drained
+
+    async def _give_target_power(self, target_guid: int, power_type: int,
+                                 amount: int, template) -> None:
+        """Add ``amount`` of one power type to a player, peer or creature."""
+        if amount <= 0:
+            return
+        kind = self._spell_target_kind(target_guid)
+        if kind == "player":
+            if int(self._power_type()) != int(power_type):
+                return
+            current = int(self.character.get("power", 0))
+            await self._set_player_power(min(self._max_power(),
+                                             current + amount))
+        elif kind == "peer":
+            peer = self._peer_session_for_guid(target_guid)
+            if peer is None or int(peer._power_type()) != int(power_type):
+                return
+            await peer._set_player_power(min(
+                peer._max_power(),
+                int(peer.character.get("power", 0)) + amount))
+        else:
+            low = creature.creature_low_guid(int(target_guid))
+            ai, current, maximum, creature_type = self._creature_power_state(
+                low)
+            if ai is None or creature_type != int(power_type):
+                return
+            ai["mana"] = min(maximum, current + amount)
+            self._set_creature_power(low, ai["mana"])
+            await self._send_creature_power(low, ai)
+        await self._send_spell_energize_log(
+            target_guid, self.player_guid, template.id, power_type, amount)
+
+    async def _pull_target_to_caster(self, target_guid: int) -> None:
+        """``SPELL_EFFECT_PULL_TOWARDS``: drag a target in front of the caster."""
+        kind = self._spell_target_kind(target_guid)
+        if kind == "creature":
+            low = creature.creature_low_guid(int(target_guid))
+            spawn = self._get_creature_spawn(low)
+            if spawn is None:
+                return
+            pos = self._creature_position(low)
+        elif kind == "peer":
+            peer = self._peer_session_for_guid(target_guid)
+            if peer is None or not peer.character:
+                return
+            pos = (float(peer.character.get("x", 0.0) or 0.0),
+                   float(peer.character.get("y", 0.0) or 0.0),
+                   float(peer.character.get("z", 0.0) or 0.0))
+        else:
+            return
+        caster = self._player_position()
+        dx = pos[0] - caster[0]
+        dy = pos[1] - caster[1]
+        length = max(0.001, (dx * dx + dy * dy) ** 0.5)
+        dest = (caster[0] + dx / length * 3.0,
+                caster[1] + dy / length * 3.0, caster[2])
+        facing = math.atan2(pos[1] - dest[1], pos[0] - dest[0])
+        if kind == "peer":
+            await self._peer_session_for_guid(target_guid)._teleport_nearby(
+                dest[0], dest[1], dest[2], facing)
+            return
+        state = self._get_combat_state().get("aggro", {}).get(low)
+        if state is not None:
+            state["pos"] = dest
+            state["chase_until"] = time.monotonic() + 0.25
+        await self.send_packet(
+            Opcodes.SMSG_MONSTER_MOVE,
+            object_update.build_monster_move(
+                self._creature_object_guid(low, int(spawn["entry"])),
+                pos[0], pos[1], pos[2],
+                math.atan2(dest[1] - pos[1], dest[0] - pos[0]),
+                dest[0], dest[1], dest[2], duration_ms=200,
+                move_id=self._next_move_id()),
+        )
+
+    def _modify_reputation(self, faction: int, amount: int) -> None:
+        if not self.character:
+            return
+        reputation = self.character.setdefault("reputation", {})
+        reputation[int(faction)] = int(
+            reputation.get(int(faction), 0) or 0) + int(amount)
+
     async def _heal_unit(self, target_guid: int, amount: int, template,
                          critical: bool = False) -> None:
         """Heal a player, peer or creature target and send the heal log."""
@@ -2489,6 +2685,14 @@ class SpellsMixin:
 
     async def _charge_target(self, target_guid: int) -> None:
         """``SPELL_EFFECT_CHARGE``: move next to the target and attack it."""
+        await self._move_next_to_target(target_guid, attack=True)
+
+    async def _jump_to_target(self, target_guid: int) -> None:
+        """``SPELL_EFFECT_JUMP``: jump next to the target without attacking."""
+        await self._move_next_to_target(target_guid, attack=False)
+
+    async def _move_next_to_target(self, target_guid: int,
+                                   attack: bool) -> None:
         kind = self._spell_target_kind(target_guid)
         if kind == "peer":
             peer = (self._peer_session_for_guid(target_guid)
@@ -2517,7 +2721,7 @@ class SpellsMixin:
         y = target[1] + dy / length * stop
         facing = math.atan2(target[1] - y, target[0] - x)
         await self._teleport_nearby(x, y, target[2], facing)
-        if kind == "creature":
+        if attack and kind == "creature":
             # ``EffectCharge`` attacks once the movement phase completes.
             await self.handle_attack_swing(struct.pack("<Q", int(target_guid)))
 

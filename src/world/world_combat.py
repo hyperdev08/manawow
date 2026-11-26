@@ -270,6 +270,16 @@ class WorldCombatManager:
         state["taunt_until"] = time.monotonic() + max(0.0, float(duration))
         self.select_target(state)
 
+    def taunt_fade(self, low_guid: int, player_guid: int) -> None:
+        """End a forced target when its taunt aura is removed early."""
+        state = self._states.get(int(low_guid))
+        if state is None:
+            return
+        if int(state.get("taunt_target") or 0) == int(player_guid or 0):
+            state["taunt_target"] = 0
+            state["taunt_until"] = 0.0
+            self.select_target(state)
+
     def select_target(self, state: dict, now: Optional[float] = None) -> int:
         """Pick the highest-threat living player, respecting an active taunt."""
         now = time.monotonic() if now is None else float(now)
