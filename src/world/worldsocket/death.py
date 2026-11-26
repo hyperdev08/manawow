@@ -565,7 +565,13 @@ class DeathMixin:
                 int(self.player_guid), level, target_kind="player",
                 duration_ms=duration_ms)
 
-    async def _apply_durability_loss(self) -> None:
+    async def _apply_durability_loss(self,
+                                     percent: float = 0.25) -> None:
+        """Lose ``percent`` durability on every equipped item.
+
+        TrinityCore passes ``0.10`` on death (``Unit::Kill``) and ``0.25``
+        for spirit-healer resurrection.
+        """
         inventory = self.character.get("inventory") or {}
         rows = []
         changed = []
@@ -576,7 +582,7 @@ class DeathMixin:
             if max_dur <= 0:
                 continue
             current = int(item.get("durability") or 0)
-            loss = max(1, int(max_dur * 0.25))
+            loss = max(1, int(max_dur * float(percent)))
             new_value = max(0, current - loss)
             if new_value == current:
                 continue

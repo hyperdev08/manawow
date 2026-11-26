@@ -923,6 +923,13 @@ class StatsMixin:
             await self.dismiss_all_summons()
 
         combat["ghost"] = False
+        # ``Unit::Kill`` removes 10% durability from every equipped item and
+        # tells the client with ``SMSG_DURABILITY_DAMAGE_DEATH``.  Spirit-
+        # healer resurrection adds its separate 25% loss later.
+        if hasattr(self, "_apply_durability_loss"):
+            await self._apply_durability_loss(0.10)
+            await self.send_packet(
+                Opcodes.SMSG_DURABILITY_DAMAGE_DEATH, b"")
         # Persist the corpse, record death state and show the closest
         # graveyard's release marker.
         if hasattr(self, "_record_death"):

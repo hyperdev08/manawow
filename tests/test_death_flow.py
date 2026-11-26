@@ -8,6 +8,7 @@ import time
 from src.common.config import AuthConfig, Config, DBConfig, LogConfig, WorldConfig
 from src.protocol.opcodes import Opcodes
 from src.world import character_db, graveyard
+from src.world import update_fields as F
 from src.world.realmsocket import WorldSocket
 
 
@@ -94,6 +95,55 @@ def test_death_release_and_reclaim(tmp_path):
         assert socket._get_combat_state()["ghost"] is False
         assert int(socket.character["health"]) >= 1
         assert character_db.get_character_corpse(db, guid) is None
+        assert writer.writes
+
+    asyncio.run(flow())
+
+
+def test_death_degrades_equipped_item_durability(tmp_path):
+    cfg, guid = _make_world(tmp_path)
+    db = cfg.database.world_path
+    con = sqlite3.connect(db)
+    try:
+        con.execute(
+            "INSERT INTO item_templates(entry, name1, stackable,"
+            " max_durability, display_id, quality, inventory_type)"
+            " VALUES(6000, 'Test Sword', 1, 100, 100, 2, 21)")
+        con.execute(
+            "INSERT INTO character_items(character_guid, item_entry, slot,"
+            " stack_count, durability, max_durability)"
+            " VALUES(?, 6000, 15, 1, 100, 100)", (guid,))
+        con.commit()
+    finally:
+        con.close()
+
+    async def flow():
+        writer = FakeWriter()
+        socket = WorldSocket(asyncio.StreamReader(), writer, cfg)
+        socket.in_world = True
+        socket.player_guid = guid
+        socket.character = dict(character_db.get_character(db, 1, guid))
+        socket.character["health"] = 0
+        socket.character["inventory"] = {
+            int(slot): {
+                **dict(item),
+                "guid": F.ITEM_HIGH_GUID | int(item["id"]),
+            }
+            for slot, item in character_db.get_character_inventory(
+                db, guid).items()
+        }
+        await socket._on_player_killed("test")
+
+        assert socket.character["inventory"][15]["durability"] == 90
+        con = sqlite3.connect(db)
+        try:
+            durability = con.execute(
+                "SELECT durability FROM character_items"
+                " WHERE character_guid = ? AND slot = 15",
+                (guid,)).fetchone()[0]
+        finally:
+            con.close()
+        assert durability == 90
         assert writer.writes
 
     asyncio.run(flow())

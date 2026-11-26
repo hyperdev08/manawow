@@ -131,7 +131,7 @@ A real 3.3.5a client can now log in, pick a character and **enter the world**:
 - Limitations: round-robin looter rotation, disenchant rolls and LFG are not implemented
 
 ### Death, ghosts, corpses and spirit healers
-- On death the server stores a corpse at the death position, records `death_state` (`1` dead, `2` ghost) and sends `SMSG_DEATH_RELEASE_LOC` with the nearest usable graveyard.
+- On death the server stores a corpse at the death position, removes 10% durability from every equipped item (persisted and sent to the client with `SMSG_DURABILITY_DAMAGE_DEATH`), records `death_state` (`1` dead, `2` ghost) and sends `SMSG_DEATH_RELEASE_LOC` with the nearest usable graveyard.
 - Graveyards come from the CMaNGOS `world_safe_locs` and `game_graveyard_zone` tables, imported by `tools/import_wotlk_db.py` (including `--graveyards-only`). Selection mirrors `Player::GetClosestGraveYard`: zone + team first, then neutral zone links, then the nearest same-map graveyard.
 - `CMSG_REPOP_REQUEST` teleports the player to that graveyard as a ghost: `PLAYER_FLAGS_GHOST`, one health point, `SMSG_PRE_RESURRECT`, `SMSG_CORPSE_RECLAIM_DELAY` and the usual worldport handshake. The ghost can walk around but cannot fight, loot or cast.
 - `CMSG_RECLAIM_CORPSE` resurrects at the corpse (same map within 39 yards, or at the instance entrance graveyard for a cross-map corpse) after the 30-second reclaim delay, at 50% health/mana. `CMSG_SPIRIT_HEALER_ACTIVATE` (or the spirit healer gossip option) resurrects at the graveyard with 50% health/mana, 25% durability loss and Resurrection Sickness (no sickness below level 11, one minute per level from 11–19, ten minutes from 20).
