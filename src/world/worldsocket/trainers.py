@@ -39,6 +39,22 @@ class TrainersMixin:
     def _player_skills(self) -> dict:
         return self.character.get("skills", {}) if self.character else {}
 
+    def _effective_skills(self) -> dict:
+        """Skills with ``SPELL_AURA_MOD_SKILL`` bonuses applied (read-only)."""
+        skills = self._player_skills()
+        if not skills or not hasattr(self, "_player_aura_mods"):
+            return skills
+        bonuses = self._player_aura_mods().get("skills") or {}
+        if not bonuses:
+            return skills
+        result = {sid: dict(entry) for sid, entry in skills.items()}
+        for skill_id, delta in bonuses.items():
+            entry = result.get(int(skill_id))
+            if entry is not None:
+                entry["value"] = max(
+                    0, int(entry.get("value", 0) or 0) + int(delta))
+        return result
+
     def _can_use_trainer(self, spawn) -> bool:
         if not self.character:
             return False
@@ -50,7 +66,7 @@ class TrainersMixin:
         path = self.config.database.world_path
         payload, count = trainer.build_trainer_list(
             path, guid, spawn, self.character, self._known_spells(),
-            self._player_skills())
+            self._effective_skills())
         if not count:
             self.log.debug(
                 f"Trainer '{spawn['name']}' ({guid}) has no spells for "
@@ -249,7 +265,8 @@ class TrainersMixin:
             return
         known = self._known_spells()
         state = trainer.spell_state(
-            path, trainer_spell, self.character, known, self._player_skills())
+            path, trainer_spell, self.character, known,
+            self._effective_skills())
         if state != trainer.TRAINER_SPELL_GREEN:
             await fail(trainer.TRAINER_FAIL_UNAVAILABLE)
             return

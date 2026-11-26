@@ -1720,12 +1720,24 @@ class SpellsMixin:
                 if target_guid:
                     await self._charge_target(target_guid)
                 continue
+            if etype == spells.SPELL_EFFECT_SPAWN:
+                # ``SPELL_EFFECT_SPAWN`` is client-side only (TrinityCore
+                # handles it with ``EffectUnused``); nothing to do server-side.
+                continue
             if etype == spells.SPELL_EFFECT_OPEN_LOCK:
                 if target_guid and gameobject.is_gameobject_guid(target_guid):
                     await self._open_lock(target_guid, int(template.id))
                 continue
             if target_guid and gameobject.is_gameobject_guid(target_guid):
-                continue                    # no other effect acts on objects yet
+                if etype == spells.SPELL_EFFECT_ACTIVATE_OBJECT:
+                    await self._spell_activate_gameobject(
+                        target_guid, int(effect.get("misc_value") or 0))
+                elif etype == spells.SPELL_EFFECT_GAMEOBJECT_DAMAGE:
+                    amount = self._spell_effect_value(
+                        template, index, effect, caster_level, combo_points)
+                    await self._spell_damage_gameobject(
+                        target_guid, amount, template)
+                continue
             # Persistent ground auras (Blizzard, Consecration, Death and Decay,
             # ...) are created once per cast; their companion
             # PERIODIC_TRIGGER_SPELL effect supplies the tick damage.
@@ -2109,6 +2121,21 @@ class SpellsMixin:
                 if triggered:
                     await self._cast_triggered(
                         triggered, target_guid or self.player_guid)
+            elif etype == spells.SPELL_EFFECT_TRANSMITTED_OBJECT:
+                entry = int(effect.get("misc_value") or 0)
+                if entry and hasattr(self, "_summon_gameobject"):
+                    duration = spells.summon_duration_ms(
+                        self.config.database.world_path,
+                        template.duration_index, caster_level)
+                    if cast is not None and getattr(cast, "has_dest", False):
+                        x, y, z = (float(cast.x), float(cast.y),
+                                   float(cast.z))
+                    else:
+                        x, y, z = self._player_position()
+                    await self._summon_gameobject(
+                        entry, x, y, z,
+                        float(self.character.get("o", 0.0) or 0.0),
+                        duration)
             elif etype in (spells.SPELL_EFFECT_SUMMON_OBJECT_WILD,
                            spells.SPELL_EFFECT_SUMMON_OBJECT_SLOT1,
                            spells.SPELL_EFFECT_SUMMON_OBJECT_SLOT2,

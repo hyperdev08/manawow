@@ -86,6 +86,7 @@ GAMEOBJECT_TYPE_MO_TRANSPORT = 15
 GAMEOBJECT_TYPE_DUEL_ARBITER = 16
 GAMEOBJECT_TYPE_FLAGSTAND = 24
 GAMEOBJECT_TYPE_FLAGDROP = 26
+GAMEOBJECT_TYPE_DESTRUCTIBLE_BUILDING = 33
 
 # Elevators and boats move on a client-side path driven by
 # ``UPDATEFLAG_TRANSPORT`` and the server's transport clock; drawn as static
@@ -946,7 +947,36 @@ class GameObjectRuntime:
         self.loot: Dict[int, dict] = {}             # guid -> {"items": [...], "money": int}
         self.restock: Dict[int, float] = {}         # guid -> loot regenerates at
         self.looter: Dict[int, int] = {}            # guid -> player guid
+        self.health: Dict[int, int] = {}            # destructible building health
         self.pools: Optional[GameObjectPools] = None  # loaded on first use
+
+    # -- destructible buildings ---------------------------------------
+    @staticmethod
+    def max_health(spawn) -> int:
+        """Health of a destructible building (``intact + damaged`` hits)."""
+        if int(spawn["type"] if "type" in spawn.keys() else 0) != \
+                GAMEOBJECT_TYPE_DESTRUCTIBLE_BUILDING:
+            return 0
+        intact = int(spawn["data0"] or 0) if "data0" in spawn.keys() else 0
+        damaged = int(spawn["data1"] or 0) if "data1" in spawn.keys() else 0
+        return max(0, intact + damaged)
+
+    def current_health(self, guid: int, spawn) -> int:
+        maximum = self.max_health(spawn)
+        return int(self.health.get(int(guid), maximum))
+
+    def modify_health(self, guid: int, spawn, delta: int) -> int:
+        """Apply ``delta`` to a building and return the new health.
+
+        Non-destructible objects return ``0`` so callers can leave them alone.
+        """
+        maximum = self.max_health(spawn)
+        if maximum <= 0:
+            return 0
+        current = int(self.health.get(int(guid), maximum))
+        current = max(0, min(maximum, current + int(delta)))
+        self.health[int(guid)] = current
+        return current
 
     # -- spawn ---------------------------------------------------------
     def is_spawned(self, guid: int, now: Optional[float] = None) -> bool:
@@ -970,6 +1000,7 @@ class GameObjectRuntime:
         self.loot.pop(guid, None)
         self.restock.pop(guid, None)
         self.looter.pop(guid, None)
+        self.health.pop(guid, None)
 
     # -- state ---------------------------------------------------------
     def state(self, guid: int) -> Optional[int]:
@@ -1014,4 +1045,5 @@ class GameObjectRuntime:
         self.states.clear()
         self.loot.clear()
         self.restock.clear()
+        self.health.clear()
         self.looter.clear()

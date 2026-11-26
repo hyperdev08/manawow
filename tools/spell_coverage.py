@@ -46,6 +46,10 @@ SUPPORTED_EFFECTS = frozenset((
     spells.SPELL_EFFECT_APPLY_AREA_AURA_FRIEND,
     spells.SPELL_EFFECT_APPLY_AREA_AURA_ENEMY,
     spells.SPELL_EFFECT_JUMP_DEST,
+    spells.SPELL_EFFECT_SPAWN,
+    spells.SPELL_EFFECT_TRANSMITTED_OBJECT,
+    spells.SPELL_EFFECT_ACTIVATE_OBJECT,
+    spells.SPELL_EFFECT_GAMEOBJECT_DAMAGE,
     spells.SPELL_EFFECT_POWER_BURN,
     spells.SPELL_EFFECT_CHARGE,
     spells.SPELL_EFFECT_INEBRIATE,
@@ -112,7 +116,8 @@ EFFECT_NAMES = {
     65: "Area aura raid", 67: "Heal max health", 68: "Interrupt cast",
     74: "Apply glyph", 75: "Heal mechanical", 76: "Summon object",
     77: "Script effect", 78: "Attack", 80: "Add combo points",
-    86: "Activate object", 90: "Kill credit", 96: "Charge",
+    86: "Activate object", 87: "Gameobject damage", 90: "Kill credit",
+    96: "Charge",
     98: "Knock back", 100: "Inebriate", 104: "Summon object slot 1",
     105: "Summon object slot 2", 106: "Summon object slot 3",
     107: "Summon object slot 4", 108: "Dispel mechanic",
@@ -176,9 +181,20 @@ def audit(path: str) -> dict:
                 aura = int(row[f"effect_apply_aura_name{index}"] or 0)
                 aura_types[aura] += 1
                 aura_examples.setdefault(aura, (spell_id, name))
-                if aura not in SUPPORTED_AURA_TYPES:
-                    spell_unsupported = True
-                    reasons[f"aura {aura}"] += 1
+                if aura in SUPPORTED_AURA_TYPES:
+                    continue
+                # Drink spells carry the real regeneration value on a
+                # PERIODIC_DUMMY effect and copy it into the MOD_REGEN /
+                # MOD_POWER_REGEN aura; other periodic-dummy spells are
+                # script markers and stay unsupported.
+                if aura == spells.SPELL_AURA_PERIODIC_DUMMY and any(
+                        int(row[f"effect_apply_aura_name{i}"] or 0) in (
+                            spells.SPELL_AURA_MOD_REGEN,
+                            spells.SPELL_AURA_MOD_POWER_REGEN)
+                        for i in (1, 2, 3)):
+                    continue
+                spell_unsupported = True
+                reasons[f"aura {aura}"] += 1
         if spell_unsupported:
             unsupported_spells += 1
         else:

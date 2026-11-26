@@ -76,6 +76,10 @@ SUPPORTED_AURA_TYPES = frozenset((
     spells.SPELL_AURA_MOD_POWER_REGEN,
     spells.SPELL_AURA_PERIODIC_DAMAGE_PERCENT,
     spells.SPELL_AURA_MOD_HEALTH_REGEN_IN_COMBAT,
+    spells.SPELL_AURA_MOD_SCALE,
+    spells.SPELL_AURA_MOD_BASE_RESISTANCE_PCT,
+    spells.SPELL_AURA_MOD_SHIELD_BLOCKVALUE,
+    spells.SPELL_AURA_MOD_SKILL,
     spells.SPELL_AURA_MOD_ATTACKSPEED,
     spells.SPELL_AURA_MOD_STUN,
     spells.SPELL_AURA_MOD_DAMAGE_DONE,
@@ -280,7 +284,9 @@ class AurasMixin:
                                  spells.SPELL_AURA_MOD_DAMAGE_PERCENT_DONE,
                                  spells.SPELL_AURA_MOD_DAMAGE_PERCENT_TAKEN,
                                  spells.SPELL_AURA_DAMAGE_SHIELD,
-                                 spells.SPELL_AURA_REFLECT_SPELLS) \
+                                 spells.SPELL_AURA_REFLECT_SPELLS,
+                                 spells.SPELL_AURA_MOD_REGEN,
+                                 spells.SPELL_AURA_MOD_POWER_REGEN) \
                     and amount == 0:
                 return None
         return {
@@ -316,6 +322,24 @@ class AurasMixin:
                 template, other, index, caster_level, combo_points)
             if component is not None:
                 components.append(component)
+        # Drink spells keep the real value on ``PERIODIC_DUMMY`` and a zero
+        # ``MOD_POWER_REGEN`` aura.  TrinityCore copies the dummy amount into
+        # the regen aura when the aura is applied.
+        dummy_amount = 0
+        for index, other in enumerate(template.effects):
+            if int(other.get("apply_aura") or 0) != \
+                    spells.SPELL_AURA_PERIODIC_DUMMY:
+                continue
+            dummy_amount = max(
+                dummy_amount,
+                int(template.effect_value(
+                    index, caster_level, combo_points)))
+        if dummy_amount > 0:
+            for component in components:
+                if component["type"] in (spells.SPELL_AURA_MOD_REGEN,
+                                         spells.SPELL_AURA_MOD_POWER_REGEN) \
+                        and int(component["amount"]) == 0:
+                    component["amount"] = dummy_amount
         return components
 
     # ------------------------------------------------------------------
@@ -497,8 +521,19 @@ class AurasMixin:
                 flags |= bit
             else:
                 flags &= ~bit
+        base_scale = 1.0
+        if "scale" in spawn.keys():
+            try:
+                base_scale = float(spawn["scale"] or 1.0)
+            except (TypeError, ValueError):
+                base_scale = 1.0
         await self._send_creature_fields(
-            int(low_guid), {F.UNIT_FIELD_FLAGS: flags})
+            int(low_guid), {
+                F.UNIT_FIELD_FLAGS: flags,
+                F.OBJECT_FIELD_SCALE_X: object_update.float_bits(
+                    max(0.01, base_scale * float(
+                        mods.get("scale_mult", 1.0) or 1.0))),
+            })
 
     async def _tick_auras(self, now: float) -> None:
         """Expire player and creature auras and tell the client about it."""
@@ -641,6 +676,14 @@ class AurasMixin:
             "health_regen": 0.0,
             "health_regen_combat": 0.0,
             "power_regen": {},
+            "scale_mult": 1.0,
+            "base_resistances_pct": {
+                "armor": 0.0,
+                **{school: 0.0 for _bit, school in
+                   spells.RESISTANCE_AURA_SCHOOLS},
+            },
+            "block_value": 0,
+            "skills": {},
             "absorb": [],
             "school_immune": 0,
             "damage_immune": 0,
@@ -827,6 +870,20 @@ class AurasMixin:
                 elif aura_type == spells.SPELL_AURA_MOD_POWER_REGEN:
                     mods["power_regen"][misc] = (
                         mods["power_regen"].get(misc, 0) + amount)
+                elif aura_type == spells.SPELL_AURA_MOD_SCALE:
+                    mods["scale_mult"] *= max(
+                        0.01, 1.0 + float(amount) / 100.0)
+                elif aura_type == spells.SPELL_AURA_MOD_BASE_RESISTANCE_PCT:
+                    if misc & 1:
+                        mods["base_resistances_pct"]["armor"] += amount
+                    for bit, school in spells.RESISTANCE_AURA_SCHOOLS:
+                        if misc & bit:
+                            mods["base_resistances_pct"][school] += amount
+                elif aura_type == spells.SPELL_AURA_MOD_SHIELD_BLOCKVALUE:
+                    mods["block_value"] += amount
+                elif aura_type == spells.SPELL_AURA_MOD_SKILL:
+                    mods["skills"][misc] = (
+                        mods["skills"].get(misc, 0) + amount)
                 elif aura_type == spells.SPELL_AURA_SCHOOL_ABSORB:
                     mods["absorb"].append(aura)
                 elif aura_type == spells.SPELL_AURA_SCHOOL_IMMUNITY:
@@ -1048,6 +1105,8 @@ class AurasMixin:
         self._apply_combat_stats()
         fields = object_update.build_combat_stats_values(self.character)
         fields.update(self._derived_player_fields())
+        fields[F.OBJECT_FIELD_SCALE_X] = object_update.float_bits(
+            float(self.character.get("object_scale", 1.0) or 1.0))
         await self._send_player_fields(fields)
 
         mods = self._player_aura_mods()

@@ -391,12 +391,22 @@ class StatsMixin:
 
         # ``Player::UpdateArmor``: item armor plus twice the final agility.
         agility = int(stats.get("agi", 0) or 0)
-        armor = int(item_totals.get("armor", 0) or 0) + agility * 2
+        base_armor = agility * 2
+        if aura_mods:
+            # ``SPELL_AURA_MOD_BASE_RESISTANCE_PCT`` only multiplies the
+            # agility-derived base armor, not the equipped armor.
+            base_armor = int(base_armor * (
+                1.0 + float(
+                    aura_mods["base_resistances_pct"].get("armor", 0.0)
+                    or 0.0) / 100.0))
+        armor = int(item_totals.get("armor", 0) or 0) + base_armor
         if aura_mods:
             armor += int(aura_mods["armor"] or 0)
             armor = int(armor * (
                 1.0 + float(aura_mods.get("armor_pct", 0.0) or 0.0) / 100.0))
         self.character["armor"] = armor
+        self.character["object_scale"] = float(
+            (aura_mods.get("scale_mult", 1.0) if aura_mods else 1.0) or 1.0)
         for school in ("holy", "fire", "nature", "frost", "shadow", "arcane"):
             value = int(item_totals.get(school, 0) or 0)
             if aura_mods:
@@ -459,6 +469,9 @@ class StatsMixin:
         self.character["has_shield"] = bool(item_totals.get("shield", 0))
         self.character["block_value"] = int(
             item_totals.get("block_value", 0) or 0)
+        if aura_mods:
+            self.character["block_value"] += int(
+                aura_mods.get("block_value", 0) or 0)
         self.character["spell_power"] = int(
             item_totals.get("spell_power", 0) or 0)
         self.character["healing_power"] = int(

@@ -243,9 +243,63 @@ def _socket(tmp_path):
                 " VALUES(?, ?, 6, ?, ?, ?, 1, ?, 1)",
                 (spell_id, f"Aura {aura} Test", aura, misc, base, amplitude))
         con.execute(
+            "INSERT OR REPLACE INTO spell_templates"
+            "(id, name, effect1, effect_apply_aura_name1,"
+            " effect_implicit_target_a1, effect_base_points1,"
+            " effect_amplitude1, effect2, effect_apply_aura_name2,"
+            " effect_implicit_target_a2, effect_base_points2,"
+            " effect_amplitude2, duration_index)"
+            " VALUES(435, 'Drink Aura Test', 6, 85, 1, -1, 0,"
+            " 6, 226, 1, 41, 2200, 1)")
+        con.execute(
+            "INSERT OR REPLACE INTO spell_templates"
+            "(id, name, effect1, effect_apply_aura_name1, effect_base_points1,"
+            " effect_implicit_target_a1, duration_index)"
+            " VALUES(436, 'Scale Aura Test', 6, 61, 49, 1, 1)")
+        con.execute(
+            "INSERT OR REPLACE INTO spell_templates"
+            "(id, name, effect1, effect_apply_aura_name1, effect_base_points1,"
+            " effect_misc_value1, effect_implicit_target_a1, duration_index)"
+            " VALUES(437, 'Base Resist Aura Test', 6, 142, 99, 1, 1, 1)")
+        con.execute(
+            "INSERT OR REPLACE INTO spell_templates"
+            "(id, name, effect1, effect_apply_aura_name1, effect_base_points1,"
+            " effect_implicit_target_a1, duration_index)"
+            " VALUES(438, 'Block Value Aura Test', 6, 158, 1, 1, 1)")
+        con.execute(
+            "INSERT OR REPLACE INTO spell_templates"
+            "(id, name, effect1, effect_apply_aura_name1, effect_base_points1,"
+            " effect_misc_value1, effect_implicit_target_a1, duration_index)"
+            " VALUES(439, 'Skill Aura Test', 6, 30, 9, 164, 1, 1)")
+        con.execute(
+            "INSERT OR REPLACE INTO spell_templates"
+            "(id, name, effect1) VALUES(440, 'Spawn Effect Test', 46)")
+        con.execute(
+            "INSERT OR REPLACE INTO spell_templates"
+            "(id, name, effect1, effect_misc_value1, duration_index)"
+            " VALUES(441, 'Transmitted Object Test', 50, 5000, 1)")
+        con.execute(
+            "INSERT OR REPLACE INTO spell_templates"
+            "(id, name, effect1, effect_misc_value1)"
+            " VALUES(442, 'Activate Object Test', 86, 11)")
+        con.execute(
+            "INSERT OR REPLACE INTO spell_templates"
+            "(id, name, effect1, effect_base_points1)"
+            " VALUES(443, 'Gameobject Damage Test', 87, 999)")
+        con.execute(
+            "INSERT OR REPLACE INTO spell_templates"
+            "(id, name, effect1, effect_apply_aura_name1, effect_base_points1,"
+            " effect_misc_value1, effect_implicit_target_a1, duration_index)"
+            " VALUES(444, 'Agility Aura Test', 6, 29, 9, 1, 1, 1)")
+        con.execute(
             "INSERT OR REPLACE INTO gameobject_templates"
             "(entry, type, display_id, name, size, faction, flags)"
             " VALUES(5000, 6, 100, 'Trap', 1.0, 0, 0)")
+        con.execute(
+            "INSERT OR REPLACE INTO gameobject_templates"
+            "(entry, type, display_id, name, size, faction, flags,"
+            " data0, data1)"
+            " VALUES(5001, 33, 101, 'Wall', 1.0, 0, 0, 5000, 0)")
         con.execute(
             "INSERT OR REPLACE INTO spell_target_position"
             " VALUES(400, 0, 10.0, 20.0, 30.0, 1.0)")
@@ -699,6 +753,74 @@ def test_food_drink_and_percent_regen_auras(tmp_path):
                    if int(d["spell_id"]) == 432)
         await socket._apply_dot_tick(dot)
         assert socket.character["health"] == 97
+
+    asyncio.run(flow())
+
+
+def test_drink_aura_and_easy_stat_auras(tmp_path):
+    async def flow():
+        socket, db, _sent, _delivered = _socket(tmp_path)
+        await socket._apply_spell_effects(
+            None, spells.get_spell_template(db, 435), socket.player_guid)
+        mods = socket._player_aura_mods()
+        assert mods["power_regen"].get(0) == 42
+
+        socket.character["skills"] = {
+            164: {"slot": 1, "value": 5, "max_value": 75, "step": 1}}
+        await socket._apply_spell_effects(
+            None, spells.get_spell_template(db, 444), socket.player_guid)
+        await socket._apply_spell_effects(
+            None, spells.get_spell_template(db, 436), socket.player_guid)
+        assert abs(socket.character["object_scale"] - 1.5) < 1e-6
+        armor_before = int(socket.character["armor"])
+        assert armor_before > 0
+        await socket._apply_spell_effects(
+            None, spells.get_spell_template(db, 437), socket.player_guid)
+        assert socket.character["armor"] == armor_before * 2
+        await socket._apply_spell_effects(
+            None, spells.get_spell_template(db, 438), socket.player_guid)
+        assert socket.character["block_value"] == 2
+        await socket._apply_spell_effects(
+            None, spells.get_spell_template(db, 439), socket.player_guid)
+        assert socket._effective_skills()[164]["value"] == 15
+        assert socket._player_skills()[164]["value"] == 5
+
+    asyncio.run(flow())
+
+
+def test_transmitted_activate_and_damage_gameobjects(tmp_path):
+    async def flow():
+        socket, db, sent, _delivered = _socket(tmp_path)
+        await socket._apply_spell_effects(
+            None, spells.get_spell_template(db, 440), 0)
+        cast = types.SimpleNamespace(has_dest=True, x=4.0, y=5.0, z=0.0,
+                                     item_guid=0)
+        await socket._apply_spell_effects(
+            cast, spells.get_spell_template(db, 441), 0)
+        objects = socket._summoned_gameobjects()
+        assert objects
+        low, spawn = next(iter(objects.items()))
+        assert int(spawn["entry"]) == 5000
+        assert (float(spawn["x"]), float(spawn["y"])) == (4.0, 5.0)
+
+        guid = gameobject.gameobject_guid(low, 5000)
+        socket._visible_gameobjects[low] = guid
+        await socket._apply_spell_effects(
+            None, spells.get_spell_template(db, 442), guid)
+        assert socket._go_runtime().state(low) == gameobject.GO_STATE_ACTIVE
+
+        wall_low = await socket._summon_gameobject(5001, 0.0, 0.0, 0.0, 0.0,
+                                                   60000)
+        wall_guid = gameobject.gameobject_guid(wall_low, 5001)
+        socket._visible_gameobjects[wall_low] = wall_guid
+        wall_spawn = socket._summoned_gameobjects()[wall_low]
+        sent.clear()
+        await socket._apply_spell_effects(
+            None, spells.get_spell_template(db, 443), wall_guid)
+        runtime = socket._go_runtime()
+        assert runtime.current_health(wall_low, wall_spawn) == 4000
+        assert int(Opcodes.SMSG_DESTRUCTIBLE_BUILDING_DAMAGE) in [
+            opcode for opcode, _payload in sent]
 
     asyncio.run(flow())
 

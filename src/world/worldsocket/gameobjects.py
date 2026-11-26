@@ -12,6 +12,7 @@ from src.world import login_packets
 from src.world import movement
 from src.world import object_update
 from src.world import quests as Q
+from src.world import spells
 from src.world import update_fields as F
 
 # Shared fallback for sessions created without a world server (unit tests).
@@ -427,6 +428,77 @@ class GameObjectsMixin:
         else:
             self.log.debug(f"Using game object type {go_type} ({spawn['name']}) "
                            "is not implemented yet")
+
+    def _spell_gameobject_spawn(self, guid: int):
+        """Spawn row behind a spell's gameobject target, if it is known."""
+        low_guid = gameobject.gameobject_low_guid(int(guid))
+        spawn = self._gameobject_spawn_cache.get(low_guid)
+        if spawn is None:
+            spawn = self._summoned_gameobjects().get(low_guid)
+        return spawn
+
+    async def _spell_activate_gameobject(self, guid: int,
+                                         action: int) -> None:
+        """``SPELL_EFFECT_ACTIVATE_OBJECT`` (``GameObjectActions``)."""
+        spawn = self._spell_gameobject_spawn(guid)
+        if spawn is None:
+            return
+        low_guid = int(spawn["guid"])
+        runtime = self._go_runtime()
+        if action == 12:                     # destroy
+            await self._destroy_gameobject(spawn)
+            return
+        if action in (5, 14):                # disturb / use
+            await self._use_gameobject(guid, spawn)
+            return
+        if action == 11:                     # toggle open
+            await self._toggle_gameobject(spawn)
+            return
+        if action in (7, 8, 9):              # unlock/open
+            new_state = gameobject.GO_STATE_ACTIVE
+        elif action == 10:                   # close
+            new_state = gameobject.GO_STATE_READY
+        else:
+            # Custom animations and lock/unlock-only actions have no
+            # server-side state; using the object is the closest behaviour.
+            await self._use_gameobject(guid, spawn)
+            return
+        if new_state == gameobject.initial_state(spawn):
+            runtime.states.pop(low_guid, None)
+        else:
+            runtime.set_state(
+                low_guid, new_state, gameobject.auto_close_seconds(spawn))
+        await self._broadcast_gameobject_state(spawn, new_state)
+
+    async def _destroy_gameobject(self, spawn) -> None:
+        low_guid = int(spawn["guid"])
+        if low_guid in self._summoned_gameobjects():
+            await self._dismiss_gameobject(low_guid)
+        else:
+            await self._despawn_gameobject(spawn)
+
+    async def _spell_damage_gameobject(self, guid: int, amount: int,
+                                       template) -> None:
+        """``SPELL_EFFECT_GAMEOBJECT_DAMAGE`` on a destructible building."""
+        spawn = self._spell_gameobject_spawn(guid)
+        if spawn is None or amount <= 0:
+            return
+        low_guid = int(spawn["guid"])
+        runtime = self._go_runtime()
+        if runtime.max_health(spawn) <= 0:
+            return
+        health = runtime.modify_health(low_guid, spawn, -int(amount))
+        payload = (spells.pack_guid(int(guid))
+                   + spells.pack_guid(int(self.player_guid))
+                   + spells.pack_guid(int(self.player_guid))
+                   + struct.pack("<II", int(amount) & 0xFFFFFFFF,
+                                 int(template.id) & 0xFFFFFFFF))
+        await self.send_packet(
+            Opcodes.SMSG_DESTRUCTIBLE_BUILDING_DAMAGE, payload)
+        await self.send_packet_to_peers(
+            Opcodes.SMSG_DESTRUCTIBLE_BUILDING_DAMAGE, payload)
+        if health <= 0:
+            await self._destroy_gameobject(spawn)
 
     async def _toggle_gameobject(self, spawn) -> None:
         """Open a closed door/button or close an open one (``GameObject::UseDoorOrButton``)."""
