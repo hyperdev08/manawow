@@ -120,7 +120,9 @@ class CreatureMovementMixin:
                 "facing": float(spawn["o"] or 0.0),
                 "radius": max(0.5, radius),
                 "speed": max(0.5, float(spawn["speed_walk"] or 2.5)),
-                "next_move": now + random.uniform(0.0, 2.0),
+                # CMaNGOS ``WanderMovementGenerator`` starts with a zero
+                # delay timer, so the first move is attempted immediately.
+                "next_move": now,
                 "move_until": 0.0,
                 "moves_left": 1,
                 "path": path,
