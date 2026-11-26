@@ -288,6 +288,14 @@ CREATE TABLE IF NOT EXISTS character_spells(
 );
 CREATE INDEX IF NOT EXISTS idx_character_spells_character ON character_spells(character_guid);
 
+-- Character talents: the highest rank index (0-based) learned in each talent.
+CREATE TABLE IF NOT EXISTS character_talents(
+  character_guid INTEGER NOT NULL,
+  talent_id INTEGER NOT NULL,
+  rank INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY(character_guid, talent_id)
+);
+
 -- Character skill lines (professions, weapon skills, riding).  The value/max
 -- pair uses PLAYER_SKILL_VALUE semantics and slot is the 0-based position in
 -- the client's PLAYER_SKILL_INFO array after the language skills.
@@ -347,14 +355,18 @@ def _schema_subset(sql: str, tables: set[str]) -> str:
         text = statement.strip()
         if not text:
             continue
-        if re.search(r"\bINDEX\b", text[:80], re.I):
-            match = re.search(r"\bON\s+([A-Za-z_][A-Za-z0-9_]*)", text,
+        # SQL comments can contain words such as "index" and would otherwise
+        # be mistaken for an INDEX statement (e.g. the character_talents DDL
+        # comment says "rank index").
+        clean = re.sub(r"--[^\n]*", "", text)
+        if re.search(r"\bINDEX\b", clean[:120], re.I):
+            match = re.search(r"\bON\s+([A-Za-z_][A-Za-z0-9_]*)", clean,
                               re.I)
             name = match.group(1) if match else ""
         else:
             match = re.search(
                 r"\bTABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?([A-Za-z_][A-Za-z0-9_]*)",
-                text, re.I)
+                clean, re.I)
             name = match.group(1) if match else ""
         if name.lower() in tables:
             statements.append(text)
@@ -365,7 +377,8 @@ def _schema_subset(sql: str, tables: set[str]) -> str:
 # retained for tests/tools that explicitly create a self-contained database.
 CREATE_CHARACTER_TABLES_SQL = _schema_subset(
     CREATE_CHARACTERS_SQL, {"characters", "character_items",
-                            "character_spells", "character_skills",
+                            "character_spells", "character_talents",
+                            "character_skills",
                             "character_proficiencies", "character_corpses",
                             "character_taxi_nodes", "groups",
                             "group_members"})
@@ -451,6 +464,7 @@ CHARACTER_TABLES = (
     "characters",
     "character_items",
     "character_spells",
+    "character_talents",
     "character_skills",
     "character_proficiencies",
     "character_corpses",
@@ -996,8 +1010,8 @@ def delete_character(path: str, account_id: int, guid: int) -> bool:
             from src.world import quests
             quests.delete_character_quests(con, guid)
             for table in ("character_items", "character_spells",
-                          "character_skills", "character_proficiencies",
-                          "character_corpses"):
+                          "character_talents", "character_skills",
+                          "character_proficiencies", "character_corpses"):
                 try:
                     con.execute(
                         f"DELETE FROM {table} WHERE character_guid = ?",
@@ -2321,6 +2335,42 @@ def swap_character_items(path: str, character_guid: int, slot_a: int, slot_b: in
             )
         con.commit()
         return True
+    finally:
+        con.close()
+
+
+def get_character_talents(path: str, character_guid: int) -> Dict[int, int]:
+    """Return ``{talent_id: highest_rank_index}`` for one character."""
+    con = _connect(path)
+    try:
+        rows = con.execute(
+            "SELECT talent_id, rank FROM character_talents"
+            " WHERE character_guid = ?", (int(character_guid),)).fetchall()
+        return {int(row[0]): int(row[1]) for row in rows}
+    finally:
+        con.close()
+
+
+def set_character_talent(path: str, character_guid: int, talent_id: int,
+                         rank: int) -> None:
+    con = _connect(path)
+    try:
+        con.execute(
+            "INSERT OR REPLACE INTO character_talents"
+            "(character_guid, talent_id, rank) VALUES(?,?,?)",
+            (int(character_guid), int(talent_id), int(rank)))
+        con.commit()
+    finally:
+        con.close()
+
+
+def clear_character_talents(path: str, character_guid: int) -> None:
+    con = _connect(path)
+    try:
+        con.execute(
+            "DELETE FROM character_talents WHERE character_guid = ?",
+            (int(character_guid),))
+        con.commit()
     finally:
         con.close()
 

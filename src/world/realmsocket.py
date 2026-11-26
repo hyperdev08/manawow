@@ -39,6 +39,7 @@ from src.world.worldsocket.runes import RunesMixin
 from src.world.worldsocket.spells import SpellsMixin
 from src.world.worldsocket.stats import StatsMixin
 from src.world.worldsocket.summons import SummonsMixin
+from src.world.worldsocket.talents import TalentsMixin
 from src.world.worldsocket.taxi import TaxiMixin
 from src.world.worldsocket.trainers import TrainersMixin
 from src.world.worldsocket.vendors import VendorsMixin
@@ -74,5 +75,6 @@ class WorldSocket(
     QuestsMixin,
     VendorsMixin,
     TrainersMixin,
+    TalentsMixin,
 ):
     """One connected 3.3.5a client; see the mixins for each subsystem."""

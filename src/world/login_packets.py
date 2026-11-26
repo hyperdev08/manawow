@@ -2,9 +2,9 @@
 
 Mirrors the essential part of TrinityCore's ``WorldSession::HandlePlayerLogin``
 plus ``Player::SendInitialPacketsBeforeAddToMap``/``AfterAddToMap`` and
-``Player::UpdateZone``.  Systems we do not simulate yet (guilds, achievements,
-talents, action bars, spells) are still announced with empty packets so the
-client's UI is initialised instead of waiting for data that never arrives.
+``Player::UpdateZone``.  Systems we do not simulate yet (guilds, achievements)
+are still announced with empty packets so the client's UI is initialised
+instead of waiting for data that never arrives.
 """
 from __future__ import annotations
 

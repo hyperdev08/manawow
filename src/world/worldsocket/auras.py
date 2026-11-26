@@ -616,6 +616,22 @@ class AurasMixin:
         if changed:
             await self._refresh_player_auras()
 
+    async def _remove_player_aura_spell(self, spell_id: int) -> None:
+        """Remove every aura on the player created by one spell."""
+        entries = self._get_combat_state().get("auras", [])
+        removed = [aura for aura in entries
+                   if int(aura.get("spell_id") or 0) == int(spell_id)]
+        if not removed:
+            return
+        for aura in removed:
+            entries.remove(aura)
+            self._remove_dots_for_aura(
+                "player", int(self.player_guid), int(spell_id))
+            await self._send_aura_update(
+                "player", int(self.player_guid), aura, remove=True)
+        self._normalise_aura_slots(entries)
+        await self._refresh_player_auras()
+
     def _fade_taunt_auras(self, low_guid: int, removed: list) -> None:
         manager = (self._creature_combat_manager()
                    if hasattr(self, "_creature_combat_manager") else None)

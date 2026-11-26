@@ -1597,6 +1597,7 @@ async def worldserver_flow(host: str, port: int, session_key: bytes, realm_id: i
             None,  # the (possibly compressed) update object
             Opcodes.SMSG_CLIENT_CONTROL_UPDATE,
             Opcodes.SMSG_TIME_SYNC_REQ,
+            Opcodes.SMSG_TALENTS_INFO,
         ]
         update_payload = None
         update_compressed = False
@@ -1611,6 +1612,16 @@ async def worldserver_flow(host: str, port: int, session_key: bytes, realm_id: i
                 continue
             assert_eq(opcode, int(expected), f"login packet #{index} opcode")
 
+            if expected == Opcodes.SMSG_TALENTS_INFO:
+                assert_eq(payload[0], 0, "talent info kind")
+                assert_eq(struct.unpack_from("<I", payload, 1)[0], 0,
+                          "level-1 talent points")
+                assert_eq(payload[5], 1, "talent group count")
+                assert_eq(payload[6], 0, "active talent group")
+                assert_eq(payload[7], 0, "learned talent count")
+                assert_eq(payload[8], 6, "glyph slot count")
+                assert_eq(len(payload), 21, "talent info length")
+                continue
             if expected == Opcodes.SMSG_CLIENT_CONTROL_UPDATE:
                 control_guid, control_pos = read_packed_guid(payload, 0)
                 assert_eq(control_guid, guid, "client control update guid")
@@ -2404,6 +2415,7 @@ LOGIN_BURST_OPCODES = [
     None,  # the (possibly compressed) create-object update
     Opcodes.SMSG_CLIENT_CONTROL_UPDATE,
     Opcodes.SMSG_TIME_SYNC_REQ,
+    Opcodes.SMSG_TALENTS_INFO,
 ]
 
 

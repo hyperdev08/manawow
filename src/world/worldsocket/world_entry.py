@@ -144,6 +144,9 @@ class WorldEntryMixin:
         known_spell_ids = [int(row["spell"]) for row in known_spells]
         # The cast handler refuses anything the character has not learned.
         self.known_spell_ids = set(known_spell_ids)
+        if hasattr(self, "_load_talents"):
+            await self._load_talents()
+            known_spell_ids = sorted(self.known_spell_ids)
         action_buttons = character_db.get_character_action_buttons(
             self.config.database.world_path, self.player_guid
         )
@@ -162,6 +165,10 @@ class WorldEntryMixin:
                     trainer.build_proficiency(item_class, subclass_mask))
         if self._is_death_knight():
             await self._send_resync_runes()
+        if hasattr(self, "_apply_loaded_talents"):
+            await self._apply_loaded_talents()
+        if hasattr(self, "_send_talents_info"):
+            await self._send_talents_info()
 
         self.log.info(
             f"Sent world entry packets for '{character['name']}' "

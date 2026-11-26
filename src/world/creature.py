@@ -513,6 +513,27 @@ CREATE TABLE IF NOT EXISTS totem_categories(
   category_mask INTEGER NOT NULL DEFAULT 0
 );
 
+CREATE TABLE IF NOT EXISTS talent_tabs(
+  id INTEGER PRIMARY KEY,
+  class_mask INTEGER NOT NULL DEFAULT 0,
+  pet_talent_mask INTEGER NOT NULL DEFAULT 0,
+  order_index INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS talents(
+  id INTEGER PRIMARY KEY,
+  tab_id INTEGER NOT NULL DEFAULT 0,
+  tier_id INTEGER NOT NULL DEFAULT 0,
+  column_index INTEGER NOT NULL DEFAULT 0,
+  spell_rank1 INTEGER NOT NULL DEFAULT 0,
+  spell_rank2 INTEGER NOT NULL DEFAULT 0,
+  spell_rank3 INTEGER NOT NULL DEFAULT 0,
+  spell_rank4 INTEGER NOT NULL DEFAULT 0,
+  spell_rank5 INTEGER NOT NULL DEFAULT 0,
+  prereq_talent INTEGER NOT NULL DEFAULT 0,
+  prereq_rank INTEGER NOT NULL DEFAULT 0
+);
+
 CREATE TABLE IF NOT EXISTS glyph_properties(
   id INTEGER PRIMARY KEY,
   spell_id INTEGER NOT NULL DEFAULT 0,
@@ -874,6 +895,8 @@ _SKILL_LINE_ABILITY_SQL = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "skill_line_ability.sql")
 _TOTEM_CATEGORIES_SQL = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "totem_categories.sql")
+_TALENTS_SQL = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "talents.sql")
 
 
 def _seed_spell_item_enchantment(con: sqlite3.Connection) -> None:
@@ -927,6 +950,18 @@ def _seed_totem_categories(con: sqlite3.Connection) -> None:
     if not os.path.exists(_TOTEM_CATEGORIES_SQL):
         return
     with open(_TOTEM_CATEGORIES_SQL, encoding="utf-8") as handle:
+        con.executescript(handle.read())
+    con.commit()
+
+
+def _seed_talents(con: sqlite3.Connection) -> None:
+    """Load bundled Talent.dbc/TalentTab.dbc rows."""
+    count = con.execute("SELECT COUNT(*) FROM talents").fetchone()[0]
+    if count:
+        return
+    if not os.path.exists(_TALENTS_SQL):
+        return
+    with open(_TALENTS_SQL, encoding="utf-8") as handle:
         con.executescript(handle.read())
     con.commit()
 
@@ -991,6 +1026,7 @@ def init_creature_db(path: str) -> None:
         _seed_glyph_properties(con)
         _seed_skill_line_ability(con)
         _seed_totem_categories(con)
+        _seed_talents(con)
         if con.execute("SELECT COUNT(*) FROM creature_spawns").fetchone()[0]:
             con.commit()
             return

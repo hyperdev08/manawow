@@ -363,6 +363,11 @@ def _socket(tmp_path):
             " 1, 1)")
         con.execute(
             "INSERT OR REPLACE INTO spell_templates"
+            "(id, name, attributes, effect1, effect_apply_aura_name1,"
+            " effect_base_points1, effect_misc_value1)"
+            " VALUES(11069, 'Improved Fireball', 262608, 6, 107, -101, 10)")
+        con.execute(
+            "INSERT OR REPLACE INTO spell_templates"
             "(id, name, effect1, effect_trigger_spell1)"
             " VALUES(460, 'Learn Pet Spell Test', 57, 200)")
         con.execute(
@@ -1085,6 +1090,32 @@ def test_pet_spell_sanctuary_honor_and_unlearn_effects(tmp_path):
         assert 200 not in socket.known_spell_ids
         assert int(Opcodes.SMSG_REMOVED_SPELL) in [
             opcode for opcode, _payload in sent]
+
+    asyncio.run(flow())
+
+
+def test_talent_learning_points_and_reset(tmp_path):
+    async def flow():
+        socket, db, sent, _delivered = _socket(tmp_path)
+        socket.character.update({"level": 10, "class": 8, "talents": {}})
+        socket.known_spell_ids = set()
+
+        assert await socket._learn_talent(26, 0)
+        assert 11069 in socket.known_spell_ids
+        assert socket.character["talents"] == {26: 0}
+        assert int(Opcodes.SMSG_TALENTS_INFO) in [
+            opcode for opcode, _payload in sent]
+        assert any(int(aura["spell_id"]) == 11069
+                   for aura in socket._get_combat_state()["auras"])
+
+        # Tier 2 needs 10 points in the tree; one point is not enough.
+        assert not await socket._learn_talent(29, 0)
+
+        await socket._reset_talents()
+        assert socket.character["talents"] == {}
+        assert 11069 not in socket.known_spell_ids
+        assert not any(int(aura["spell_id"]) == 11069
+                       for aura in socket._get_combat_state()["auras"])
 
     asyncio.run(flow())
 

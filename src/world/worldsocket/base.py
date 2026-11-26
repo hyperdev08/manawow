@@ -410,6 +410,10 @@ class SocketBase:
                 await self.handle_trainer_list(data)
             elif opcode == Opcodes.CMSG_TRAINER_BUY_SPELL:
                 await self.handle_trainer_buy_spell(data)
+            elif opcode == Opcodes.CMSG_LEARN_TALENT:
+                await self.handle_learn_talent(data)
+            elif opcode == Opcodes.CMSG_UNLEARN_TALENTS:
+                await self.handle_unlearn_talents(data)
             elif opcode == Opcodes.CMSG_PET_ACTION:
                 await self.handle_pet_action(data)
             elif opcode == Opcodes.CMSG_PET_SET_ACTION:

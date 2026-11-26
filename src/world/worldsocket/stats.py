@@ -756,6 +756,9 @@ class StatsMixin:
         if leveled and hasattr(self, "refresh_gameobject_quest_flags"):
             # New quests may unlock: wanted posters become clickable.
             await self.refresh_gameobject_quest_flags()
+        if leveled and hasattr(self, "_send_talents_info"):
+            # A level grants a new talent point.
+            await self._send_talents_info()
         if leveled:
             self.log.info(
                 f"'{self.character['name']}' reached level {level} "
