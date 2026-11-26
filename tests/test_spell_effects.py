@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import sqlite3
 import struct
+import time
 import types
 
 from src.common.config import AuthConfig, Config, DBConfig, LogConfig, WorldConfig
@@ -173,6 +174,74 @@ def _socket(tmp_path):
             "INSERT OR REPLACE INTO item_templates"
             "(entry, name1, stackable, display_id, quality, totem_category)"
             " VALUES(6003, 'Test Pick', 1, 103, 1, 165)")
+        con.execute(
+            "INSERT OR REPLACE INTO spell_templates"
+            "(id, name, effect1, effect_apply_aura_name1, effect_base_points1,"
+            " effect_implicit_target_a1, effect_radius_index1, duration_index)"
+            " VALUES(417, 'Friend Aura Test', 128, 29, 5, 1, 13, 1)")
+        con.execute(
+            "INSERT OR REPLACE INTO spell_templates"
+            "(id, name, effect1, effect_apply_aura_name1, effect_base_points1,"
+            " effect_implicit_target_a1, effect_radius_index1, duration_index)"
+            " VALUES(418, 'Enemy Aura Test', 129, 29, 5, 1, 13, 1)")
+        con.execute(
+            "INSERT OR REPLACE INTO spell_templates"
+            "(id, name, effect1, effect_apply_aura_name1, effect_base_points1,"
+            " effect_implicit_target_a1, effect_radius_index1, duration_index,"
+            " effect_amplitude1)"
+            " VALUES(419, 'Pet Aura Test', 119, 20, 2, 1, 13, 1, 1000)")
+        con.execute(
+            "INSERT OR REPLACE INTO spell_templates"
+            "(id, name, effect1, effect_base_points1, effect_misc_value1,"
+            " effect_multiple_value1)"
+            " VALUES(420, 'Power Burn Test', 62, 9, 0, 0.5)")
+        con.execute(
+            "INSERT OR REPLACE INTO spell_templates"
+            "(id, name, effect1, effect_base_points1, effect_implicit_target_a1)"
+            " VALUES(421, 'Heal Percent Test', 136, 1, 1)")
+        con.execute(
+            "INSERT OR REPLACE INTO spell_templates"
+            "(id, name, effect1) VALUES(422, 'Jump Dest Test', 42)")
+        con.execute(
+            "INSERT OR REPLACE INTO spell_templates"
+            "(id, name, effect1, effect_apply_aura_name1, effect_base_points1,"
+            " effect_implicit_target_a1, mechanic, duration_index)"
+            " VALUES(423, 'Mechanic Aura Test', 6, 12, 1, 1, 7, 1)")
+        con.execute(
+            "INSERT OR REPLACE INTO spell_templates"
+            "(id, name, effect1, effect_misc_value1)"
+            " VALUES(424, 'Dispel Mechanic Test', 108, 7)")
+        con.execute(
+            "INSERT OR REPLACE INTO spell_templates"
+            "(id, name, effect1, effect_base_points1)"
+            " VALUES(425, 'Inebriate Test', 100, 19)")
+        con.execute(
+            "INSERT OR REPLACE INTO spell_templates"
+            "(id, name, effect1) VALUES(426, 'Charge Test', 96)")
+        con.execute(
+            "INSERT OR REPLACE INTO spell_templates"
+            "(id, name, effect1, effect_misc_value1)"
+            " VALUES(427, 'Kill Credit Test', 90, 6000)")
+        con.execute(
+            "INSERT OR REPLACE INTO spell_templates"
+            "(id, name, effect1, effect_misc_value1)"
+            " VALUES(428, 'Kill Credit Group Test', 134, 6000)")
+        con.execute(
+            "INSERT OR REPLACE INTO spell_templates"
+            "(id, name, effect1, effect_apply_aura_name1, effect_base_points1,"
+            " effect_implicit_target_a1, effect_radius_index1, duration_index)"
+            " VALUES(434, 'Party Aura Real Test', 35, 29, 5, 1, 13, 1)")
+        for spell_id, aura, misc, base, amplitude in (
+                (429, 84, 0, 9, 0), (430, 85, 0, 9, 0),
+                (431, 161, 0, 4, 0), (432, 89, 0, 2, 1000),
+                (433, 20, 0, 2, 1000)):
+            con.execute(
+                "INSERT OR REPLACE INTO spell_templates"
+                "(id, name, effect1, effect_apply_aura_name1,"
+                " effect_misc_value1, effect_base_points1,"
+                " effect_implicit_target_a1, effect_amplitude1, duration_index)"
+                " VALUES(?, ?, 6, ?, ?, ?, 1, ?, 1)",
+                (spell_id, f"Aura {aura} Test", aura, misc, base, amplitude))
         con.execute(
             "INSERT OR REPLACE INTO gameobject_templates"
             "(entry, type, display_id, name, size, faction, flags)"
@@ -431,6 +500,205 @@ def test_crafting_consumes_reagents_creates_item_and_skills_up(tmp_path):
         failures = [payload for opcode, payload in sent
                     if opcode == int(Opcodes.SMSG_CAST_FAILED)]
         assert failures and failures[-1][5] == 100
+
+    asyncio.run(flow())
+
+
+def test_area_auras_friend_enemy_and_pet(tmp_path):
+    async def flow():
+        socket, db, _sent, _delivered = _socket(tmp_path)
+        peer_applied = []
+
+        async def peer_aura(template, effect, index, caster_guid,
+                            target_guid, caster_level, combo_points=0,
+                            target_kind=None):
+            peer_applied.append((int(template.id), int(target_guid)))
+
+        near = types.SimpleNamespace(
+            player_guid=2, character={"x": 5.0, "y": 0.0, "z": 0.0},
+            _apply_periodic_aura=lambda *a, **k: None,
+            _apply_aura_from_effect=peer_aura)
+        far = types.SimpleNamespace(
+            player_guid=3, character={"x": 30.0, "y": 0.0, "z": 0.0},
+            _apply_periodic_aura=lambda *a, **k: None,
+            _apply_aura_from_effect=peer_aura)
+        socket.peers = lambda: [near, far]
+
+        await socket._apply_spell_effects(
+            None, spells.get_spell_template(db, 417), 0)
+        assert peer_applied == [(417, 2)]
+        auras = socket._get_combat_state()["auras"]
+        assert any(int(a["spell_id"]) == 417 for a in auras)
+
+        # Party area auras use the same component lookup as plain auras.
+        await socket._apply_spell_effects(
+            None, spells.get_spell_template(db, 434), 0)
+        assert any(int(a["spell_id"]) == 434
+                   for a in socket._get_combat_state()["auras"])
+
+        # Enemy aura debuffs hostile creatures but leaves service NPCs alone.
+        combat = socket._get_combat_state()
+        combat["creature_auras"].clear()
+        socket._creature_spawn_cache = {
+            5000: {"guid": 5000, "entry": 5000, "x": 3.0, "y": 0.0,
+                    "z": 0.0, "dead_since": 0, "npc_flags": 0,
+                    "unit_flags": 0, "min_level": 1, "max_level": 1,
+                    "current_health": 100, "max_health": 100,
+                    "combat_reach": 0.5, "bounding_radius": 0.5,
+                    "faction": 0, "name": "Dummy"},
+        }
+        await socket._apply_spell_effects(
+            None, spells.get_spell_template(db, 418), 0)
+        entries = combat["creature_auras"].get(5000, [])
+        assert any(int(a["spell_id"]) == 418 for a in entries)
+
+        # Pet aura applies to the active pet and registers its periodic heal.
+        pet_spawn = dict(socket._creature_spawn_cache[5000])
+        pet_spawn.update({"entry": 5001, "name": "Pet", "is_pet": True,
+                          "expires": None})
+        socket._summoned_creatures = {6000: pet_spawn}
+        socket._summon_states = {
+            6000: {"is_pet": True, "stationary": False}}
+        await socket._apply_spell_effects(
+            None, spells.get_spell_template(db, 419), 0)
+        pet_auras = combat["creature_auras"].get(6000, [])
+        assert any(int(a["spell_id"]) == 419 for a in pet_auras)
+        dots = [d for d in combat["dots"] if int(d["spell_id"]) == 419]
+        assert dots and dots[0]["percent"] and dots[0]["is_heal"]
+
+    asyncio.run(flow())
+
+
+def test_power_burn_heal_pct_jump_and_dispel_mechanic(tmp_path):
+    async def flow():
+        socket, db, _sent, _delivered = _socket(tmp_path)
+        socket.character["power"] = 100
+        socket.character["health"] = 100
+        await socket._apply_spell_effects(
+            None, spells.get_spell_template(db, 420), socket.player_guid)
+        assert socket.character["power"] == 90
+        assert socket.character["health"] == 95
+
+        socket.character["health"] = 50
+        await socket._apply_spell_effects(
+            None, spells.get_spell_template(db, 421), socket.player_guid)
+        assert socket.character["health"] == 52
+
+        cast = types.SimpleNamespace(has_dest=True, x=5.0, y=6.0, z=0.0,
+                                     item_guid=0)
+        await socket._apply_spell_effects(
+            cast, spells.get_spell_template(db, 422), 0)
+        assert (socket.character["x"], socket.character["y"]) == (5.0, 6.0)
+
+        await socket._apply_spell_effects(
+            None, spells.get_spell_template(db, 423), socket.player_guid)
+        assert any(int(a["spell_id"]) == 423
+                   for a in socket._get_combat_state()["auras"])
+        await socket._apply_spell_effects(
+            None, spells.get_spell_template(db, 424), socket.player_guid)
+        assert not any(int(a["spell_id"]) == 423
+                       for a in socket._get_combat_state()["auras"])
+
+    asyncio.run(flow())
+
+
+def test_inebriate_kill_credit_and_charge(tmp_path):
+    async def flow():
+        socket, db, sent, _delivered = _socket(tmp_path)
+        await socket._apply_spell_effects(
+            None, spells.get_spell_template(db, 425), socket.player_guid)
+        assert socket.character["drunk"] == 20
+        assert int(Opcodes.SMSG_CROSSED_INEBRIATION_THRESHOLD) in [
+            opcode for opcode, _payload in sent]
+
+        credited = []
+
+        async def credit(entry, guid=0):
+            credited.append((int(entry), int(guid)))
+        socket._quest_credit_kill_entry = credit
+        await socket._apply_spell_effects(
+            None, spells.get_spell_template(db, 427), socket.player_guid)
+        assert credited == [(6000, 0)]
+
+        peer_credit = []
+
+        async def peer_credit_entry(entry, guid=0):
+            peer_credit.append((int(entry), int(guid)))
+
+        peer = types.SimpleNamespace(
+            player_guid=2, character={"x": 1.0, "y": 0.0, "z": 0.0},
+            _quest_credit_kill_entry=peer_credit_entry)
+        socket._group_member_sessions = lambda exclude_self=False: [peer]
+        await socket._apply_spell_effects(
+            None, spells.get_spell_template(db, 428), socket.player_guid)
+        assert credited[-1] == (6000, 0)
+        assert len(peer_credit) == 1
+
+        combat = socket._get_combat_state()
+        spawn = {"guid": 5000, "entry": 5000, "x": 10.0, "y": 0.0,
+                 "z": 0.0, "dead_since": 0, "npc_flags": 0,
+                 "unit_flags": 0, "min_level": 1, "max_level": 1,
+                 "current_health": 100, "max_health": 100,
+                 "combat_reach": 0.0, "bounding_radius": 0.5,
+                 "faction": 0, "name": "Dummy"}
+        socket._summoned_creatures = {5000: spawn}
+        socket._get_creature_spawn = lambda low: (
+            spawn if int(low) == 5000 else None)
+        attacked = []
+
+        async def attack(payload):
+            attacked.append(payload)
+        socket.handle_attack_swing = attack
+        guid = socket._creature_object_guid(5000, 5000)
+        await socket._apply_spell_effects(
+            None, spells.get_spell_template(db, 426), guid)
+        assert socket.character["x"] > 6.0
+        assert attacked
+
+    asyncio.run(flow())
+
+
+def test_food_drink_and_percent_regen_auras(tmp_path):
+    async def flow():
+        socket, db, _sent, _delivered = _socket(tmp_path)
+        now = time.monotonic()
+        socket.character["health"] = 50
+        socket.character["stats"] = {"spi": 0}
+        socket.character["level"] = 1
+        await socket._apply_spell_effects(
+            None, spells.get_spell_template(db, 429), socket.player_guid)
+        combat = socket._get_combat_state()
+        combat["last_health_gain"] = now - 2.0
+        await socket._regenerate(now)
+        assert socket.character["health"] >= 54
+
+        socket.character["health"] = 100
+        socket.character["power"] = 50
+        await socket._apply_spell_effects(
+            None, spells.get_spell_template(db, 430), socket.player_guid)
+        combat["last_mana_gain"] = now - 2.0
+        await socket._regenerate(now)
+        assert socket.character["power"] >= 54
+
+        mods = socket._player_aura_mods()
+        assert mods["health_regen"] == 10
+        assert mods["power_regen"][0] == 10
+
+        socket.character["health"] = 50
+        await socket._apply_spell_effects(
+            None, spells.get_spell_template(db, 433), socket.player_guid)
+        dot = next(d for d in combat["dots"]
+                   if int(d["spell_id"]) == 433)
+        await socket._apply_dot_tick(dot)
+        assert socket.character["health"] == 53
+
+        socket.character["health"] = 100
+        await socket._apply_spell_effects(
+            None, spells.get_spell_template(db, 432), socket.player_guid)
+        dot = next(d for d in combat["dots"]
+                   if int(d["spell_id"]) == 432)
+        await socket._apply_dot_tick(dot)
+        assert socket.character["health"] == 97
 
     asyncio.run(flow())
 

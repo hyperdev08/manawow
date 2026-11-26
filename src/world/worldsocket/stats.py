@@ -957,18 +957,31 @@ class StatsMixin:
         power = int(self.character.get("power", max_power))
         in_fight = bool(combat["aggro"]) or combat["auto_attacking"]
         char_class = int(self.character.get("class", 1))
+        aura_mods = (self._player_aura_mods()
+                     if hasattr(self, "_player_aura_mods") else {})
+        power_regen = (aura_mods.get("power_regen") or {}).get(
+            self._power_type(), 0)
+        power_bonus = float(power_regen or 0) / 5.0
 
-        if not in_fight and health < max_health:
+        await self._tick_inebriation(combat, now)
+
+        rate = 0.0
+        if not in_fight:
             # ``Player::Regenerate(POWER_HEALTH)``: out-of-combat health comes
             # from spirit with a small level component and is carried as a
             # fraction between ticks, so low-level characters still heal.
             stats = self.character.get("stats") or {}
             spirit = max(0.0, float(stats.get("spi", 0) or 0))
-            rate = spirit * 0.025 + max(1, int(self.character.get("level", 1))) * 0.05
-            if hasattr(self, "_player_aura_mods"):
-                rate *= 1.0 + float(
-                    self._player_aura_mods().get("health_regen_pct", 0.0)
-                    or 0.0) / 100.0
+            rate = (spirit * 0.025
+                    + max(1, int(self.character.get("level", 1))) * 0.05)
+            rate *= 1.0 + float(
+                aura_mods.get("health_regen_pct", 0.0) or 0.0) / 100.0
+            # Food/drink ``SPELL_AURA_MOD_REGEN`` is stored per 5 seconds.
+            rate += float(aura_mods.get("health_regen", 0.0) or 0.0) / 5.0
+        # Troll's Blood and similar regeneration works in combat too.
+        rate += float(
+            aura_mods.get("health_regen_combat", 0.0) or 0.0) / 2.0
+        if health < max_health and rate > 0.0:
             await self._regenerate_health_over_time(
                 combat, health, max_health, rate, now)
 
@@ -1016,7 +1029,7 @@ class StatsMixin:
         elif char_class in self._ENERGY_CLASSES:
             await self._regenerate_over_time(
                 combat, "energy", power, max_power,
-                self._ENERGY_PER_SECOND, now,
+                self._ENERGY_PER_SECOND + power_bonus, now,
             )
         else:
             # CMaNGOS ``Player::Regenerate(POWER_MANA)``: the flat rate the
@@ -1032,7 +1045,7 @@ class StatsMixin:
             flat_rate, interrupted_rate = self._mana_regen_rates()
             rate = interrupted_rate if interrupted else flat_rate
             await self._regenerate_over_time(
-                combat, "mana", power, max_power, rate, now,
+                combat, "mana", power, max_power, rate + power_bonus, now,
             )
 
     def _mana_regen_rates(self) -> tuple[float, float]:
@@ -1090,6 +1103,54 @@ class StatsMixin:
         combat["health_regen_accum"] = accum - whole
         if whole > 0:
             await self._set_player_health(min(max_health, health + whole))
+
+    @staticmethod
+    def _drunken_state(value: int) -> int:
+        if value >= 90:
+            return 3                      # DRUNKEN_SMASHED
+        if value >= 50:
+            return 2                      # DRUNKEN_DRUNK
+        return 1 if value > 0 else 0      # TIPSY / SOBER
+
+    async def _set_drunk_value(self, value: int, item_id: int = 0) -> None:
+        """``Player::SetDrunkValue``: store inebriation and cross thresholds."""
+        if not self.character:
+            return
+        value = max(0, min(100, int(value)))
+        old = int(self.character.get("drunk", 0) or 0)
+        if value == old:
+            return
+        self.character["drunk"] = value
+        gender = int(self.character.get("gender", 0) or 0)
+        await self._send_player_fields({
+            F.PLAYER_BYTES_3: gender | (value << 8)})
+        if self._drunken_state(old) == self._drunken_state(value):
+            return
+        payload = (spells.pack_guid(int(self.player_guid))
+                   + struct.pack("<II", self._drunken_state(value),
+                                 int(item_id or 0)))
+        await self.send_packet(
+            Opcodes.SMSG_CROSSED_INEBRIATION_THRESHOLD, payload)
+        if hasattr(self, "send_packet_to_peers"):
+            await self.send_packet_to_peers(
+                Opcodes.SMSG_CROSSED_INEBRIATION_THRESHOLD, payload)
+
+    async def _tick_inebriation(self, combat: dict, now: float) -> None:
+        """``Player::Update``: sober up one point every nine seconds."""
+        if not self.character:
+            return
+        drunk = int(self.character.get("drunk", 0) or 0)
+        if drunk <= 0:
+            return
+        last = float(combat.get("last_sober") or 0.0)
+        if last <= 0.0:
+            combat["last_sober"] = now
+            return
+        steps = int((now - last) // 9.0)
+        if steps <= 0:
+            return
+        combat["last_sober"] = last + steps * 9.0
+        await self._set_drunk_value(max(0, drunk - steps))
 
     def _gain_rage(self, damage: int, dealing: bool = True,
                    weapon_speed: float = 2.0, crit: bool = False) -> None:

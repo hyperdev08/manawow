@@ -550,6 +550,15 @@ class QuestsMixin:
 
     async def _quest_on_creature_killed(self, guid: int, entry: int) -> None:
         """``Player::KilledMonsterCredit`` for every matching kill objective."""
+        await self._quest_credit_kill_entry(entry, int(guid))
+
+    async def _quest_credit_kill_entry(self, entry: int,
+                                       guid: int = 0) -> None:
+        """Credit kill objectives for one creature entry.
+
+        ``guid`` is only used for ``SMSG_QUESTUPDATE_ADD_KILL``; spell effects
+        credit by entry and pass zero.
+        """
         log = self._quest_log_map()
         if not log:
             return

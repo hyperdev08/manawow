@@ -49,6 +49,18 @@ AFLAG_NEGATIVE = 0x80
 
 PERMANENT_AURA_SECONDS = 10 * 365 * 24 * 3600
 
+# Effects that carry ``EffectApplyAuraName``: plain auras plus every area-aura
+# variant.  They share the component/target-pattern rules.
+AURA_EFFECT_TYPES = frozenset((
+    spells.SPELL_EFFECT_APPLY_AURA,
+    spells.SPELL_EFFECT_APPLY_AREA_AURA_PARTY,
+    spells.SPELL_EFFECT_APPLY_AREA_AURA_RAID,
+    spells.SPELL_EFFECT_APPLY_AREA_AURA_PET,
+    spells.SPELL_EFFECT_APPLY_AREA_AURA_FRIEND,
+    spells.SPELL_EFFECT_APPLY_AREA_AURA_ENEMY,
+    spells.SPELL_EFFECT_APPLY_AREA_AURA_OWNER,
+))
+
 # Every aura type this module can turn into a simulation modifier or a piece of
 # state.  Aura types not listed here are still stored (so they can be dispelled
 # and shown to the client), but they carry no server-side effect yet.
@@ -59,6 +71,11 @@ SUPPORTED_AURA_TYPES = frozenset((
     spells.SPELL_AURA_MOD_FEAR,
     spells.SPELL_AURA_PERIODIC_DAMAGE,
     spells.SPELL_AURA_PERIODIC_HEAL,
+    spells.SPELL_AURA_OBS_MOD_HEALTH,
+    spells.SPELL_AURA_MOD_REGEN,
+    spells.SPELL_AURA_MOD_POWER_REGEN,
+    spells.SPELL_AURA_PERIODIC_DAMAGE_PERCENT,
+    spells.SPELL_AURA_MOD_HEALTH_REGEN_IN_COMBAT,
     spells.SPELL_AURA_MOD_ATTACKSPEED,
     spells.SPELL_AURA_MOD_STUN,
     spells.SPELL_AURA_MOD_DAMAGE_DONE,
@@ -290,7 +307,7 @@ class AurasMixin:
                    int(effect.get("target_b") or 0))
         components = []
         for index, other in enumerate(template.effects):
-            if int(other.get("effect") or 0) != spells.SPELL_EFFECT_APPLY_AURA:
+            if int(other.get("effect") or 0) not in AURA_EFFECT_TYPES:
                 continue
             if (int(other.get("target_a") or 0),
                     int(other.get("target_b") or 0)) != pattern:
@@ -621,6 +638,9 @@ class AurasMixin:
             "reflect": False,
             "spell_penetration": 0,
             "health_regen_pct": 0.0,
+            "health_regen": 0.0,
+            "health_regen_combat": 0.0,
+            "power_regen": {},
             "absorb": [],
             "school_immune": 0,
             "damage_immune": 0,
@@ -800,6 +820,13 @@ class AurasMixin:
                     mods["spell_penetration"] += max(0, amount)
                 elif aura_type == spells.SPELL_AURA_MOD_HEALTH_REGEN_PERCENT:
                     mods["health_regen_pct"] += amount
+                elif aura_type == spells.SPELL_AURA_MOD_REGEN:
+                    mods["health_regen"] += amount
+                elif aura_type == spells.SPELL_AURA_MOD_HEALTH_REGEN_IN_COMBAT:
+                    mods["health_regen_combat"] += amount
+                elif aura_type == spells.SPELL_AURA_MOD_POWER_REGEN:
+                    mods["power_regen"][misc] = (
+                        mods["power_regen"].get(misc, 0) + amount)
                 elif aura_type == spells.SPELL_AURA_SCHOOL_ABSORB:
                     mods["absorb"].append(aura)
                 elif aura_type == spells.SPELL_AURA_SCHOOL_IMMUNITY:
