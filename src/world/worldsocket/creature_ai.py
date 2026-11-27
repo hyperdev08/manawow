@@ -538,6 +538,8 @@ class CreatureAIMixin:
         caster_guid = self._creature_object_guid(int(low_guid), ai["entry"])
         level = int(ai["level"])
         crit_chance = float(spawn["crit_chance"] or 0.0) if "crit_chance" in spawn.keys() else 0.0
+        crit_chance = max(0.0, crit_chance - float(
+            self.character.get("resilience_pct", 0.0) or 0.0))
         ground_started = False
         aura_patterns: set = set()
 

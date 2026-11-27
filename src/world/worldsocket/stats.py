@@ -9,6 +9,7 @@ import time
 from src.common.db_io import run_db_write
 from src.protocol.opcodes import Opcodes
 from src.world import character_db
+from src.world import combat_ratings as CR
 from src.world import login_packets
 from src.world import object_update
 from src.world import spells
@@ -275,7 +276,8 @@ class StatsMixin:
         """
         # Equipment or level changed: the next swing must reread the weapon
         # rows instead of using the session's cached values.
-        for attribute in ("_weapon_stats_cache", "_weapon_proc_cache"):
+        for attribute in ("_weapon_stats_cache", "_weapon_proc_cache",
+                          "_weapon_meta_cache"):
             cache = getattr(self, attribute, None)
             if cache is not None:
                 cache.clear()
@@ -288,6 +290,7 @@ class StatsMixin:
             race, char_class, level)
         if stats is None:
             stats = {"str": 0, "agi": 0, "sta": 0, "inte": 0, "spi": 0}
+        create_stats = dict(stats)
 
         # Equipped items contribute exactly like the item auras CMaNGOS applies
         # in ``Player::_ApplyItemMods``: primary attributes (which then feed the
@@ -439,39 +442,67 @@ class StatsMixin:
                 / 100.0))
         self.character["ranged_attack_power"] = ranged_ap
 
-        # Combat ratings and derived chances.  Ratings are converted with a
-        # flat 15 points per percent (the level-60-ish ratio) because the full
-        # ``GtCombatRatings`` curve is not imported; the result is still a
-        # consistent, gear-driven table rather than fixed 5%/10%.
+        # Combat ratings and derived chances.  All conversions use the
+        # level-scaled ``gtCombatRatings`` curves and the per-class
+        # ``gtOCTClassCombatRatingScalar`` factors, like CMaNGOS
+        # ``Player::GetRatingMultiplier``.
+        path = self.config.database.world_path
         aura_ratings = ((aura_mods.get("ratings") or {})
                         if aura_mods else {})
+
+        def rating_bonus(rating_type: int, rating: int) -> float:
+            return CR.rating_bonus(
+                path, rating_type, int(rating or 0), level, char_class)
+
         hit_rating = int(item_totals.get("hit_rating", 0) or 0) + int(
             aura_ratings.get("hit", 0) or 0)
         crit_rating = int(item_totals.get("crit_rating", 0) or 0) + int(
             aura_ratings.get("crit", 0) or 0)
         haste_rating = int(item_totals.get("haste_rating", 0) or 0) + int(
             aura_ratings.get("haste", 0) or 0)
+        dodge_rating = int(item_totals.get("dodge_rating", 0) or 0) + int(
+            aura_ratings.get("dodge", 0) or 0)
+        parry_rating = int(item_totals.get("parry_rating", 0) or 0) + int(
+            aura_ratings.get("parry", 0) or 0)
+        block_rating = int(item_totals.get("block_rating", 0) or 0) + int(
+            aura_ratings.get("block", 0) or 0)
+        resilience = int(
+            item_totals.get("resilience", 0) or 0) + int(
+                aura_ratings.get("resilience", 0) or 0)
+        armor_penetration = int(
+            item_totals.get("armor_penetration", 0) or 0) + int(
+                aura_ratings.get("armor_penetration", 0) or 0)
+        expertise_rating = int(
+            item_totals.get("expertise", 0) or 0) + int(
+                aura_ratings.get("expertise", 0) or 0)
+        defense_rating = int(
+            item_totals.get("defense_rating", 0) or 0) + int(
+                aura_ratings.get("defense", 0) or 0)
+
         self.character["hit_rating"] = hit_rating
         self.character["crit_rating"] = crit_rating
         self.character["haste_rating"] = haste_rating
-        self.character["resilience"] = int(
-            item_totals.get("resilience", 0) or 0) + int(
-                aura_ratings.get("resilience", 0) or 0)
-        self.character["armor_penetration"] = int(
-            item_totals.get("armor_penetration", 0) or 0) + int(
-                aura_ratings.get("armor_penetration", 0) or 0)
-        self.character["expertise"] = int(
-            item_totals.get("expertise", 0) or 0) + int(
-                aura_ratings.get("expertise", 0) or 0)
-        self.character["defense_rating"] = int(
-            item_totals.get("defense_rating", 0) or 0) + int(
-                aura_ratings.get("defense", 0) or 0)
+        self.character["resilience"] = resilience
+        self.character["armor_penetration"] = armor_penetration
+        self.character["defense_rating"] = defense_rating
+        self.character["expertise"] = int(rating_bonus(
+            CR.CR_EXPERTISE, expertise_rating))
+        self.character["armor_penetration_pct"] = rating_bonus(
+            CR.CR_ARMOR_PENETRATION, armor_penetration)
+        self.character["resilience_pct"] = rating_bonus(
+            CR.CR_CRIT_TAKEN_MELEE, resilience)
+        self.character["defense_skill_bonus"] = CR.rating_to_skill(
+            path, CR.CR_DEFENSE_SKILL, defense_rating, level, char_class)
         self.character["has_shield"] = bool(item_totals.get("shield", 0))
-        self.character["block_value"] = int(
-            item_totals.get("block_value", 0) or 0)
+
+        strength = int(stats.get("str", 0) or 0)
+        flat_block = int(item_totals.get("block_value", 0) or 0)
         if aura_mods:
-            self.character["block_value"] += int(
-                aura_mods.get("block_value", 0) or 0)
+            flat_block += int(aura_mods.get("block_value", 0) or 0)
+        self.character["block_value"] = max(
+            flat_block,
+            int(max(0.0, flat_block + strength * 0.5 - 10.0)))
+
         self.character["spell_power"] = int(
             item_totals.get("spell_power", 0) or 0)
         self.character["healing_power"] = int(
@@ -486,44 +517,91 @@ class StatsMixin:
         else:
             self.character["healing_power"] = 0
             self.character["healing_pct"] = 0.0
+
         agility = int(stats.get("agi", 0) or 0)
+        intellect = int(stats.get("inte", 0) or 0)
         aura_hit = float(aura_mods.get("hit", 0.0)) if aura_mods else 0.0
         aura_spell_hit = float(aura_mods.get("spell_hit", 0.0)) \
             if aura_mods else 0.0
         aura_crit = float(aura_mods.get("crit", 0.0)) if aura_mods else 0.0
         aura_spell_crit = float(aura_mods.get("spell_crit", 0.0)) \
             if aura_mods else 0.0
-        self.character["hit_chance"] = min(
-            100.0, 5.0 + hit_rating / 15.0 + aura_hit)
+        aura_dodge = float(aura_mods.get("dodge", 0.0)) if aura_mods else 0.0
+        aura_parry = float(aura_mods.get("parry", 0.0)) if aura_mods else 0.0
+        aura_block = float(aura_mods.get("block", 0.0)) if aura_mods else 0.0
+
+        hit_bonus = rating_bonus(CR.CR_HIT_MELEE, hit_rating) + aura_hit
+        ranged_hit_bonus = rating_bonus(
+            CR.CR_HIT_RANGED, hit_rating) + aura_hit
+        spell_hit_bonus = rating_bonus(
+            CR.CR_HIT_SPELL, hit_rating) + aura_spell_hit
+        self.character["hit_bonus"] = hit_bonus
+        self.character["ranged_hit_bonus"] = ranged_hit_bonus
+        self.character["spell_hit_bonus"] = spell_hit_bonus
+        self.character["hit_chance"] = min(100.0, 5.0 + hit_bonus)
         self.character["spell_hit_chance"] = min(
-            100.0, 5.0 + hit_rating / 15.0 + aura_spell_hit)
-        self.character["crit_chance"] = min(
-            75.0, 5.0 + crit_rating / 15.0 + agility * 0.005 + aura_crit)
-        self.character["spell_crit_chance"] = min(
-            75.0, 5.0 + crit_rating / 15.0 + aura_spell_crit)
-        self.character["dodge_chance"] = min(
-            75.0, 5.0 + (
-                int(item_totals.get("dodge_rating", 0) or 0)
-                + int(aura_ratings.get("dodge", 0) or 0)) / 15.0
-            + agility * 0.002 + (float(aura_mods.get("dodge", 0.0))
-                                 if aura_mods else 0.0))
-        self.character["parry_chance"] = min(
-            75.0, 5.0 + (
-                int(item_totals.get("parry_rating", 0) or 0)
-                + int(aura_ratings.get("parry", 0) or 0)) / 15.0
-            + (float(aura_mods.get("parry", 0.0)) if aura_mods else 0.0))
+            100.0, 5.0 + spell_hit_bonus)
+
+        crit_from_agility = CR.melee_crit_from_agility(
+            path, char_class, level, agility)
+        spell_crit_from_intellect = CR.spell_crit_from_intellect(
+            path, char_class, level, intellect)
+        melee_crit = min(75.0, crit_from_agility + aura_crit
+                         + rating_bonus(CR.CR_CRIT_MELEE, crit_rating))
+        ranged_crit = min(75.0, crit_from_agility + aura_crit
+                          + rating_bonus(CR.CR_CRIT_RANGED, crit_rating))
+        spell_crit = min(75.0, spell_crit_from_intellect + aura_spell_crit
+                         + rating_bonus(CR.CR_CRIT_SPELL, crit_rating))
+        self.character["crit_chance"] = melee_crit
+        self.character["offhand_crit_chance"] = melee_crit
+        self.character["ranged_crit_chance"] = ranged_crit
+        self.character["spell_crit_chance"] = spell_crit
+
+        class_index = char_class if 0 <= char_class < CR.MAX_CLASSES else 0
+        base_agility = int(create_stats.get("agi", 0) or 0)
+        extra_agility = max(0, agility - base_agility)
+        dodge_raw = (
+            CR.CLASS_BASE_DODGE[class_index]
+            + CR.dodge_from_agility(path, char_class, level, agility)
+            + aura_dodge
+            + rating_bonus(CR.CR_DODGE, dodge_rating))
+        dodge_diminishing = (
+            CR.dodge_from_agility(path, char_class, level, extra_agility)
+            + rating_bonus(CR.CR_DODGE, dodge_rating))
+        self.character["dodge_chance"] = max(0.0, min(75.0, CR.diminish_avoidance(
+            dodge_raw, dodge_diminishing,
+            CR.AVOIDANCE_DIMINISHING_DODGE_CAP[class_index],
+            CR.AVOIDANCE_DIMINISHING_COEFFICIENT[class_index])))
+
+        parry_raw = (
+            (5.0 if CR.class_can_parry(char_class) else 0.0)
+            + aura_parry
+            + rating_bonus(CR.CR_PARRY, parry_rating))
+        self.character["parry_chance"] = max(0.0, min(75.0, CR.diminish_avoidance(
+            parry_raw, rating_bonus(CR.CR_PARRY, parry_rating),
+            CR.AVOIDANCE_DIMINISHING_PARRY_CAP[class_index],
+            CR.AVOIDANCE_DIMINISHING_COEFFICIENT[class_index])))
+
+        block_raw = (
+            (5.0 if self.character["has_shield"] else 0.0)
+            + aura_block
+            + rating_bonus(CR.CR_BLOCK, block_rating))
         self.character["block_chance"] = (
-            min(75.0, 5.0 + (
-                int(item_totals.get("block_rating", 0) or 0)
-                + int(aura_ratings.get("block", 0) or 0)) / 15.0
-                + (float(aura_mods.get("block", 0.0)) if aura_mods else 0.0))
+            max(0.0, min(75.0, block_raw))
             if self.character["has_shield"] else 0.0)
-        self.character["melee_haste"] = haste_rating / 15.0 + (
-            float(aura_mods.get("melee_haste", 0.0)) if aura_mods else 0.0)
-        self.character["ranged_haste"] = haste_rating / 15.0 + (
-            float(aura_mods.get("ranged_haste", 0.0)) if aura_mods else 0.0)
-        self.character["spell_haste"] = haste_rating / 15.0 + (
-            float(aura_mods.get("spell_haste", 0.0)) if aura_mods else 0.0)
+
+        self.character["melee_haste"] = (
+            rating_bonus(CR.CR_HASTE_MELEE, haste_rating) + (
+                float(aura_mods.get("melee_haste", 0.0))
+                if aura_mods else 0.0))
+        self.character["ranged_haste"] = (
+            rating_bonus(CR.CR_HASTE_RANGED, haste_rating) + (
+                float(aura_mods.get("ranged_haste", 0.0))
+                if aura_mods else 0.0))
+        self.character["spell_haste"] = (
+            rating_bonus(CR.CR_HASTE_SPELL, haste_rating) + (
+                float(aura_mods.get("spell_haste", 0.0))
+                if aura_mods else 0.0))
         self.character["spell_penetration"] = int(
             item_totals.get("spell_penetration", 0) or 0) + int(
             aura_mods.get("spell_penetration", 0) if aura_mods else 0)

@@ -8,6 +8,8 @@ import struct
 import time
 
 from src.protocol.opcodes import Opcodes
+from src.world import character_db
+from src.world import combat_ratings as CR
 from src.world import creature
 from src.world import databases
 from src.world import spells
@@ -85,6 +87,16 @@ class CombatMixin:
             if now - combat["last_swing"] >= interval:
                 combat["last_swing"] = now
                 await self._player_swing(now, self._player_weapon_stats())
+            if self._can_dual_wield():
+                offhand = self._player_offhand_weapon_stats()
+                if offhand is not None:
+                    offhand_interval = float(
+                        combat.get("offhand_interval")
+                        or offhand.get("delay", 2.0) or 2.0)
+                    if now - float(combat.get("last_offhand_swing") or 0.0) \
+                            >= offhand_interval:
+                        combat["last_offhand_swing"] = now
+                        await self._player_offhand_swing(now, offhand)
 
         # 2b. ranged auto-attack (Auto Shot / Shoot / wand)
         if combat.get("ranged_attacking") and not combat["dead"] and can_attack:
@@ -194,7 +206,12 @@ class CombatMixin:
         # ``last_swing = 0`` makes the very first swing land on the next tick so
         # the attack feels immediate, like the real client's off-hand timer.
         combat["last_swing"] = 0.0
+        combat["last_offhand_swing"] = 0.0
         combat["swing_interval"] = self._player_weapon_stats()["delay"]
+        offhand = (self._player_offhand_weapon_stats()
+                   if self._can_dual_wield() else None)
+        combat["offhand_interval"] = (
+            offhand["delay"] if offhand is not None else 0.0)
         await self.send_packet(
             Opcodes.SMSG_ATTACKSTART,
             struct.pack("<QQ", int(self.player_guid), int(target_guid)),
@@ -262,62 +279,196 @@ class CombatMixin:
             return
 
         await self._player_melee_attack(weapon, target_guid, spawn, slot=15)
-        # Dual wield: a second, weaker swing from the off-hand weapon on the
-        # same timer.  Retail gives the off-hand a higher miss chance.
-        if int(spawn["dead_since"] or 0) == 0 and self._can_dual_wield():
-            offhand = self._player_offhand_weapon_stats()
-            if offhand is not None:
-                await self._player_melee_attack(
-                    offhand, target_guid, spawn, offhand_swing=True, slot=16)
+
+    async def _player_offhand_swing(self, now: float, weapon: dict) -> None:
+        """One independent off-hand auto-attack swing."""
+        combat = self._get_combat_state()
+        target_guid = combat["target_guid"]
+        low_guid = creature.creature_low_guid(target_guid)
+        spawn = self._get_creature_spawn(low_guid)
+        if spawn is None or int(spawn["dead_since"] or 0) > 0:
+            return
+        if self._distance(self._player_position(),
+                          self._creature_position(low_guid)) > self._melee_reach(
+                              spawn):
+            return
+        if hasattr(self, "_target_in_front") \
+                and not self._target_in_front(target_guid):
+            return
+        if hasattr(self, "_has_line_of_sight") and not await self._has_line_of_sight(
+                self._unit_eye_position(self.player_guid),
+                self._unit_eye_position(target_guid)):
+            return
+        await self._player_melee_attack(
+            weapon, target_guid, spawn, offhand_swing=True, slot=16)
 
     def _clamp_chance(self, value: float, high: float = 100.0) -> float:
         return max(0.0, min(float(high), float(value)))
 
-    def _player_melee_table(self, target_level: int,
-                            offhand: bool = False) -> list:
-        """Chance table in the reference core's order (miss..crit)."""
+    def _skill_max_for_level(self) -> int:
+        return max(1, int(self.character.get("level", 1))) * 5
+
+    def _skill_value(self, skill_id: int) -> int:
+        """Stored skill value, floored at the level cap for weapon skills."""
+        skills = self.character.get("skills") or {}
+        entry = skills.get(int(skill_id))
+        if isinstance(entry, dict):
+            value = int(entry.get("value", 0) or 0)
+        else:
+            value = int(entry or 0)
+        return max(value, self._skill_max_for_level())
+
+    def _weapon_skill_value(self, slot: int) -> int:
+        meta = self._equipped_weapon_meta(int(slot))
+        skill_id = (CR.weapon_skill_for_subclass(meta["subclass"])
+                    if meta is not None else CR.SKILL_UNARMED)
+        value = self._skill_value(skill_id)
+        if slot == 16:
+            value += int(self.character.get("weapon_skill_bonus_offhand", 0)
+                         or 0)
+        elif slot == 17:
+            value += int(self.character.get("weapon_skill_bonus_ranged", 0)
+                         or 0)
+        else:
+            value += int(self.character.get("weapon_skill_bonus_main", 0)
+                         or 0)
+        return value
+
+    def _defense_skill_value(self) -> int:
+        return int(self._skill_value(CR.SKILL_DEFENSE)
+                   + float(self.character.get("defense_skill_bonus", 0.0)
+                           or 0.0))
+
+    def _player_melee_table(self, target_level: int, offhand: bool = False,
+                            target_spawn=None, white_swing: bool = True) -> list:
+        """Player attack table using weapon vs defense skill and ratings."""
         level = max(1, int(self.character.get("level", 1)))
-        diff = max(0, int(target_level) - level)
-        miss = 5.0 + diff - (
-            float(self.character.get("hit_chance", 5.0)) - 5.0)
-        if offhand:
-            miss += 15.0
-        expertise = max(0, int(self.character.get("expertise", 0) or 0))
-        dodge = max(0.0, 5.0 + diff * 0.5 - expertise * 0.25)
-        parry = max(0.0, 5.0 + diff * 0.5 - expertise * 0.25)
+        skill = self._weapon_skill_value(16 if offhand else 15)
+        defense = max(1, int(target_level)) * 5
+        difference = defense - skill
+        hit_difference = difference
+        miss = 5.0
+        if hit_difference > 0:
+            if hit_difference > 10:
+                miss += 1.0
+                hit_difference -= 10
+                factor = 0.4
+            else:
+                factor = 0.1
+            miss += hit_difference * factor
+        else:
+            miss += hit_difference * 0.04
+        if white_swing and self._can_dual_wield():
+            miss += 19.0
+        hit_bonus = float(self.character.get(
+            "hit_bonus", max(0.0, float(
+                self.character.get("hit_chance", 5.0) or 5.0) - 5.0)))
+        miss -= hit_bonus
+
+        target = target_spawn if target_spawn is not None else {}
+        def target_stat(name, default):
+            try:
+                value = target[name]
+            except (KeyError, IndexError, TypeError):
+                return default
+            return float(value if value is not None else default)
+
+        # Creatures have a 5% base dodge/parry; block only when the spawn
+        # actually carries a shield/block chance.
+        dodge_base = target_stat("dodge_chance", 5.0)
+        parry_base = target_stat("parry_chance", 5.0)
+        block_base = target_stat(
+            "block_chance", 5.0 if target_spawn is not None else 0.0)
+        dodge = dodge_base + (
+            difference * 0.1 if difference > 0 else difference * 0.04)
+        if difference > 10:
+            parry = parry_base + 1.0 + (difference - 10) * 0.4
+        elif difference > 0:
+            parry = parry_base + difference * 0.1
+        else:
+            parry = parry_base + difference * 0.04
+        block = block_base + (
+            0.0 if difference > 0 else difference * 0.04)
+        expertise = max(0.0, float(
+            self.character.get("expertise", 0.0) or 0.0))
+        dodge = max(0.0, dodge - expertise * 0.25)
+        parry = max(0.0, parry - expertise * 0.25)
+        glancing = (self._clamp_chance(10.0 + difference, 100.0)
+                    if white_swing else 0.0)
+        crit = float(self.character.get(
+            "offhand_crit_chance" if offhand else "crit_chance", 5.0) or 5.0)
+        # NPC crit suppression: 0.2% per point of defense above the attacker's
+        # level cap (CMaNGOS CalculateEffectiveCritChance, !vsPlayerOrPet).
+        crit += (self._skill_max_for_level() - defense) * 0.2
+        crit = self._clamp_chance(crit, 100.0)
         return [
-            ("miss", self._clamp_chance(miss, 60.0)),
-            ("dodge", self._clamp_chance(dodge, 30.0)),
-            ("parry", self._clamp_chance(parry, 30.0)),
-            ("glancing", 15.0 if diff >= 3 else 0.0),
-            ("crit", self._clamp_chance(
-                float(self.character.get("crit_chance", 5.0)), 50.0)),
+            ("miss", self._clamp_chance(miss, 100.0)),
+            ("dodge", self._clamp_chance(dodge, 100.0)),
+            ("parry", self._clamp_chance(parry, 100.0)),
+            ("block", self._clamp_chance(block, 100.0)),
+            ("glancing", glancing),
+            ("crit", crit),
+        ]
+
+    def _player_ranged_table(self, target_level: int) -> list:
+        """Ranged Auto Shot/Shoot table: miss and crit only."""
+        skill = self._weapon_skill_value(17)
+        defense = max(1, int(target_level)) * 5
+        difference = defense - skill
+        hit_difference = difference
+        miss = 5.0
+        if hit_difference > 0:
+            if hit_difference > 10:
+                miss += 1.0
+                hit_difference -= 10
+                factor = 0.4
+            else:
+                factor = 0.1
+            miss += hit_difference * factor
+        else:
+            miss += hit_difference * 0.04
+        hit_bonus = float(self.character.get(
+            "ranged_hit_bonus", max(0.0, float(
+                self.character.get("hit_chance", 5.0) or 5.0) - 5.0)))
+        miss -= hit_bonus
+        crit = float(self.character.get("ranged_crit_chance", 5.0) or 5.0)
+        crit += (self._skill_max_for_level() - defense) * 0.2
+        return [
+            ("miss", self._clamp_chance(miss, 100.0)),
+            ("crit", self._clamp_chance(crit, 100.0)),
         ]
 
     def _creature_melee_table(self, attacker_level: int) -> list:
         """Player defence table against a creature melee swing."""
         level = max(1, int(self.character.get("level", 1)))
-        diff = max(0, int(attacker_level) - level)
-        resilience = float(self.character.get("resilience", 0) or 0) / 25.0
+        attacker_skill = max(1, int(attacker_level)) * 5
+        defense = self._defense_skill_value()
+        difference = defense - attacker_skill
         stunned = bool(hasattr(self, "_player_aura_mods")
                        and self._player_aura_mods().get("stunned"))
-        # ``Unit::GetUnitDodgeChance`` and friends return zero while stunned;
-        # the attacker can still miss, but the victim cannot avoid the hit.
-        block = 0.0 if stunned else (
-            float(self.character.get("block_chance", 0.0))
-            if self.character.get("has_shield") else 0.0)
-        dodge = 0.0 if stunned else (
-            float(self.character.get("dodge_chance", 5.0)) + diff * 0.5)
-        parry = 0.0 if stunned else (
-            float(self.character.get("parry_chance", 5.0)) + diff * 0.5)
+        resilience = float(self.character.get("resilience_pct", 0.0) or 0.0)
+        skill_cap = max(1, level) * 5
+        # ``Unit::CalculateEffectiveMissChance`` for a player-controlled victim.
+        miss = 5.0 + difference * 0.04
+        dodge = float(self.character.get("dodge_chance", 5.0) or 5.0)
+        parry = float(self.character.get("parry_chance", 5.0) or 5.0)
+        block = (float(self.character.get("block_chance", 0.0) or 0.0)
+                 if self.character.get("has_shield") else 0.0)
+        dodge += difference * 0.04
+        parry += difference * 0.04
+        block += difference * 0.04
+        if stunned:
+            dodge = parry = block = 0.0
+        crit = 5.0 + (skill_cap - defense) * 0.04 - resilience
+        deficit = attacker_skill - min(defense, skill_cap)
+        crushing = ((2 * deficit) - 15) if deficit >= 20 else 0.0
         return [
-            ("miss", self._clamp_chance(5.0 + diff, 60.0)),
+            ("miss", self._clamp_chance(miss, 100.0)),
             ("dodge", self._clamp_chance(dodge, 40.0)),
             ("parry", self._clamp_chance(parry, 40.0)),
-            ("block", 0.0 if stunned else self._clamp_chance(
-                block + diff * 0.5, 40.0)),
-            ("crushing", 15.0 if diff >= 3 else 0.0),
-            ("crit", self._clamp_chance(5.0 + diff * 0.5 - resilience, 40.0)),
+            ("block", self._clamp_chance(block, 40.0)),
+            ("crushing", self._clamp_chance(crushing, 100.0)),
+            ("crit", self._clamp_chance(crit, 40.0)),
         ]
 
     @staticmethod
@@ -350,7 +501,7 @@ class CombatMixin:
                     hit_info=hit_info)
                 return False
         outcome = self._roll_melee(
-            self._player_melee_table(target_level, offhand_swing))
+            self._player_melee_table(target_level, offhand_swing, spawn))
         if outcome == "miss":
             await self._send_attacker_state_update(
                 self.player_guid, target_guid, 0, is_miss=True,
@@ -370,7 +521,17 @@ class CombatMixin:
         if offhand_swing:
             damage *= 0.5
         if outcome == "glancing":
-            damage *= 0.7
+            # ``Unit::CalculateGlanceAmount``: the reduction depends on the
+            # defense/weapon-skill difference rather than a fixed 70%.
+            skill = min(self._weapon_skill_value(16 if offhand_swing else 15),
+                        self._skill_max_for_level())
+            difference = max(0, target_level * 5 - skill)
+            caster = int(self.character.get("class", 0) or 0) in (5, 8, 9)
+            high = max(0.2, min(0.99, (0.9 if caster else 1.2)
+                                - 0.03 * difference))
+            low = max(0.01, (0.6 if caster else 1.3) - 0.05 * difference)
+            low = min(low, min(0.6 if caster else 0.91, high))
+            damage *= random.uniform(low, high)
             hit_info |= 0x00010000          # HITINFO_GLANCING
         elif outcome == "crit":
             damage *= 2.0
@@ -385,8 +546,11 @@ class CombatMixin:
             armor += int(mods.get("armor", 0) or 0)
             armor = int(armor * (
                 1.0 + float(mods.get("armor_pct", 0.0) or 0.0) / 100.0))
-        armor = max(0, armor - int(
-            self.character.get("armor_penetration", 0) or 0))
+        penetration = max(0.0, min(100.0, float(
+            self.character.get("armor_penetration_pct", 0.0) or 0.0)))
+        if penetration:
+            armor = int(armor * (1.0 - penetration / 100.0))
+        armor = max(0, armor)
         if armor > 0:
             damage = self._armor_reduced_damage(
                 max(1, int(round(damage))), armor, target_level)
@@ -394,6 +558,18 @@ class CombatMixin:
         if hasattr(self, "_apply_damage_modifiers"):
             damage = self._apply_damage_modifiers(
                 "creature", target_guid, 1, damage)
+        blocked_amount = 0
+        victim_state = 0
+        if outcome == "block":
+            block_value = int(spawn["block_value"] or 0) \
+                if "block_value" in spawn.keys() else 0
+            if not block_value:
+                # ``Creature::GetShieldBlockValue``.
+                block_value = max(1, target_level // 2)
+            blocked_amount = min(damage, max(1, block_value))
+            damage = max(0, damage - blocked_amount)
+            hit_info |= 0x00002000          # HITINFO_BLOCK
+            victim_state = 5                # VICTIMSTATE_BLOCKS
         absorbed = 0
         if hasattr(self, "_absorb_damage"):
             absorbed, depleted = self._absorb_damage(
@@ -406,7 +582,8 @@ class CombatMixin:
         await self._send_attacker_state_update(
             self.player_guid, target_guid, damage,
             is_crit=(outcome == "crit"), hit_info=hit_info,
-            absorbed=absorbed)
+            victim_state=victim_state, absorbed=absorbed,
+            blocked=blocked_amount)
         self._gain_rage(damage, weapon_speed=weapon["delay"],
                         crit=(outcome == "crit"))
         result = (False if damage <= 0 else
@@ -420,6 +597,99 @@ class CombatMixin:
         if hasattr(self, "_break_cc_on_damage"):
             await self._break_cc_on_damage("creature", target_guid, 0)
         return result
+
+    def _equipped_weapon_meta(self, slot: int):
+        """Subclass/ammo/stack metadata for one weapon slot."""
+        cache = getattr(self, "_weapon_meta_cache", None)
+        if cache is None:
+            cache = {}
+            self._weapon_meta_cache = cache
+        slot = int(slot)
+        if slot in cache:
+            return cache[slot]
+        con = databases.connect_character(self.config.database.world_path)
+        con.row_factory = sqlite3.Row
+        try:
+            row = con.execute(
+                "SELECT ci.item_entry, ci.stack_count, it.subclass,"
+                " it.inventory_type, it.ammo_type, it.damage_min1,"
+                " it.damage_max1, it.delay"
+                " FROM character_items ci"
+                " JOIN item_templates it ON it.entry = ci.item_entry"
+                " WHERE ci.character_guid = ? AND ci.slot = ?",
+                (int(self.player_guid or 0), slot),
+            ).fetchone()
+        finally:
+            con.close()
+        cache[slot] = dict(row) if row is not None else None
+        return cache[slot]
+
+    def _item_template_cached(self, entry: int):
+        cache = getattr(self, "_item_template_cache", None)
+        if cache is None:
+            cache = {}
+            self._item_template_cache = cache
+        entry = int(entry)
+        if entry not in cache:
+            cache[entry] = character_db.get_item_template(
+                self.config.database.world_path, entry)
+        return cache[entry]
+
+    def _ranged_ammo(self, weapon):
+        """Return the ammo stack used by a ranged weapon, or ``None``.
+
+        Thrown weapons use their own equipped stack.  Bows/crossbows use
+        arrows (subclass 2) and guns use bullets (subclass 3), matching the
+        weapon's ``ammo_type``.
+        """
+        if weapon is None:
+            return None
+        inventory = (self.character or {}).get("inventory") or {}
+        if (int(weapon.get("inventory_type") or 0) == 25
+                or int(weapon.get("subclass") or 0) == 16):
+            item = inventory.get(17)
+            if item is None or int(item.get("stack_count", 0) or 0) <= 0:
+                return None
+            return {
+                "kind": "thrown", "slot": 17, "item": item,
+                "min": float(weapon.get("damage_min1") or 0.0),
+                "max": float(weapon.get("damage_max1") or 0.0),
+            }
+        ammo_type = int(weapon.get("ammo_type") or 0)
+        if ammo_type <= 0:
+            return None
+        for slot, item in inventory.items():
+            if int(item.get("stack_count", 1) or 1) <= 0:
+                continue
+            template = self._item_template_cached(
+                int(item.get("item_entry") or 0))
+            if template is None:
+                continue
+            if int(template["class"] or 0) != 6 \
+                    or int(template["subclass"] or 0) != ammo_type:
+                continue
+            return {
+                "kind": "ammo", "slot": int(slot), "item": item,
+                "min": float(template["damage_min1"] or 0.0),
+                "max": float(template["damage_max1"] or 0.0),
+            }
+        return None
+
+    async def _consume_ranged_ammo(self, ammo) -> bool:
+        if ammo is None:
+            return False
+        if hasattr(self, "_remove_item_from_slot"):
+            removed = await self._remove_item_from_slot(
+                int(ammo["slot"]), 1, notify_quests=False)
+            return bool(removed)
+        return False
+
+    def _ranged_min_range(self, spell_id: int) -> float:
+        if int(spell_id or 0) == 75:       # Auto Shot's client dead zone
+            return 5.0
+        template = spells.get_spell_template(
+            self.config.database.world_path, int(spell_id or 0))
+        return float(getattr(template, "get_min_range", lambda: 0.0)())
 
     def _equipped_weapon_stats(self, slot: int, fallback: bool):
         if int(slot) in (15, 16) and hasattr(self, "_player_aura_mods") \
@@ -736,7 +1006,24 @@ class CombatMixin:
         if stats is None:
             combat["ranged_attacking"] = False
             return
+        weapon = self._equipped_weapon_meta(17)
+        subclass = int(weapon.get("subclass") or 0) if weapon else 0
+        if subclass == 19:
+            spell_id = 5019          # wand Shoot
+        elif subclass == 16 or (weapon is not None
+                                and int(weapon.get("inventory_type") or 0) == 25):
+            spell_id = 2764          # Throw
+        else:
+            spell_id = 75            # Auto Shot
+        combat["ranged_spell_id"] = int(spell_id)
         combat["ranged_interval"] = stats["delay"]
+        low_target = creature.creature_low_guid(int(target_guid))
+        distance = self._distance(
+            self._player_position(), self._creature_position(low_target))
+        if distance < self._ranged_min_range(int(spell_id)):
+            await self.send_packet(Opcodes.SMSG_ATTACKSWING_CANT_ATTACK, b"")
+            combat["ranged_attacking"] = False
+            return
         await self.send_packet(
             Opcodes.SMSG_ATTACKSTART,
             struct.pack("<QQ", int(self.player_guid), int(target_guid)),
@@ -757,10 +1044,25 @@ class CombatMixin:
             return
         stats = self._player_ranged_weapon_stats()
         if stats is None:
+            await self.handle_attack_stop(b"")
+            return
+        weapon = self._equipped_weapon_meta(17)
+        ammo = self._ranged_ammo(weapon)
+        is_thrown = bool(weapon is not None and (
+            int(weapon.get("inventory_type") or 0) == 25
+            or int(weapon.get("subclass") or 0) == 16))
+        needs_ammo = bool(is_thrown or (
+            weapon is not None and int(weapon.get("ammo_type") or 0) > 0))
+        if needs_ammo and ammo is None:
+            await self.handle_attack_stop(b"")
             return
         distance = self._distance(self._player_position(),
                                  self._creature_position(low))
         if distance > 41.0:
+            return
+        min_range = self._ranged_min_range(
+            int(combat.get("ranged_spell_id") or 75))
+        if min_range > 0.0 and distance < min_range:
             return
         if hasattr(self, "_target_in_front") \
                 and not self._target_in_front(target_guid):
@@ -774,30 +1076,32 @@ class CombatMixin:
         if now - float(combat.get("last_ranged_swing") or 0.0) < interval:
             return
         combat["last_ranged_swing"] = now
+        if ammo is not None and not await self._consume_ranged_ammo(ammo):
+            await self.handle_attack_stop(b"")
+            return
         target_level = max(1, int(spawn["min_level"] or 1))
-        outcome = self._roll_melee(
-            self._player_melee_table(target_level, offhand=False))
+        outcome = self._roll_melee(self._player_ranged_table(target_level))
         if outcome == "miss":
             await self._send_attacker_state_update(
                 self.player_guid, target_guid, 0, is_miss=True)
-            return
-        if outcome in ("dodge", "parry"):
-            await self._send_attacker_state_update(
-                self.player_guid, target_guid, 0,
-                victim_state=2 if outcome == "dodge" else 3)
             return
         damage = random.uniform(stats["min"], stats["max"])
         damage += max(1.0, int(self.character.get("level", 1)) * 0.5)
         damage += (int(self.character.get("ranged_attack_power", 0) or 0)
                    / 14.0 * float(stats["delay"]))
+        if ammo is not None and ammo.get("kind") != "thrown":
+            damage += random.uniform(ammo["min"], ammo["max"])
         if outcome == "crit":
             damage *= 2.0
         if hasattr(self, "_apply_damage_done"):
             damage = self._apply_damage_done(1, max(1, int(round(damage))))
         damage = max(1, int(round(damage)))
         armor = int(spawn["armor"] or 0) if "armor" in spawn.keys() else 0
-        armor = max(0, armor - int(
-            self.character.get("armor_penetration", 0) or 0))
+        penetration = max(0.0, min(100.0, float(
+            self.character.get("armor_penetration_pct", 0.0) or 0.0)))
+        if penetration:
+            armor = int(armor * (1.0 - penetration / 100.0))
+        armor = max(0, armor)
         if armor > 0:
             damage = self._armor_reduced_damage(
                 damage, armor, target_level)

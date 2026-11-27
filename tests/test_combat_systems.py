@@ -17,6 +17,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
 from src.protocol.opcodes import Opcodes
+from src.world import combat_ratings as CR
 from src.world import creature, databases, spells
 from src.world import los
 from src.world.realmsocket import WorldSocket
@@ -925,6 +926,7 @@ async def test_melee_and_ranged_apply_damage_done_bonus():
     assert before - spawn["current_health"] == seen[-1][2]
 
     spawn["current_health"] = 500
+    spawn["x"] = 10.0
     session._player_ranged_weapon_stats = lambda: {
         "min": 100.0, "max": 100.0, "delay": 2.0, "base_delay": 2.0}
     session._combat_state.update({
@@ -998,3 +1000,146 @@ async def test_stunned_player_cannot_dodge_parry_or_block():
     assert table["parry"] == 0
     assert table["block"] == 0
     assert table["miss"] > 0
+
+def test_combat_rating_curves_are_level_scaled():
+    assert abs(CR.rating_bonus(
+        WORLD_DB, CR.CR_CRIT_MELEE, 459, 80, 1) - 10.0) < 0.05
+    assert abs(CR.rating_bonus(
+        WORLD_DB, CR.CR_HIT_MELEE, 328, 80, 1) - 10.0) < 0.1
+    assert abs(CR.rating_bonus(
+        WORLD_DB, CR.CR_EXPERTISE, 82, 80, 1) - 10.0) < 0.1
+    # The same rating is worth much more at 60 than at 80.
+    low = CR.rating_bonus(WORLD_DB, CR.CR_CRIT_MELEE, 140, 60, 1)
+    high = CR.rating_bonus(WORLD_DB, CR.CR_CRIT_MELEE, 140, 80, 1)
+    assert low > high * 2
+
+
+@_async_test
+async def test_weapon_and_defense_skill_attack_table():
+    session = FakeUnit(char_class=1, level=20)
+    table = dict(session._player_melee_table(23))
+    # 15 defense over weapon skill: 5% + 1% + 5 * 0.4%.
+    assert abs(table["miss"] - 8.0) < 0.01
+    assert abs(table["dodge"] - 6.5) < 0.01
+    assert abs(table["parry"] - 8.0) < 0.01
+    assert abs(table["glancing"] - 25.0) < 0.01
+    base_crit = float(session.character["crit_chance"])
+    assert table["crit"] < base_crit
+    assert abs(table["crit"] - max(0.0, base_crit - 3.0)) < 0.01
+
+
+@_async_test
+async def test_avoidance_uses_class_caps_and_parry_capability():
+    mage = FakeUnit(char_class=8)
+    assert mage.character["dodge_chance"] > 0
+    assert mage.character["parry_chance"] == 0
+    warrior = FakeUnit(char_class=1)
+    assert warrior.character["parry_chance"] >= 5.0
+    assert warrior.character["block_chance"] == 0
+
+
+@_async_test
+async def test_armor_penetration_uses_percentage():
+    session = FakeUnit()
+    target = session.add_creature(11, x=1.0)
+    spawn = session._spawns[11]
+    spawn["armor"] = 10000
+    session._roll_melee = lambda table: "hit"
+    session._roll_weapon_procs = mock.AsyncMock()
+
+    spawn["current_health"] = 500
+    await session._player_melee_attack(
+        {"min": 100.0, "max": 100.0, "delay": 2.0}, target, spawn)
+    plain = 500 - spawn["current_health"]
+
+    spawn["current_health"] = 500
+    session.character["armor_penetration_pct"] = 50.0
+    await session._player_melee_attack(
+        {"min": 100.0, "max": 100.0, "delay": 2.0}, target, spawn)
+    penetrated = 500 - spawn["current_health"]
+    assert penetrated > plain
+
+
+@_async_test
+async def test_main_and_offhand_swings_are_separate():
+    session = FakeUnit()
+    target = session.add_creature(11, x=1.0)
+    session._combat_state["target_guid"] = target
+    session.character["o"] = 0.0
+    session._can_dual_wield = lambda: True
+    session._has_line_of_sight = mock.AsyncMock(return_value=True)
+    calls = []
+
+    async def attack(weapon, target_guid, spawn, **kwargs):
+        calls.append(kwargs)
+        return False
+
+    session._player_melee_attack = attack
+    weapon = {"min": 1.0, "max": 2.0, "delay": 2.0}
+    await session._player_swing(10.0, weapon)
+    assert len(calls) == 1
+    assert not calls[-1].get("offhand_swing")
+    await session._player_offhand_swing(10.0, weapon)
+    assert len(calls) == 2
+    assert calls[-1].get("offhand_swing") is True
+
+
+@_async_test
+async def test_ranged_table_and_ammo_selection():
+    session = FakeUnit()
+    session.character["ranged_crit_chance"] = 12.0
+    session.character["ranged_hit_bonus"] = 3.0
+    table = dict(session._player_ranged_table(20))
+    assert abs(table["crit"] - 12.0) < 0.01
+    assert abs(table["miss"] - 2.0) < 0.01
+
+    session.character["inventory"] = {
+        30: {"item_entry": 2512, "stack_count": 5}}
+    session._item_template_cached = lambda entry: {
+        "class": 6, "subclass": 2,
+        "damage_min1": 1.0, "damage_max1": 2.0}
+    ammo = session._ranged_ammo({
+        "ammo_type": 2, "inventory_type": 15, "subclass": 2})
+    assert ammo is not None and ammo["slot"] == 30
+    session._remove_item_from_slot = mock.AsyncMock(return_value=1)
+    assert await session._consume_ranged_ammo(ammo)
+    session._remove_item_from_slot.assert_awaited_once_with(
+        30, 1, notify_quests=False)
+
+    session.character["inventory"] = {
+        17: {"item_entry": 25861, "stack_count": 3}}
+    thrown = session._ranged_ammo({
+        "ammo_type": 4, "inventory_type": 25, "subclass": 16,
+        "damage_min1": 2.0, "damage_max1": 4.0})
+    assert thrown is not None and thrown["kind"] == "thrown"
+    assert session._ranged_min_range(75) == 5.0
+    assert session._ranged_min_range(5019) == 0.0
+
+@_async_test
+async def test_block_outcome_reduces_player_damage():
+    session = FakeUnit()
+    target = session.add_creature(11, x=1.0)
+    spawn = session._spawns[11]
+    spawn["block_value"] = 1000
+    session._roll_melee = lambda table: "block"
+    session._roll_weapon_procs = mock.AsyncMock()
+    before = spawn["current_health"]
+    await session._player_melee_attack(
+        {"min": 100.0, "max": 100.0, "delay": 2.0}, target, spawn)
+    assert spawn["current_health"] == before
+    packet = [payload for opcode, payload in session.sent
+              if opcode == int(Opcodes.SMSG_ATTACKERSTATEUPDATE)][-1]
+    flags = struct.unpack_from("<I", packet, 0)[0]
+    assert flags & 0x00002000          # HITINFO_BLOCK
+
+
+@_async_test
+async def test_resilience_reduces_incoming_crit_damage():
+    session = FakeUnit()
+    session.character["resilience_pct"] = 33.0
+    session.character["health"] = 1000
+    template = spells.get_spell_template(WORLD_DB, 116)
+    await session._deal_spell_damage(
+        session.player_guid, 100, spells.SCHOOL_FROST, template,
+        session.player_guid, critical=True)
+    assert session.character["health"] == 933

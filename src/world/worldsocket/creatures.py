@@ -654,18 +654,25 @@ class CreaturesMixin:
                     creature_level)
                 hit_info = 0
                 victim_state = 1
+                blocked_amount = 0
                 if outcome == "block":
                     blocked = max(
                         int(self.character.get("block_value", 0) or 0),
                         int(damage * 0.3))
-                    damage = max(1, damage - blocked)
+                    blocked_amount = min(damage, blocked)
+                    damage = max(0, damage - blocked_amount)
                     hit_info |= 0x00002000      # HITINFO_BLOCK
+                    # ``VictimState`` keeps a 1-based minimum in the packet.
                     victim_state = 5           # VICTIMSTATE_BLOCKS
                 elif outcome == "crushing":
                     damage = int(damage * 1.5)
                     hit_info |= 0x00020000      # HITINFO_CRUSHING
                 elif outcome == "crit":
                     damage *= 2
+                    resilience = float(self.character.get(
+                        "resilience_pct", 0.0) or 0.0)
+                    if resilience:
+                        damage *= 1.0 - min(0.33, resilience * 0.022)
                 if hasattr(self, "_apply_damage_modifiers"):
                     damage = self._apply_damage_modifiers(
                         "player", self.player_guid, 1, damage)
@@ -684,7 +691,7 @@ class CreaturesMixin:
                     self.player_guid, damage,
                     is_crit=(outcome == "crit"),
                     victim_state=victim_state, hit_info=hit_info,
-                    absorbed=absorbed,
+                    absorbed=absorbed, blocked=blocked_amount,
                 )
                 # Creature auto-attacks are normal-school melee, the only
                 # damage source that fills a warrior's rage bar.

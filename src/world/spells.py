@@ -920,6 +920,23 @@ class SpellTemplate:
         }
         return float(ranges.get(self.range_index, 5.0))
 
+    def get_min_range(self) -> float:
+        """Return the spell's minimum range in yards (SpellRange.dbc)."""
+        ranges = {
+            1: 0.0, 2: 0.0, 3: 0.0, 4: 0.0, 5: 0.0, 6: 0.0, 7: 0.0,
+            8: 10.0, 9: 10.0, 10: 10.0, 11: 0.0, 12: 0.0, 13: 0.0,
+            14: 0.0, 34: 0.0, 35: 0.0, 36: 0.0, 37: 0.0, 38: 10.0,
+            54: 5.0, 74: 0.0, 94: 8.0, 95: 8.0, 96: 0.0, 114: 0.0,
+            134: 0.0, 135: 0.0, 136: 30.0, 137: 0.0, 139: 5.0,
+            140: 0.0, 141: 0.0, 150: 8.0, 151: 5.0, 152: 0.0,
+            153: 0.0, 154: 10.0, 155: 0.0, 156: 30.0, 157: 0.0,
+            159: 0.0, 160: 0.0, 161: 0.0, 162: 0.0, 163: 8.0,
+            164: 10.0, 167: 40.0, 169: 0.0, 170: 0.0, 172: 0.0,
+            173: 5.0, 174: 0.0, 176: 0.0, 180: 5.0, 181: 0.0,
+            184: 5.0, 187: 0.0,
+        }
+        return float(ranges.get(self.range_index, 0.0))
+
     def get_casting_time_ms(self) -> int:
         """Return the cast time in milliseconds (SpellCastTimes.dbc)."""
         times = {

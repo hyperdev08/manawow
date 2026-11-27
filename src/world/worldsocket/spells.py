@@ -953,6 +953,10 @@ class SpellsMixin:
             return max(1, int(self.character.get("level", 1)))
         if hasattr(self, "_is_peer_player_guid") \
                 and self._is_peer_player_guid(target_guid):
+            peer = (self._peer_session_for_guid(target_guid)
+                    if hasattr(self, "_peer_session_for_guid") else None)
+            if peer is not None and peer.character:
+                return max(1, int(peer.character.get("level", 1)))
             return max(1, int(self.character.get("level", 1)))
         low = creature.creature_low_guid(int(target_guid or 0))
         spawn = self._get_creature_spawn(low)
@@ -1003,9 +1007,6 @@ class SpellsMixin:
                   "miss_type": spells.SPELL_MISS_NONE}
         if not target_guid or self._is_player_guid(target_guid):
             return result
-        if hasattr(self, "_is_peer_player_guid") \
-                and self._is_peer_player_guid(target_guid):
-            return result
         if template.attributes_ex3 & spells.SPELL_ATTR_EX3_CANT_MISS:
             return result
         if "spell_hit_chance" not in self.character:
@@ -1015,7 +1016,8 @@ class SpellsMixin:
                 and hasattr(self, "_player_melee_table"):
             target_level = self._spell_target_level(target_guid)
             outcome = self._roll_melee(
-                self._player_melee_table(target_level))
+                self._player_melee_table(
+                    target_level, white_swing=False))
             if outcome == "miss":
                 result["hit"] = False
                 result["miss_type"] = spells.SPELL_MISS_MISS
@@ -1044,6 +1046,12 @@ class SpellsMixin:
             self.character.get("spell_crit_chance", 0.0) or 0.0))
         crit_chance = max(0.0, float(self._spell_mod_value(
             template, spells.SPELLMOD_CRITICAL_CHANCE, crit_chance)))
+        if crit_chance and self._spell_target_kind(target_guid) == "peer":
+            peer = (self._peer_session_for_guid(target_guid)
+                    if hasattr(self, "_peer_session_for_guid") else None)
+            if peer is not None and peer.character:
+                crit_chance = max(0.0, crit_chance - float(
+                    peer.character.get("resilience_pct", 0.0) or 0.0))
         if crit_chance and random.uniform(0.0, 100.0) < crit_chance:
             result["crit"] = True
         return result
@@ -1324,6 +1332,12 @@ class SpellsMixin:
             if peer is not None:
                 target_session = peer
         target_kind = "player" if kind in ("player", "peer") else "creature"
+        if critical and hasattr(target_session, "character"):
+            resilience = float(target_session.character.get(
+                "resilience_pct", 0.0) or 0.0)
+            if resilience:
+                reduction = min(0.33, resilience * 0.022)
+                amount = max(0, int(amount * (1.0 - reduction)))
         if int(school) & 1 and hasattr(self, "_armor_reduced_damage"):
             if kind in ("player", "peer"):
                 armor = int(getattr(target_session, "character", {}).get(
@@ -1339,6 +1353,10 @@ class SpellsMixin:
                     armor += int(mods.get("armor", 0) or 0)
                     armor = int(armor * (1.0 + float(
                         mods.get("armor_pct", 0.0) or 0.0) / 100.0))
+            penetration = max(0.0, min(100.0, float(
+                self.character.get("armor_penetration_pct", 0.0) or 0.0)))
+            if penetration:
+                armor = int(armor * (1.0 - penetration / 100.0))
             amount = self._armor_reduced_damage(
                 amount, armor, self._spell_target_level(target_guid))
         absorbed = 0
@@ -3619,7 +3637,8 @@ class SpellsMixin:
                                           school: int = 1,
                                           victim_state: int = 0,
                                           hit_info: int = 0,
-                                          absorbed: int = 0) -> None:
+                                          absorbed: int = 0,
+                                          blocked: int = 0) -> None:
         """Send ``SMSG_ATTACKERSTATEUPDATE`` for one melee hit.
 
         Layout from CMaNGOS 3.3.5 ``Unit::SendAttackStateUpdate``: ``uint32
@@ -3665,4 +3684,6 @@ class SpellsMixin:
         out += struct.pack("<B", victim_state)
         out += struct.pack("<I", 0)      # attacker state
         out += struct.pack("<I", 0)      # melee spell id
+        if flags & 0x00002000:
+            out += struct.pack("<I", max(0, int(blocked or 0)) & 0xFFFFFFFF)
         await self.send_packet(Opcodes.SMSG_ATTACKERSTATEUPDATE, bytes(out))

@@ -479,6 +479,8 @@ class SocketBase:
                 "ranged_interval": 2.0,
                 "last_swing": 0.0,
                 "swing_interval": 2.0,
+                "last_offhand_swing": 0.0,
+                "offhand_interval": 0.0,
                 "pending_cast": None,
                 "channel": None,
                 "school_lockout": {},

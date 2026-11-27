@@ -541,6 +541,40 @@ CREATE TABLE IF NOT EXISTS creature_family(
   pet_talent_type INTEGER NOT NULL DEFAULT -1
 );
 
+-- 3.3.5 combat-rating curves (gtCombatRatings.dbc) and per-class scalars.
+CREATE TABLE IF NOT EXISTS combat_ratings(
+  level INTEGER NOT NULL,
+  rating_type INTEGER NOT NULL,
+  rating REAL NOT NULL,
+  PRIMARY KEY(level, rating_type)
+);
+CREATE TABLE IF NOT EXISTS combat_rating_scalars(
+  class INTEGER NOT NULL,
+  rating_type INTEGER NOT NULL,
+  ratio REAL NOT NULL DEFAULT 1.0,
+  PRIMARY KEY(class, rating_type)
+);
+CREATE TABLE IF NOT EXISTS melee_crit_chance(
+  class INTEGER NOT NULL,
+  level INTEGER NOT NULL,
+  chance REAL NOT NULL,
+  PRIMARY KEY(class, level)
+);
+CREATE TABLE IF NOT EXISTS melee_crit_base(
+  class INTEGER PRIMARY KEY,
+  base REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS spell_crit_chance(
+  class INTEGER NOT NULL,
+  level INTEGER NOT NULL,
+  chance REAL NOT NULL,
+  PRIMARY KEY(class, level)
+);
+CREATE TABLE IF NOT EXISTS spell_crit_base(
+  class INTEGER PRIMARY KEY,
+  base REAL NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS glyph_properties(
   id INTEGER PRIMARY KEY,
   spell_id INTEGER NOT NULL DEFAULT 0,
@@ -906,6 +940,8 @@ _TALENTS_SQL = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "talents.sql")
 _CREATURE_FAMILY_SQL = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "creature_family.sql")
+_COMBAT_RATINGS_SQL = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "combat_ratings.sql")
 
 
 def _seed_spell_item_enchantment(con: sqlite3.Connection) -> None:
@@ -987,6 +1023,18 @@ def _seed_creature_family(con: sqlite3.Connection) -> None:
     con.commit()
 
 
+def _seed_combat_ratings(con: sqlite3.Connection) -> None:
+    """Load the 3.3.5 combat-rating curves and class scalars."""
+    count = con.execute("SELECT COUNT(*) FROM combat_ratings").fetchone()[0]
+    if count:
+        return
+    if not os.path.exists(_COMBAT_RATINGS_SQL):
+        return
+    with open(_COMBAT_RATINGS_SQL, encoding="utf-8") as handle:
+        con.executescript(handle.read())
+    con.commit()
+
+
 def _seed_playercreateinfo(con: sqlite3.Connection) -> None:
     """Load the bundled 3.3.5a starter spell/action tables once.
 
@@ -1049,6 +1097,7 @@ def init_creature_db(path: str) -> None:
         _seed_totem_categories(con)
         _seed_talents(con)
         _seed_creature_family(con)
+        _seed_combat_ratings(con)
         if con.execute("SELECT COUNT(*) FROM creature_spawns").fetchone()[0]:
             con.commit()
             return
