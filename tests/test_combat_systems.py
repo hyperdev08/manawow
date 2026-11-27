@@ -1143,3 +1143,91 @@ async def test_resilience_reduces_incoming_crit_damage():
         session.player_guid, 100, spells.SCHOOL_FROST, template,
         session.player_guid, critical=True)
     assert session.character["health"] == 933
+
+def test_partial_resist_distribution_and_binary_spells():
+    assert CR.full_resist_percent(0.0) == 0.0
+    row = CR._partial_row_inflated(5000)
+    assert 9000 <= sum(row) <= 11000
+    fraction = CR.partial_resist_fraction(50.0)
+    assert 0.0 <= fraction <= 0.9
+    assert spells.get_spell_template(WORLD_DB, 118).is_binary()   # Polymorph
+    assert not spells.get_spell_template(WORLD_DB, 116).is_binary()  # Frostbolt
+    assert spells.get_spell_template(WORLD_DB, 772).is_bleed()    # Rend
+
+
+@_async_test
+async def test_periodic_crit_aura_makes_dots_crit():
+    session = FakeUnit(char_class=5)
+    creature_guid = session.add_creature(12, x=1.0)
+    pandemic = spells.get_spell_template(WORLD_DB, 58435)
+    await session._apply_aura_from_effect(
+        pandemic, pandemic.effects[0], 0, session.player_guid,
+        session.player_guid, 80, target_kind="player")
+    pain = spells.get_spell_template(WORLD_DB, 589)
+    session._apply_periodic_aura(
+        pain, pain.effects[0], 0, 80, creature_guid)
+    dot = next(d for d in session._combat_state["dots"]
+               if int(d["spell_id"]) == 589)
+    assert dot["can_crit"]
+    base = int(dot["amount"])
+    session.character["spell_crit_chance"] = 100.0
+    recorded = []
+
+    async def damage(target_guid, amount, school, spell_id, caster_guid,
+                     periodic=False, critical=False):
+        recorded.append((int(amount), bool(critical)))
+        return False
+
+    session._deal_damage_to_target = damage
+    await session._apply_dot_tick(dot)
+    assert recorded and recorded[-1] == (int(base * 1.5), True)
+
+
+def test_creature_spell_miss_chance_and_pushback():
+    now = time.monotonic()
+    state = {"aggro": {5: {"ai": {"cast": {
+        "finish_at": now + 1.0, "pushbacks": 0}}}}}
+    ai = types.SimpleNamespace(
+        character={"level": 20},
+        _spell_target_kind=lambda guid: "player",
+        _peer_session_for_guid=lambda guid: None,
+        _get_combat_state=lambda: state,
+    )
+    assert CreatureAIMixin._creature_spell_miss_chance(ai, 1, 20) == 4.0
+    assert CreatureAIMixin._creature_spell_miss_chance(ai, 1, 17) == 13.0
+    CreatureAIMixin._creature_spell_pushback(ai, 5)
+    cast = state["aggro"][5]["ai"]["cast"]
+    assert cast["pushbacks"] == 1
+    assert cast["finish_at"] > now + 1.0
+    CreatureAIMixin._creature_spell_pushback(ai, 5)
+    CreatureAIMixin._creature_spell_pushback(ai, 5)
+    assert cast["pushbacks"] == 2
+
+@_async_test
+async def test_periodic_tick_interval_scales_with_spell_haste():
+    session = FakeUnit(char_class=5)
+    target = session.add_creature(13, x=1.0)
+    haste = spells.get_spell_template(WORLD_DB, 2895)
+    await session._apply_aura_from_effect(
+        haste, haste.effects[0], 0, session.player_guid,
+        session.player_guid, 80, target_kind="player")
+    assert session._player_aura_mods()["spell_haste"] > 0
+    pain = spells.get_spell_template(WORLD_DB, 589)
+    session._apply_periodic_aura(
+        pain, pain.effects[0], 0, 80, target)
+    dot = next(d for d in session._combat_state["dots"]
+               if int(d["spell_id"]) == 589)
+    expected = 3.0 / (1.0 + session._player_aura_mods()["spell_haste"]
+                      / 100.0)
+    assert abs(float(dot["interval"]) - expected) < 0.01
+
+
+@_async_test
+async def test_magic_resistance_percent_caps_and_ignores_holy():
+    session = FakeUnit(char_class=5)
+    session.character["res_fire"] = 10000
+    percent = session._magic_resistance_percent(
+        session.player_guid, spells.SCHOOL_FIRE, 80, binary=False)
+    assert 0 < percent <= 75.0
+    assert session._magic_resistance_percent(
+        session.player_guid, spells.SCHOOL_HOLY, 80) == 0.0

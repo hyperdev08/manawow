@@ -8,6 +8,7 @@ so the server remains playable.
 from __future__ import annotations
 
 from functools import lru_cache
+import random
 import sqlite3
 
 # CombatRating enum order in gtCombatRatings.dbc.
@@ -273,5 +274,68 @@ def weapon_skill_for_subclass(subclass: int) -> int:
 def clear_caches() -> None:
     for cached in (_rating_cached, _scalar_cached, _melee_crit_cached,
                    _melee_crit_base_cached, _spell_crit_cached,
-                   _spell_crit_base_cached):
+                   _spell_crit_base_cached, _partial_row,
+                   _partial_row_inflated):
         cached.cache_clear()
+
+
+# ----------------------------------------------------------------------
+# 3.3.5 partial spell-resist distribution
+# ----------------------------------------------------------------------
+_NUM_PARTIAL_RESISTS = 11
+
+
+@lru_cache(maxsize=101)
+def _partial_row(percentage: int) -> tuple:
+    values = []
+    for column in range(_NUM_PARTIAL_RESISTS):
+        if ((percentage < 10 and column < 2)
+                or (percentage > 90 and column > 8)):
+            arg = (100 - percentage) if column > 8 else percentage
+            if column % 10 == 0:
+                value = round((100.0 - arg * 7.5) * 100)
+            else:
+                value = round(arg * 5 * 100)
+        else:
+            value = round(max(
+                0.5 - 2.5 * abs((column * 10 / 100.0)
+                                - (percentage / 100.0)), 0.0) * 10000)
+        values.append(max(0, int(value)))
+    return tuple(values)
+
+
+@lru_cache(maxsize=10001)
+def _partial_row_inflated(index: int) -> tuple:
+    """Interpolate the integer-percent table to 0.01% resolution."""
+    index = max(0, min(10000, int(index)))
+    lower = index // 100
+    upper = min(100, lower + 1)
+    fraction = (index % 100) / 100.0
+    low = _partial_row(lower)
+    high = _partial_row(upper)
+    return tuple(max(0, int(round(a + (b - a) * fraction)))
+                 for a, b in zip(low, high))
+
+
+def partial_resist_fraction(percent: float) -> float:
+    """Roll the resisted fraction (0.0..0.9) for a percentage resistance."""
+    if percent <= 0.0:
+        return 0.0
+    row = _partial_row_inflated(int(min(75.0, percent) * 100))
+    roll = random.randint(1, 10000)
+    portion = _NUM_PARTIAL_RESISTS - 1
+    for outcome, chance in enumerate(row):
+        if roll <= chance:
+            portion = outcome
+            break
+        roll -= chance
+    return min(portion, _NUM_PARTIAL_RESISTS - 1) / float(
+        _NUM_PARTIAL_RESISTS)
+
+
+def full_resist_percent(percent: float) -> float:
+    """Chance (in percent) of a non-binary spell being fully resisted."""
+    if percent <= 0.0:
+        return 0.0
+    row = _partial_row_inflated(int(min(75.0, percent) * 100))
+    return row[_NUM_PARTIAL_RESISTS - 1] / 100.0

@@ -150,6 +150,7 @@ SUPPORTED_AURA_TYPES = frozenset((
     spells.SPELL_AURA_HASTE_SPELLS,
     spells.SPELL_AURA_MECHANIC_DURATION_MOD,
     spells.SPELL_AURA_MOD_MECHANIC_DAMAGE_TAKEN_PERCENT,
+    spells.SPELL_AURA_ABILITY_PERIODIC_CRIT,
     spells.SPELL_AURA_PROC_TRIGGER_SPELL,
     spells.SPELL_AURA_ADD_FLAT_MODIFIER,
     spells.SPELL_AURA_ADD_PCT_MODIFIER,
@@ -767,6 +768,7 @@ class AurasMixin:
             "health_regen": 0.0,
             "health_regen_combat": 0.0,
             "pet_talent_points": 0,
+            "periodic_crit": False,
             "power_regen": {},
             "scale_mult": 1.0,
             "base_resistances_pct": {
@@ -887,6 +889,8 @@ class AurasMixin:
                     mods["attack_power"] += amount
                 elif aura_type == spells.SPELL_AURA_MOD_PET_TALENT_POINTS:
                     mods["pet_talent_points"] += amount
+                elif aura_type == spells.SPELL_AURA_ABILITY_PERIODIC_CRIT:
+                    mods["periodic_crit"] = True
                 elif aura_type == spells.SPELL_AURA_MOD_RATING:
                     field = _RATING_AURA_FIELDS.get(misc)
                     if field:
@@ -1136,7 +1140,8 @@ class AurasMixin:
         if spell_id and lockouts:
             template = spells.get_spell_template(
                 self.config.database.world_path, int(spell_id))
-            school = int(template.school) if template is not None else 0
+            school = spells.school_mask(
+            template.school) if template is not None else 0
             now = time.monotonic()
             for mask, until in lockouts.items():
                 if until > now and int(mask) & (school or 1):
@@ -1166,7 +1171,7 @@ class AurasMixin:
         """Check school/mechanic/effect immunity on a target."""
         mods = (self._player_aura_mods() if target_kind == "player"
                 else self._creature_aura_mods(self._creature_low(target_guid)))
-        school = int(template.school) or 1
+        school = spells.school_mask(template.school) or 1
         if mods["school_immune"] & school or mods["damage_immune"] & school:
             return True
         mechanic = template.cc_mechanic(effect)

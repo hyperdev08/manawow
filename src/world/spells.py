@@ -244,6 +244,8 @@ SPELL_AURA_MOD_RANGED_ATTACK_POWER_PCT = 167
 SPELL_AURA_HASTE_SPELLS = 216
 SPELL_AURA_MECHANIC_DURATION_MOD = 232
 SPELL_AURA_MOD_MECHANIC_DAMAGE_TAKEN_PERCENT = 255
+SPELL_AURA_ABILITY_PERIODIC_CRIT = 286
+SPELL_ATTR_EX5_NO_PARTIAL_RESISTS = 0x00800000
 
 # ``SpellModOp`` (SpellDefines.h).  Aura 107/108 stores one of these in its
 # MiscValue and the affected spell-family mask in EffectSpellClassMask.
@@ -335,6 +337,12 @@ RESISTANCE_AURA_SCHOOLS = (
     (2, "holy"), (4, "fire"), (8, "nature"), (16, "frost"),
     (32, "shadow"), (64, "arcane"),
 )
+
+
+def school_mask(school: int) -> int:
+    """Convert ``Spell.dbc`` school enum (0..6) to ``SpellSchoolMask``."""
+    value = int(school or 0)
+    return (1 << value) if 0 <= value <= 6 else value
 
 # ``EffectImplicitTarget`` values used by area selection (3.3.5a).
 TARGET_UNIT_CASTER = 1
@@ -785,6 +793,49 @@ class SpellTemplate:
 
     def is_passive(self) -> bool:
         return bool(self.attributes & SPELL_ATTR_PASSIVE)
+
+    def is_bleed(self) -> bool:
+        """Bleeds bypass armor mitigation even when their school is physical."""
+        if int(self.mechanic or 0) == MECHANIC_BLEED:
+            return True
+        return any(int(effect.get("mechanic") or 0) == MECHANIC_BLEED
+                   for effect in self.effects)
+
+    def is_binary(self) -> bool:
+        """Approximate CMaNGOS ``IsBinarySpell`` for 3.3.5 spells."""
+        damage_effects = {
+            SPELL_EFFECT_SCHOOL_DAMAGE,
+            SPELL_EFFECT_HEALTH_LEECH,
+            SPELL_EFFECT_WEAPON_DAMAGE,
+            SPELL_EFFECT_WEAPON_DAMAGE_NOSCHOOL,
+            SPELL_EFFECT_NORMALIZED_WEAPON_DMG,
+            SPELL_EFFECT_WEAPON_PERCENT_DAMAGE,
+        }
+        valid = aura = nondmg = 0
+        effects = list(self.effects)
+        for index, effect in enumerate(effects):
+            etype = int(effect.get("effect") or 0)
+            if not etype:
+                continue
+            if etype in (SPELL_EFFECT_DUMMY, SPELL_EFFECT_TRIGGER_SPELL, 77):
+                continue
+            bit = 1 << index
+            valid |= bit
+            if int(effect.get("apply_aura") or 0):
+                aura |= bit
+            if etype not in damage_effects:
+                nondmg |= bit
+        if not valid:
+            return False
+        if nondmg == valid or aura == valid:
+            return True
+        damage = valid & ~nondmg
+        dot = damage & aura
+        if damage == dot:
+            return True
+        # A direct damage component can always be partially resisted, even if
+        # the same spell also applies a control aura (Frostbolt-like spells).
+        return False
 
     def uses_ranged_slot(self) -> bool:
         return bool(self.attributes & SPELL_ATTR_USES_RANGED_SLOT)

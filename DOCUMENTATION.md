@@ -99,9 +99,10 @@ A real 3.3.5a client can now log in, pick a character and **enter the world**:
 - Item on-hit procs use the real `item_template` chance-on-hit trigger and `spellppmRate_*`: PPM is normalized against the weapon's base speed, with per-item cooldowns/charges
 - Temporary weapon enchants and poisons are read from bundled `SpellItemEnchantment.dbc` data: poison/stone application stores the enchant per weapon slot, persists it in `character_items.enchantment_2`, and procs on auto-attacks and weapon abilities; `CMSG_CANCEL_TEMP_ENCHANTMENT` clears it
 - Poison rates match 3.3.5: Instant Poison 8.57 PPM, Wound Poison 21.4 PPM, Deadly Poison 30%, Crippling/Mind-numbing 50%, with half chance from the off-hand
-- Spell casts use the 3.3.5 hit/miss and partial-resistance rules: 4% base miss at equal level modified by spell hit rating and level difference, spell crit rating, per-school resistances reduced by spell penetration, absorb shields, school/mechanic/effect immunities and spell reflection
-- Direct damage/heals scale with spell power/healing power using the DBC bonus coefficient; heals crit for 1.5x and damage for 2x
-- Damage taken while casting pushes the cast back (up to two 0.25-0.5 s delays) and shortens an active channel; moving out of range cancels the cast/channel
+- Spell casts use the 3.3.5 hit/miss and partial-resistance rules: 4% base miss at equal level modified by spell hit rating and level difference, binary-spell full resists, per-school resistances reduced by spell penetration resolved through the `SPELL_PARTIAL_RESIST_DISTRIBUTION` table, absorb shields, school/mechanic/effect immunities and spell reflection
+- Creature spells roll their own miss chance and binary full-resist chance against the player; partial magic resistance is rolled per damage tick through the same distribution table
+- Direct damage/heals scale with spell power/healing power using the DBC bonus coefficient; heals crit for 1.5x and damage for 2x. Haste shortens periodic tick intervals, `SPELL_AURA_ABILITY_PERIODIC_CRIT` enables per-tick DoT crits, and bleed/physical DoT ticks bypass armor while direct physical spells still use it
+- Damage taken while casting pushes the cast back (up to two 0.25-0.5 s delays) and shortens an active channel; creature casts receive the same pushback, and moving out of range cancels the cast/channel
 - Out-of-combat health regeneration uses the spirit/level formula instead of a flat percentage
 - Death knight runes are real state: blood, blood, unholy, unholy, frost, frost, regenerated at 0.1 per second
 - Area-of-effect spells use the real 3.3.5 `EffectImplicitTarget`/`SpellRadius.dbc` data:

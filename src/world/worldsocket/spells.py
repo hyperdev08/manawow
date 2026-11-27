@@ -10,6 +10,7 @@ import time
 from src.common.db_io import run_db_write
 from src.protocol.opcodes import Opcodes
 from src.world import character_db
+from src.world import combat_ratings as CR
 from src.world import creature
 from src.world import databases
 from src.world import gameobject
@@ -1042,6 +1043,13 @@ class SpellsMixin:
             result["hit"] = False
             result["miss_type"] = spells.SPELL_MISS_MISS
             return result
+        resist_chance = self._spell_full_resist_chance(
+            target_guid, template)
+        if resist_chance > 0.0 and random.uniform(
+                0.0, 100.0) < resist_chance:
+            result["hit"] = False
+            result["miss_type"] = spells.SPELL_MISS_RESIST
+            return result
         crit_chance = max(0.0, float(
             self.character.get("spell_crit_chance", 0.0) or 0.0))
         crit_chance = max(0.0, float(self._spell_mod_value(
@@ -1056,44 +1064,98 @@ class SpellsMixin:
             result["crit"] = True
         return result
 
-    def _spell_resist_amount(self, target_guid: int, school: int,
-                             damage: int) -> int:
-        """Partial resistance using the 3.3.5 resistance-to-level ratio."""
-        if damage <= 0 or not school:
-            return 0
+    def _magic_resistance_percent(self, target_guid: int, school: int,
+                                  caster_level: int = 1,
+                                  binary: bool = False,
+                                  penetration: int = 0) -> float:
+        """``Unit::CalculateEffectiveMagicResistancePercent`` in percent."""
+        mask = spells.school_mask(school)
+        if not mask or int(mask) & 1:
+            return 0.0
         kind = self._spell_target_kind(target_guid)
-        name = ""
-        for bit, school_name in spells.RESISTANCE_AURA_SCHOOLS:
-            if school & bit:
-                name = school_name
-                break
-        if not name:
-            return 0
         if kind == "creature":
             spawn = self._get_creature_spawn(
                 creature.creature_low_guid(target_guid))
-            if spawn is not None and ("resistance_" + name) in spawn.keys():
-                resistance = int(spawn["resistance_" + name] or 0)
-                level = max(1, int(spawn["min_level"] or 1))
+            if spawn is None:
+                return 0.0
+            target_level = max(1, int(spawn["min_level"] or 1))
+            source = spawn
+        else:
+            target_level = max(1, int(self.character.get("level", 1)))
+            source = self.character
+
+        resistance = 0
+        found = False
+        for bit, name in spells.RESISTANCE_AURA_SCHOOLS:
+            if bit == 2 or not (int(mask) & bit):
+                continue                # holy is ignored by 3.3.5
+            if kind == "creature":
+                key = "resistance_" + name
+                amount = int(source[key] or 0) \
+                    if key in source.keys() else 0
             else:
-                return 0
-            penetration = int(self.character.get(
-                "spell_penetration", 0) or 0)
-            resistance = max(0, resistance - penetration)
-            if not resistance:
-                return 0
-            chance = min(0.75, resistance / (5.0 * level))
-            return max(0, int(damage * random.uniform(0.0, chance)))
-        if kind != "player":
+                amount = int(source.get("res_" + name, 0) or 0)
+            result = amount - int(penetration or 0)
+            if result < 0:
+                result = min(amount, 0)
+            if not found or result < resistance:
+                resistance = result
+                found = True
+        if not found:
+            return 0.0
+        if resistance >= 0:
+            skill = max(float(caster_level) * 5.0, 100.0)
+            percent = resistance / skill * 100.0
+            # NPC victims receive the level-difference bonus on non-binary
+            # magic hits (``CalculateEffectiveMagicResistancePercent``).
+            if not binary and kind == "creature":
+                percent += 0.4 * max(
+                    max(1, target_level) * 5.0 - skill, 0.0)
+            return min(percent, 75.0)
+        skill = max(float(target_level) * 5.0, 100.0)
+        return resistance / skill * 100.0
+
+    def _spell_resist_amount(self, target_guid: int, school: int,
+                             damage: int, caster_level: int = 1,
+                             penetration: int = 0, template=None) -> int:
+        """Roll partial magic resistance using the 3.3.5 distribution."""
+        if damage <= 0 or not school:
             return 0
-        resistance = max(0, int(self.character.get("res_" + name, 0) or 0))
-        penetration = int(self.character.get("spell_penetration", 0) or 0)
-        resistance = max(0, resistance - penetration)
-        if not resistance:
+        if template is not None and template.is_binary():
+            return 0                    # full resist was rolled in the hit table
+        if template is not None and (
+                int(getattr(template, "attributes_ex5", 0))
+                & spells.SPELL_ATTR_EX5_NO_PARTIAL_RESISTS):
             return 0
-        level = max(1, int(self.character.get("level", 1)))
-        chance = min(0.75, resistance / (5.0 * level))
-        return max(0, int(damage * random.uniform(0.0, chance)))
+        percent = self._magic_resistance_percent(
+            target_guid, school, caster_level, binary=False,
+            penetration=penetration)
+        if percent <= 0.0:
+            return 0
+        return max(0, int(damage * CR.partial_resist_fraction(percent)))
+
+    def _spell_full_resist_chance(self, target_guid: int, template) -> float:
+        """Chance to fully resist a spell, as a percentage."""
+        kind = self._spell_target_kind(target_guid)
+        target_session = self
+        if kind == "peer" and hasattr(self, "_peer_session_for_guid"):
+            peer = self._peer_session_for_guid(target_guid)
+            if peer is not None:
+                target_session = peer
+        binary = template.is_binary()
+        caster_level = max(1, int(self.character.get("level", 1)))
+        penetration = int(self.character.get(
+            "spell_penetration", 0) or 0)
+        percent = target_session._magic_resistance_percent(
+            target_guid, int(template.school), caster_level,
+            binary=binary, penetration=penetration)
+        if percent <= 0.0:
+            return 0.0
+        if binary:
+            return min(100.0, percent)
+        # Player/pet spells add the full-resist column from the distribution;
+        # NPC spells are only partially cut off.
+        return min(100.0, CR.full_resist_percent(percent))
 
     def _spell_reflects(self, target_guid: int) -> bool:
         kind = self._spell_target_kind(target_guid)
@@ -1332,13 +1394,15 @@ class SpellsMixin:
             if peer is not None:
                 target_session = peer
         target_kind = "player" if kind in ("player", "peer") else "creature"
+        mask = spells.school_mask(school)
         if critical and hasattr(target_session, "character"):
             resilience = float(target_session.character.get(
                 "resilience_pct", 0.0) or 0.0)
             if resilience:
                 reduction = min(0.33, resilience * 0.022)
                 amount = max(0, int(amount * (1.0 - reduction)))
-        if int(school) & 1 and hasattr(self, "_armor_reduced_damage"):
+        if (int(mask) & 1 and hasattr(self, "_armor_reduced_damage")
+                and not periodic and not template.is_bleed()):
             if kind in ("player", "peer"):
                 armor = int(getattr(target_session, "character", {}).get(
                     "armor", 0) or 0)
@@ -1363,23 +1427,44 @@ class SpellsMixin:
         depleted = []
         resisted = 0
         remaining = amount
+        caster_level = 1
+        penetration = 0
+        if int(caster_guid or 0) == int(self.player_guid or 0):
+            caster_level = max(1, int(self.character.get("level", 1)))
+            penetration = int(self.character.get(
+                "spell_penetration", 0) or 0)
+        else:
+            peer_caster = (self._peer_session_for_guid(caster_guid)
+                           if hasattr(self, "_peer_session_for_guid")
+                           else None)
+            if peer_caster is not None and peer_caster.character:
+                caster_level = max(1, int(
+                    peer_caster.character.get("level", 1)))
+                penetration = int(peer_caster.character.get(
+                    "spell_penetration", 0) or 0)
+            elif caster_guid:
+                spawn = self._get_creature_spawn(
+                    creature.creature_low_guid(caster_guid))
+                if spawn is not None:
+                    caster_level = max(1, int(spawn["min_level"] or 1))
         # Peer players own their aura list; drain/resist/modify on that
         # session instead of falling back to this session's creature store.
         if kind != "peer" or peer is not None:
             if hasattr(target_session, "_absorb_damage"):
                 absorbed, depleted = target_session._absorb_damage(
-                    target_kind, target_guid, school, amount)
+                    target_kind, target_guid, mask, amount)
                 for aura in depleted:
                     if hasattr(target_session, "_send_aura_update"):
                         await target_session._send_aura_update(
                             target_kind, target_guid, aura, remove=True)
             if hasattr(target_session, "_spell_resist_amount"):
                 resisted = target_session._spell_resist_amount(
-                    target_guid, school, amount)
+                    target_guid, school, amount, caster_level,
+                    penetration, template)
             remaining = max(0, amount - absorbed - resisted)
             if hasattr(target_session, "_apply_damage_modifiers"):
                 remaining = target_session._apply_damage_modifiers(
-                    target_kind, target_guid, school, remaining)
+                    target_kind, target_guid, mask, remaining)
         died = False
         if kind == "player":
             if remaining > 0:
@@ -1402,7 +1487,7 @@ class SpellsMixin:
                     target_guid, remaining, caster_guid,
                     threat_kind="spell")
         await self._send_spell_damage_log(
-            target_guid, caster_guid, template.id, remaining, school or 1,
+            target_guid, caster_guid, template.id, remaining, mask or 1,
             periodic=1 if periodic else 0,
             critical=1 if critical else 0,
             overkill=overkill, absorbed=absorbed, resisted=resisted)
@@ -1826,7 +1911,7 @@ class SpellsMixin:
                     damage=True)
                 amount += self._spell_power_bonus(effect)
                 amount = self._apply_damage_done(
-                    int(template.school), max(0, amount))
+                    spells.school_mask(template.school), max(0, amount))
                 if critical:
                     amount = int(amount * 2.0)
                 if amount <= 0:
@@ -2050,7 +2135,8 @@ class SpellsMixin:
             elif etype == spells.SPELL_EFFECT_INTERRUPT_CAST:
                 if target_guid:
                     await self._interrupt_target_cast(
-                        target_guid, int(template.school) or 1)
+                        target_guid,
+                        spells.school_mask(template.school) or 1)
             elif etype == spells.SPELL_EFFECT_DISPEL:
                 if target_guid:
                     count = int(effect.get("base_points") or 0) + 1
@@ -2964,7 +3050,7 @@ class SpellsMixin:
                          spells.SPELL_EFFECT_HEALTH_LEECH):
                 base_amount += self._spell_power_bonus(effect)
             base_amount = self._apply_damage_done(
-                int(template.school) or 1, base_amount)
+                spells.school_mask(template.school) or 1, base_amount)
         for low_guid, spawn in targets:
             guid = self._creature_object_guid(low_guid, int(spawn["entry"]))
             if etype in (spells.SPELL_EFFECT_SCHOOL_DAMAGE,
@@ -3032,7 +3118,7 @@ class SpellsMixin:
             etype, template, index, effect, caster_level, combo_points)
         if etype == spells.SPELL_EFFECT_SCHOOL_DAMAGE:
             base += self._spell_power_bonus(effect)
-        base = self._apply_damage_done(int(template.school) or 1, base)
+        base = self._apply_damage_done(spells.school_mask(template.school) or 1, base)
         hit: list[int] = []
         current = int(target_guid)
         for jump in range(max(1, chain_count)):
@@ -3136,7 +3222,7 @@ class SpellsMixin:
         if amount <= 0:
             return
         if caster_guid is None or int(caster_guid) == int(self.player_guid or 0):
-            amount = self._apply_damage_done(int(school) or 1, int(amount))
+            amount = self._apply_damage_done(spells.school_mask(school) or 1, int(amount))
         if amount <= 0:
             return
         now = time.monotonic()
@@ -3278,6 +3364,12 @@ class SpellsMixin:
         if not target_guid:
             return
         amplitude = max(250, int(effect["amplitude"] or 2000)) / 1000.0
+        aura_mods = (self._player_aura_mods()
+                     if hasattr(self, "_player_aura_mods") else {})
+        haste = float(aura_mods.get("spell_haste", 0.0) or 0.0)
+        if haste > 0.0:
+            amplitude = max(0.25, amplitude / (1.0 + haste / 100.0))
+        can_crit = bool(aura_mods.get("periodic_crit"))
         amount = template.effect_value(index, caster_level, combo_points)
         percent = aura in (spells.SPELL_AURA_OBS_MOD_HEALTH,
                            spells.SPELL_AURA_PERIODIC_DAMAGE_PERCENT)
@@ -3287,7 +3379,7 @@ class SpellsMixin:
                       spells.SPELL_AURA_PERIODIC_LEECH):
             amount += self._spell_power_bonus(effect)
             amount = self._apply_damage_done(
-                int(template.school) or 1, max(0, amount))
+                spells.school_mask(template.school) or 1, max(0, amount))
         if amount <= 0:
             return
         duration_ms = spells.spell_duration_ms(
@@ -3317,6 +3409,7 @@ class SpellsMixin:
                 dot["energize"] = (int(effect.get("misc_value") or 0)
                                    if aura == spells.SPELL_AURA_PERIODIC_ENERGIZE
                                    else None)
+                dot["can_crit"] = can_crit
                 return
         combat["dots"].append({
             "target_guid": int(target_guid),
@@ -3334,19 +3427,21 @@ class SpellsMixin:
             "energize": (int(effect.get("misc_value") or 0)
                          if aura == spells.SPELL_AURA_PERIODIC_ENERGIZE
                          else None),
+            "can_crit": can_crit,
         })
 
     async def _deal_damage_to_target(self, target_guid: int, damage: int,
                                      school: int, spell_id: int,
                                      caster_guid: int,
-                                     periodic: bool = False) -> bool:
+                                     periodic: bool = False,
+                                     critical: bool = False) -> bool:
         """Damage a creature (or the player) and write the combat-log packet."""
         template = spells.get_spell_template(
             self.config.database.world_path, int(spell_id))
         if template is not None and hasattr(self, "_deal_spell_damage"):
             return await self._deal_spell_damage(
                 target_guid, damage, school or 1, template, caster_guid,
-                periodic=periodic)
+                critical=critical, periodic=periodic)
         if self._is_player_guid(target_guid):
             await self._damage_player(damage, f"spell {spell_id}")
             return False
@@ -3354,7 +3449,8 @@ class SpellsMixin:
             target_guid, damage, caster_guid, threat_kind="spell")
         await self._send_spell_damage_log(
             target_guid, caster_guid, spell_id, damage, school or 1,
-            periodic=1 if periodic else 0
+            periodic=1 if periodic else 0,
+            critical=1 if critical else 0,
         )
         return died
 
@@ -3428,6 +3524,13 @@ class SpellsMixin:
                     target_guid, caster_guid, dot["spell_id"], power_type,
                     amount)
             return
+        critical = False
+        if dot.get("can_crit") and not dot["is_heal"]:
+            chance = float(self.character.get(
+                "spell_crit_chance", 0.0) or 0.0)
+            if chance and random.uniform(0.0, 100.0) < chance:
+                amount = int(amount * 1.5)
+                critical = True
         if dot["is_heal"]:
             kind = self._spell_target_kind(target_guid)
             if kind == "peer":
@@ -3465,7 +3568,7 @@ class SpellsMixin:
         if self._is_player_guid(target_guid):
             await self._deal_damage_to_target(
                 target_guid, amount, dot["school"] or 1, dot["spell_id"],
-                caster_guid, periodic=True)
+                caster_guid, periodic=True, critical=critical)
             if dot.get("leech") and caster_guid:
                 if self._is_player_guid(caster_guid):
                     healed, _ = await self._heal_player(amount)
@@ -3483,7 +3586,7 @@ class SpellsMixin:
             return
         died = await self._deal_damage_to_target(
             target_guid, amount, dot["school"] or 1, dot["spell_id"],
-            caster_guid, periodic=True)
+            caster_guid, periodic=True, critical=critical)
         if dot.get("leech") and caster_guid and self._is_player_guid(caster_guid):
             healed, _ = await self._heal_player(amount)
             await self._send_spell_heal_log(

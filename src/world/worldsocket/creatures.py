@@ -221,6 +221,8 @@ class CreaturesMixin:
         if new_health <= 0:
             await self._on_creature_killed(guid)
             return True
+        if hasattr(self, "_creature_spell_pushback"):
+            self._creature_spell_pushback(int(low_guid))
         await self._send_creature_fields(low_guid, {
             F.UNIT_FIELD_HEALTH: new_health,
             F.UNIT_FIELD_MAXHEALTH: max_health,

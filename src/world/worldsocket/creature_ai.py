@@ -302,7 +302,7 @@ class CreatureAIMixin:
             lockout = ai.get("school_lockout") or {}
             if lockout and float(lockout.get("until", 0)) > now \
                     and int(lockout.get("school", 0)) & (
-                        int(template.school) or 1):
+                        spells.school_mask(template.school) or 1):
                 continue
             cost = self._creature_spell_cost(template, ai["max_mana"])
             if cost > ai["mana"]:
@@ -432,11 +432,75 @@ class CreatureAIMixin:
                                              Opcodes.SMSG_SPELL_GO, payload)
         else:
             await self.send_packet(Opcodes.SMSG_SPELL_GO, payload)
+        if template.is_harmful():
+            kind = self._spell_target_kind(target_guid)
+            if kind in ("player", "peer"):
+                if not (int(template.attributes_ex3)
+                        & spells.SPELL_ATTR_EX3_CANT_MISS) \
+                        and random.uniform(
+                            0.0, 100.0) < self._creature_spell_miss_chance(
+                                target_guid, int(ai["level"])):
+                    await self._send_spell_miss_log(
+                        target_guid, caster_guid, template.id,
+                        spells.SPELL_MISS_MISS)
+                    return
+                if template.is_binary():
+                    target_session = self
+                    if kind == "peer" and hasattr(
+                            self, "_peer_session_for_guid"):
+                        peer = self._peer_session_for_guid(target_guid)
+                        if peer is not None:
+                            target_session = peer
+                    percent = target_session._magic_resistance_percent(
+                        target_guid, int(template.school),
+                        int(ai["level"]), binary=True, penetration=0)
+                    if random.uniform(0.0, 100.0) < percent:
+                        await self._send_spell_miss_log(
+                            target_guid, caster_guid, template.id,
+                            spells.SPELL_MISS_RESIST)
+                        return
         await self._apply_creature_spell_effects(
             low_guid, spawn, ai, template, target_guid)
         self.log.debug(
             f"Creature {ai['entry']} casts {template.name} ({template.id})"
         )
+
+    def _creature_spell_miss_chance(self, target_guid: int,
+                                    caster_level: int) -> float:
+        """``Unit::CalculateSpellMissChance`` for an NPC caster."""
+        kind = self._spell_target_kind(target_guid)
+        if kind == "peer" and hasattr(self, "_peer_session_for_guid"):
+            peer = self._peer_session_for_guid(target_guid)
+            target_level = max(1, int(
+                peer.character.get("level", 1))) if peer is not None else 1
+        elif kind == "player":
+            target_level = max(1, int(self.character.get("level", 1)))
+        else:
+            target_level = max(1, int(caster_level))
+        difference = target_level - max(1, int(caster_level))
+        chance = 4.0
+        if difference > 2:
+            chance += 2.0 + (difference - 2) * 7.0
+        else:
+            chance += difference
+        return max(0.0, min(100.0, chance))
+
+    def _creature_spell_pushback(self, low_guid: int) -> None:
+        """Delay an in-progress creature cast after taking damage."""
+        state = self._get_combat_state().get(
+            "aggro", {}).get(int(low_guid))
+        ai = state.get("ai") if state is not None else None
+        cast = ai.get("cast") if ai is not None else None
+        if cast is None:
+            return
+        pushbacks = int(cast.get("pushbacks") or 0)
+        if pushbacks >= 2:
+            return
+        cast["pushbacks"] = pushbacks + 1
+        remaining = max(0.0, float(cast.get("finish_at") or 0.0)
+                        - time.monotonic())
+        cast["finish_at"] = float(cast.get("finish_at") or 0.0) + min(
+            0.5, remaining * 0.25)
 
     async def _heal_creature(self, low_guid: int, spawn, amount: int,
                              template=None, caster_guid: int = 0) -> None:
@@ -494,10 +558,9 @@ class CreatureAIMixin:
                                     caster_guid: int = 0) -> bool:
         """Check immunities, reflect and line of sight for a creature spell.
 
-        Creatures always land their spells against an equal-level player in
-        this simulator; what matters for 3.3.5 feel is the immunity/reflect
-        layer, which is driven by auras.  Sending the miss packet is enough for
-        the client to show "Immune" or "Reflected".
+        Hit/miss and full binary resistance are rolled once per cast in
+        ``_finish_creature_cast``; this per-effect check handles the
+        immunity/reflect layer driven by auras.
         """
         if not target_guid:
             return True
@@ -708,7 +771,7 @@ class CreatureAIMixin:
             elif etype == spells.SPELL_EFFECT_INTERRUPT_CAST:
                 if target_guid and self._is_player_guid(target_guid):
                     combat = self._get_combat_state()
-                    mask = int(template.school) or 1
+                    mask = spells.school_mask(template.school) or 1
                     combat.setdefault("school_lockout", {})[
                         mask] = time.monotonic() + 4.0
                     if hasattr(self, "_interrupt_player_cast"):

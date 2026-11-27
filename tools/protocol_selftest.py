@@ -1060,6 +1060,10 @@ async def rune_and_creature_ai_checks(temp_dir: str, world_db: str) -> None:
     ai["gcd_until"] = 0.0
     by_id[20792]["next_ready"] = 0.0
 
+    # Keep the scripted Frostbolt deterministic: real combat rolls a 4% spell
+    # miss against an equal-level target.
+    dummy._creature_spell_miss_chance = lambda *_args: 0.0
+
     async def creature_cast_check():
         await realmsocket.WorldSocket._creature_spell_list_tick(
             dummy, 7, spawn, ai, 100.0, False)
