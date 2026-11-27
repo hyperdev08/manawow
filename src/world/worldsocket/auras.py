@@ -1258,6 +1258,20 @@ class AurasMixin:
             value = int(value * (1.0 + pct / 100.0))
         return max(0, value)
 
+    def _creature_damage_done_modifier(self, low_guid: int, school: int,
+                                       damage: float) -> float:
+        """``Unit::MeleeDamageBonusDone`` using a creature's aura state."""
+        mods = self._creature_aura_mods(int(low_guid))
+        school_name = self._school_name(school)
+        flat = int(mods["damage_done_flat"].get("all", 0))
+        flat += int(mods["damage_done_flat"].get(school_name, 0))
+        pct = float(mods["damage_done_pct"].get("all", 0.0))
+        pct += float(mods["damage_done_pct"].get(school_name, 0.0))
+        value = max(0.0, float(damage) + flat)
+        if pct:
+            value *= 1.0 + pct / 100.0
+        return max(0.0, value)
+
     # ------------------------------------------------------------------
     # Player packets / derived stats
     # ------------------------------------------------------------------

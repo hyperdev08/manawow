@@ -1317,9 +1317,17 @@ class SpellsMixin:
             await self._deal_damage_to_target(
                 target_guid, amount, school, template.id, caster_guid)
             return False
+        peer = None
+        target_session = self
+        if kind == "peer" and hasattr(self, "_peer_session_for_guid"):
+            peer = self._peer_session_for_guid(target_guid)
+            if peer is not None:
+                target_session = peer
+        target_kind = "player" if kind in ("player", "peer") else "creature"
         if int(school) & 1 and hasattr(self, "_armor_reduced_damage"):
-            if kind == "player":
-                armor = int(self.character.get("armor", 0) or 0)
+            if kind in ("player", "peer"):
+                armor = int(getattr(target_session, "character", {}).get(
+                    "armor", 0) or 0)
             else:
                 spawn = self._get_creature_spawn(
                     creature.creature_low_guid(target_guid))
@@ -1335,21 +1343,25 @@ class SpellsMixin:
                 amount, armor, self._spell_target_level(target_guid))
         absorbed = 0
         depleted = []
-        if hasattr(self, "_absorb_damage"):
-            absorbed, depleted = self._absorb_damage(
-                "player" if kind == "player" else "creature",
-                target_guid, school, amount)
-            for aura in depleted:
-                if hasattr(self, "_send_aura_update"):
-                    await self._send_aura_update(
-                        "player" if kind == "player" else "creature",
-                        target_guid, aura, remove=True)
-        resisted = self._spell_resist_amount(target_guid, school, amount)
-        remaining = max(0, amount - absorbed - resisted)
-        if hasattr(self, "_apply_damage_modifiers"):
-            remaining = self._apply_damage_modifiers(
-                "player" if kind == "player" else "creature",
-                target_guid, school, remaining)
+        resisted = 0
+        remaining = amount
+        # Peer players own their aura list; drain/resist/modify on that
+        # session instead of falling back to this session's creature store.
+        if kind != "peer" or peer is not None:
+            if hasattr(target_session, "_absorb_damage"):
+                absorbed, depleted = target_session._absorb_damage(
+                    target_kind, target_guid, school, amount)
+                for aura in depleted:
+                    if hasattr(target_session, "_send_aura_update"):
+                        await target_session._send_aura_update(
+                            target_kind, target_guid, aura, remove=True)
+            if hasattr(target_session, "_spell_resist_amount"):
+                resisted = target_session._spell_resist_amount(
+                    target_guid, school, amount)
+            remaining = max(0, amount - absorbed - resisted)
+            if hasattr(target_session, "_apply_damage_modifiers"):
+                remaining = target_session._apply_damage_modifiers(
+                    target_kind, target_guid, school, remaining)
         died = False
         if kind == "player":
             if remaining > 0:
@@ -1358,8 +1370,6 @@ class SpellsMixin:
                 self._victim_health(target_guid)
                 if hasattr(self, "_victim_health") else 0))
         elif kind == "peer":
-            peer = (self._peer_session_for_guid(target_guid)
-                    if hasattr(self, "_peer_session_for_guid") else None)
             if peer is not None and remaining > 0:
                 await peer._damage_player(
                     remaining, f"{self.character.get('name', 'player')}'s "
@@ -3608,7 +3618,8 @@ class SpellsMixin:
                                           is_crit: bool = False,
                                           school: int = 1,
                                           victim_state: int = 0,
-                                          hit_info: int = 0) -> None:
+                                          hit_info: int = 0,
+                                          absorbed: int = 0) -> None:
         """Send ``SMSG_ATTACKERSTATEUPDATE`` for one melee hit.
 
         Layout from CMaNGOS 3.3.5 ``Unit::SendAttackStateUpdate``: ``uint32
@@ -3620,8 +3631,14 @@ class SpellsMixin:
         ``overdamage`` is ``max(0, damage - victim_health)`` measured *before*
         the damage is applied -- the newer core's ``-1`` sentinel is a post-3.3.5
         convention and the 3.3.5 client renders it as a nonsense overkill value.
+
+        When ``absorbed`` is non-zero the packet sets ``HITINFO_ABSORB`` and
+        appends the absorbed amount after the sub-damage entries.
         """
         flags = int(hit_info)
+        absorbed = max(0, int(absorbed or 0))
+        if absorbed:
+            flags |= 0x00000020          # HITINFO_ABSORB
         if not is_miss:
             flags |= 0x00000002          # HITINFO_AFFECTS_VICTIM
             if victim_state == 0:
@@ -3643,6 +3660,8 @@ class SpellsMixin:
         out += struct.pack("<I", school & 0xFF)
         out += struct.pack("<f", float(damage))
         out += struct.pack("<I", damage & 0xFFFFFFFF)
+        if absorbed:
+            out += struct.pack("<I", absorbed & 0xFFFFFFFF)
         out += struct.pack("<B", victim_state)
         out += struct.pack("<I", 0)      # attacker state
         out += struct.pack("<I", 0)      # melee spell id

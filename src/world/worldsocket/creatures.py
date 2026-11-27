@@ -669,18 +669,30 @@ class CreaturesMixin:
                 if hasattr(self, "_apply_damage_modifiers"):
                     damage = self._apply_damage_modifiers(
                         "player", self.player_guid, 1, damage)
+                absorbed = 0
+                if hasattr(self, "_absorb_damage"):
+                    absorbed, depleted = self._absorb_damage(
+                        "player", self.player_guid, 1, damage)
+                    for aura in depleted:
+                        if hasattr(self, "_send_aura_update"):
+                            await self._send_aura_update(
+                                "player", self.player_guid, aura,
+                                remove=True)
+                    damage = max(0, damage - absorbed)
                 await self._send_attacker_state_update(
                     self._creature_object_guid(int(low_guid), int(spawn["entry"])),
                     self.player_guid, damage,
                     is_crit=(outcome == "crit"),
                     victim_state=victim_state, hit_info=hit_info,
+                    absorbed=absorbed,
                 )
                 # Creature auto-attacks are normal-school melee, the only
                 # damage source that fills a warrior's rage bar.
-                await self._damage_player(
-                    damage, str(spawn["name"]), physical=True,
-                    attacker_guid=self._creature_object_guid(
-                        int(low_guid), int(spawn["entry"])))
+                if damage > 0:
+                    await self._damage_player(
+                        damage, str(spawn["name"]), physical=True,
+                        attacker_guid=self._creature_object_guid(
+                            int(low_guid), int(spawn["entry"])))
                 if hasattr(self, "_break_cc_on_damage"):
                     await self._break_cc_on_damage(
                         "player", self.player_guid, 0)
@@ -988,4 +1000,10 @@ class CreaturesMixin:
             delay = max(800, int(spawn["melee_attack_speed"] or 2000)) / 1000.0
             low += attack_power / 14.0 * delay
             high += attack_power / 14.0 * delay
-        return random.uniform(low, high)
+        damage = random.uniform(low, high)
+        if hasattr(self, "_creature_damage_done_modifier"):
+            low_guid = int(spawn["guid"]) if "guid" in spawn.keys() else 0
+            if low_guid:
+                damage = self._creature_damage_done_modifier(
+                    low_guid, 1, damage)
+        return max(1.0, float(damage))

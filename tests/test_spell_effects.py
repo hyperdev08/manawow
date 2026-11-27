@@ -1541,3 +1541,67 @@ def test_respec_dismisses_hunter_pet(tmp_path):
         assert socket.character["money"] == 0
 
     asyncio.run(flow())
+
+def test_peer_spell_absorb_uses_peer_aura_store(tmp_path):
+    async def flow():
+        socket, db, _sent, _delivered = _socket(tmp_path)
+        con = sqlite3.connect(db)
+        try:
+            con.execute(
+                "INSERT OR REPLACE INTO spell_templates"
+                "(id, name, attributes, effect1, effect_apply_aura_name1,"
+                " effect_base_points1, effect_misc_value1, duration_index)"
+                " VALUES(700, 'Test Shield', 64, 6, 69, 100, 127, 1)")
+            con.commit()
+        finally:
+            con.close()
+
+        peer = WorldSocket(asyncio.StreamReader(), FakeWriter(), socket.config)
+        peer.sent = []
+
+        async def peer_send_packet(opcode, payload=b""):
+            peer.sent.append((int(opcode), bytes(payload)))
+
+        peer.send_packet = peer_send_packet
+        peer.in_world = True
+        peer.player_guid = 2
+        peer.character = {
+            "guid": 2, "name": "Peer", "class": 8, "race": 1, "level": 20,
+            "health": 1000, "max_health": 1000, "power": 1000,
+            "max_power": 1000, "x": 0.0, "y": 0.0, "z": 0.0, "map": 0,
+        }
+        peer.known_spell_ids = set()
+        server = types.SimpleNamespace(sessions=[socket, peer])
+        socket.server = server
+        peer.server = server
+
+        template = spells.get_spell_template(db, 700)
+        await peer._apply_aura_from_effect(
+            template, template.effects[0], 0, socket.player_guid,
+            peer.player_guid, 20, target_kind="player")
+        aura = peer._get_combat_state()["auras"][0]
+        pool = int(aura["absorb_remaining"])
+        assert pool > 0
+        health_before = int(peer.character["health"])
+
+        await socket._deal_spell_damage(
+            peer.player_guid, 20, spells.SCHOOL_HOLY, template,
+            socket.player_guid)
+        assert int(peer.character["health"]) == health_before
+        assert int(aura["absorb_remaining"]) == pool - 20
+
+        # Depleting the remaining pool removes the shield without damage.
+        remaining_pool = int(aura["absorb_remaining"])
+        await socket._deal_spell_damage(
+            peer.player_guid, remaining_pool, spells.SCHOOL_HOLY, template,
+            socket.player_guid)
+        assert not any(int(entry["spell_id"]) == 700
+                       for entry in peer._get_combat_state()["auras"])
+        assert int(peer.character["health"]) == health_before
+
+        await socket._deal_spell_damage(
+            peer.player_guid, 50, spells.SCHOOL_HOLY, template,
+            socket.player_guid)
+        assert int(peer.character["health"]) < health_before
+
+    asyncio.run(flow())

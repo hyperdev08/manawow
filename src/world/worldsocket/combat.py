@@ -299,17 +299,23 @@ class CombatMixin:
         level = max(1, int(self.character.get("level", 1)))
         diff = max(0, int(attacker_level) - level)
         resilience = float(self.character.get("resilience", 0) or 0) / 25.0
-        block = (float(self.character.get("block_chance", 0.0))
-                 if self.character.get("has_shield") else 0.0)
+        stunned = bool(hasattr(self, "_player_aura_mods")
+                       and self._player_aura_mods().get("stunned"))
+        # ``Unit::GetUnitDodgeChance`` and friends return zero while stunned;
+        # the attacker can still miss, but the victim cannot avoid the hit.
+        block = 0.0 if stunned else (
+            float(self.character.get("block_chance", 0.0))
+            if self.character.get("has_shield") else 0.0)
+        dodge = 0.0 if stunned else (
+            float(self.character.get("dodge_chance", 5.0)) + diff * 0.5)
+        parry = 0.0 if stunned else (
+            float(self.character.get("parry_chance", 5.0)) + diff * 0.5)
         return [
             ("miss", self._clamp_chance(5.0 + diff, 60.0)),
-            ("dodge", self._clamp_chance(
-                float(self.character.get("dodge_chance", 5.0)) + diff * 0.5,
-                40.0)),
-            ("parry", self._clamp_chance(
-                float(self.character.get("parry_chance", 5.0)) + diff * 0.5,
-                40.0)),
-            ("block", self._clamp_chance(block + diff * 0.5, 40.0)),
+            ("dodge", self._clamp_chance(dodge, 40.0)),
+            ("parry", self._clamp_chance(parry, 40.0)),
+            ("block", 0.0 if stunned else self._clamp_chance(
+                block + diff * 0.5, 40.0)),
             ("crushing", 15.0 if diff >= 3 else 0.0),
             ("crit", self._clamp_chance(5.0 + diff * 0.5 - resilience, 40.0)),
         ]
@@ -333,6 +339,7 @@ class CombatMixin:
                                    slot: int = 15) -> bool:
         """Resolve one main-hand/off-hand swing.  Returns True if it killed."""
         target_level = max(1, int(spawn["min_level"] or 1))
+        hit_info = 0x00000004 if offhand_swing else 0
         if hasattr(self, "_creature_aura_mods"):
             mods = self._creature_aura_mods(
                 creature.creature_low_guid(target_guid))
@@ -344,7 +351,6 @@ class CombatMixin:
                 return False
         outcome = self._roll_melee(
             self._player_melee_table(target_level, offhand_swing))
-        hit_info = 0x00000004 if offhand_swing else 0
         if outcome == "miss":
             await self._send_attacker_state_update(
                 self.player_guid, target_guid, 0, is_miss=True,
@@ -368,6 +374,9 @@ class CombatMixin:
             hit_info |= 0x00010000          # HITINFO_GLANCING
         elif outcome == "crit":
             damage *= 2.0
+        # ``Unit::MeleeDamageBonusDone``: buffs/talents the attacker has.
+        if hasattr(self, "_apply_damage_done"):
+            damage = self._apply_damage_done(1, max(1, int(round(damage))))
         # ``Unit::CalcArmorReducedDamage`` against the creature's template armor.
         armor = int(spawn["armor"] or 0) if "armor" in spawn.keys() else 0
         if hasattr(self, "_creature_aura_mods"):
@@ -381,17 +390,28 @@ class CombatMixin:
         if armor > 0:
             damage = self._armor_reduced_damage(
                 max(1, int(round(damage))), armor, target_level)
-        damage = max(1, int(round(damage)))
+        damage = max(0, int(round(damage)))
         if hasattr(self, "_apply_damage_modifiers"):
             damage = self._apply_damage_modifiers(
                 "creature", target_guid, 1, damage)
+        absorbed = 0
+        if hasattr(self, "_absorb_damage"):
+            absorbed, depleted = self._absorb_damage(
+                "creature", target_guid, 1, damage)
+            for aura in depleted:
+                if hasattr(self, "_send_aura_update"):
+                    await self._send_aura_update(
+                        "creature", target_guid, aura, remove=True)
+            damage = max(0, damage - absorbed)
         await self._send_attacker_state_update(
             self.player_guid, target_guid, damage,
-            is_crit=(outcome == "crit"), hit_info=hit_info)
+            is_crit=(outcome == "crit"), hit_info=hit_info,
+            absorbed=absorbed)
         self._gain_rage(damage, weapon_speed=weapon["delay"],
                         crit=(outcome == "crit"))
-        result = await self._deal_damage_to_creature(
-            target_guid, damage, self.player_guid)
+        result = (False if damage <= 0 else
+                  await self._deal_damage_to_creature(
+                      target_guid, damage, self.player_guid))
         if not result and hasattr(self, "_roll_weapon_procs"):
             await self._roll_weapon_procs(
                 int(slot), float(weapon.get("base_delay",
@@ -772,6 +792,8 @@ class CombatMixin:
                    / 14.0 * float(stats["delay"]))
         if outcome == "crit":
             damage *= 2.0
+        if hasattr(self, "_apply_damage_done"):
+            damage = self._apply_damage_done(1, max(1, int(round(damage))))
         damage = max(1, int(round(damage)))
         armor = int(spawn["armor"] or 0) if "armor" in spawn.keys() else 0
         armor = max(0, armor - int(
@@ -782,11 +804,21 @@ class CombatMixin:
         if hasattr(self, "_apply_damage_modifiers"):
             damage = self._apply_damage_modifiers(
                 "creature", target_guid, 1, damage)
+        absorbed = 0
+        if hasattr(self, "_absorb_damage"):
+            absorbed, depleted = self._absorb_damage(
+                "creature", target_guid, 1, damage)
+            for aura in depleted:
+                if hasattr(self, "_send_aura_update"):
+                    await self._send_aura_update(
+                        "creature", target_guid, aura, remove=True)
+            damage = max(0, damage - absorbed)
         await self._send_attacker_state_update(
             self.player_guid, target_guid, damage,
-            is_crit=(outcome == "crit"))
-        await self._deal_damage_to_creature(
-            target_guid, damage, self.player_guid, threat_kind="ranged")
+            is_crit=(outcome == "crit"), absorbed=absorbed)
+        if damage > 0:
+            await self._deal_damage_to_creature(
+                target_guid, damage, self.player_guid, threat_kind="ranged")
         if hasattr(self, "_roll_weapon_procs") \
                 and self._creature_health(target_guid) > 0:
             await self._roll_weapon_procs(

@@ -190,7 +190,8 @@ class FakeUnit(AurasMixin, SpellsMixin, StatsMixin, CombatMixin,
             return int(self.character.get("health", 0))
         return self._creature_health(guid)
 
-    async def _damage_player(self, damage, source, physical=False):
+    async def _damage_player(self, damage, source, physical=False,
+                             attacker_guid=0):
         amount = max(1, int(damage))
         self.character["health"] = max(0, int(self.character["health"]) - amount)
 
@@ -871,3 +872,129 @@ async def test_regenerate_ignores_a_session_logged_out_mid_tick():
 
     # The guarded method returns before touching any other session state.
     await StatsMixin._regenerate(LoggedOut(), time.monotonic())
+
+def _attacker_state_flags(session):
+    packets = [payload for opcode, payload in session.sent
+               if opcode == int(Opcodes.SMSG_ATTACKERSTATEUPDATE)]
+    assert packets
+    return struct.unpack_from("<I", packets[-1], 0)[0]
+
+
+@_async_test
+async def test_physical_immune_melee_does_not_crash():
+    session = FakeUnit()
+    target = session.add_creature(11, x=1.0, level=20)
+    spawn = session._spawns[11]
+    immunity = spells.get_spell_template(WORLD_DB, 1022)
+    await session._apply_aura_from_effect(
+        immunity, immunity.effects[0], 0, session.player_guid, target,
+        20, target_kind="creature")
+    session._roll_melee = lambda table: "hit"
+    session._roll_weapon_procs = mock.AsyncMock()
+    before = spawn["current_health"]
+
+    await session._player_melee_attack(
+        {"min": 100.0, "max": 100.0, "delay": 2.0}, target, spawn)
+
+    assert spawn["current_health"] == before
+    flags = _attacker_state_flags(session)
+    assert flags & 0x00000010          # HITINFO_MISS
+
+
+@_async_test
+async def test_melee_and_ranged_apply_damage_done_bonus():
+    session = FakeUnit()
+    target = session.add_creature(11, x=1.0)
+    spawn = session._spawns[11]
+    seen = []
+
+    def damage_done(school, damage):
+        output = int(damage) * 2
+        seen.append((int(school), int(damage), output))
+        return output
+
+    session._apply_damage_done = damage_done
+    session._roll_melee = lambda table: "hit"
+    session._roll_weapon_procs = mock.AsyncMock()
+    session._has_line_of_sight = mock.AsyncMock(return_value=True)
+
+    before = spawn["current_health"]
+    await session._player_melee_attack(
+        {"min": 100.0, "max": 100.0, "delay": 2.0}, target, spawn)
+    assert seen and seen[-1][0] == 1
+    assert before - spawn["current_health"] == seen[-1][2]
+
+    spawn["current_health"] = 500
+    session._player_ranged_weapon_stats = lambda: {
+        "min": 100.0, "max": 100.0, "delay": 2.0, "base_delay": 2.0}
+    session._combat_state.update({
+        "target_guid": target, "ranged_attacking": True,
+        "last_ranged_swing": 0.0, "ranged_interval": 2.0})
+    seen.clear()
+    before = spawn["current_health"]
+    await session._player_ranged_attack(time.monotonic() + 10.0)
+    assert seen and seen[-1][0] == 1
+    assert before - spawn["current_health"] == seen[-1][2]
+
+
+@_async_test
+async def test_melee_absorbs_creature_shield_and_creature_melee_absorbs_player_shield():
+    session = FakeUnit()
+    target = session.add_creature(11, x=1.0)
+    spawn = session._spawns[11]
+    shield = spells.get_spell_template(WORLD_DB, 17)
+    await session._apply_aura_from_effect(
+        shield, shield.effects[0], 0, session.player_guid, target,
+        20, target_kind="creature")
+    creature_auras = session._combat_state["creature_auras"][11]
+    creature_auras[0]["absorb_remaining"] = 1000
+    session._roll_melee = lambda table: "hit"
+    session._roll_weapon_procs = mock.AsyncMock()
+
+    before = spawn["current_health"]
+    await session._player_melee_attack(
+        {"min": 100.0, "max": 100.0, "delay": 2.0}, target, spawn)
+    assert spawn["current_health"] == before
+    assert _attacker_state_flags(session) & 0x00000020   # HITINFO_ABSORB
+
+    # The reverse direction: creature melee is absorbed by the player shield.
+    session._combat_state["creature_auras"].clear()
+    await session._apply_aura_from_effect(
+        shield, shield.effects[0], 0, session.player_guid,
+        session.player_guid, 20, target_kind="player")
+    session._combat_state["auras"][0]["absorb_remaining"] = 1000
+    session._combat_state["aggro"][11] = {
+        "guid": 11, "entry": 1011, "map": 0, "last_swing": 0.0,
+        "chase_until": 0.0, "pos": None, "facing": None,
+        "face_until": 0.0, "ai": None, "threat": 0.0,
+        "threat_table": {session.player_guid: 0.0},
+        "target_guid": session.player_guid, "taunt_target": 0,
+        "taunt_until": 0.0, "fleeing": False, "flee_until": 0.0,
+        "last_mana_regen": 0.0, "last_power_update": 0.0,
+    }
+    session._creature_ai_state = mock.AsyncMock(return_value=None)
+    session._face_creature_at_player = mock.AsyncMock()
+    session._creature_damage = lambda spawn: 50.0
+    session._has_line_of_sight = mock.AsyncMock(return_value=True)
+    health = int(session.character["health"])
+    session.sent.clear()
+    await session._creature_combat_tick(11, time.monotonic() + 10.0)
+    assert int(session.character["health"]) == health
+    assert _attacker_state_flags(session) & 0x00000020   # HITINFO_ABSORB
+
+
+@_async_test
+async def test_stunned_player_cannot_dodge_parry_or_block():
+    session = FakeUnit()
+    stun = spells.get_spell_template(WORLD_DB, 25)
+    await session._apply_aura_from_effect(
+        stun, stun.effects[0], 0, session.player_guid,
+        session.player_guid, 20, target_kind="player")
+    session.character.update({
+        "has_shield": True, "dodge_chance": 25.0,
+        "parry_chance": 25.0, "block_chance": 25.0})
+    table = dict(session._creature_melee_table(20))
+    assert table["dodge"] == 0
+    assert table["parry"] == 0
+    assert table["block"] == 0
+    assert table["miss"] > 0
